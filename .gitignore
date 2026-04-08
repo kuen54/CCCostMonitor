@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+dist/
+.build/
+
+# macOS
+.DS_Store
+
+# Internal dev notes
+CLAUDE.md
+
+# Unused SPM manifest
+Package.swift
+
+# Xcode (not used, but just in case)
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
