@@ -1,8 +1,9 @@
 # CC Cost Monitor
 
 macOS menu bar app that shows how much you're spending on [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Parses local session logs — zero tokens consumed, nothing sent anywhere.
-<img width="193" height="418" alt="image" src="https://github.com/user-attachments/assets/889e5b26-da99-446c-bd85-995d1fc3fd8d" /><img width="193" height="330" alt="image" src="https://github.com/user-attachments/assets/f861cf3d-9248-47f7-b739-1232d5fb7796" />
 
+<img width="193" height="330" alt="image" src="https://github.com/user-attachments/assets/13c5218d-5e0f-4ad3-ade1-f80416825592" />
+<img width="193" height="418" alt="image" src="https://github.com/user-attachments/assets/8b9e98f6-0543-47cd-b694-f4e531d09f01" />
 
 ## Why this exists
 
