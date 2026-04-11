@@ -1791,7 +1791,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             name: NSWorkspace.didWakeNotification, object: nil
         )
 
-        // Listen for "show popover" request from a second instance trying to launch
+        // Listen for "show popover" from a second instance launched via `open -n`
+        // (normal `open` goes through applicationShouldHandleReopen instead)
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(onShowRequest),
             name: NSNotification.Name("com.claude.cc-cost-monitor.show"),
@@ -1806,7 +1807,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func onShowRequest(_ note: Notification) {
-        showPopover()
+        // DistributedNotification may arrive on a non-main thread
+        DispatchQueue.main.async { [weak self] in
+            self?.showPopover()
+        }
     }
 
     private func showPopover() {
@@ -1877,7 +1881,8 @@ func timeAgo(_ date: Date, _ loc: ((String) -> String)? = nil) -> String {
 
 // MARK: - Entry Point
 
-// Single-instance guard: if already running, tell it to show the popover, then exit
+// Single-instance guard for `open -n` (force-new-instance) scenarios.
+// Normal `open` is handled by applicationShouldHandleReopen in AppDelegate.
 let myBundleID = "com.claude.cc-cost-monitor"
 let running = NSRunningApplication.runningApplications(withBundleIdentifier: myBundleID)
 let isAlreadyRunning = running.contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
