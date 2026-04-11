@@ -1737,6 +1737,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Status bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.autosaveName = "CCCostMonitor"
+        statusItem.isVisible = true
         if let button = statusItem.button {
             button.image = makeClaudeIcon()
             button.imagePosition = .imageLeft
@@ -1788,6 +1790,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self, selector: #selector(onWake),
             name: NSWorkspace.didWakeNotification, object: nil
         )
+
+        // Listen for "show popover" request from a second instance trying to launch
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(onShowRequest),
+            name: NSNotification.Name("com.claude.cc-cost-monitor.show"),
+            object: nil
+        )
+    }
+
+    // Called when user opens the app again (double-click, Spotlight, Launchpad, etc.)
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showPopover()
+        return false
+    }
+
+    @objc private func onShowRequest(_ note: Notification) {
+        showPopover()
+    }
+
+    private func showPopover() {
+        // Ensure the status item is visible in case macOS hid it in overflow
+        statusItem.isVisible = true
+        guard let button = statusItem.button else { return }
+        if !popover.isShown {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
     }
 
     @objc private func onWake(_ note: Notification) {
@@ -1847,6 +1876,20 @@ func timeAgo(_ date: Date, _ loc: ((String) -> String)? = nil) -> String {
 }
 
 // MARK: - Entry Point
+
+// Single-instance guard: if already running, tell it to show the popover, then exit
+let myBundleID = "com.claude.cc-cost-monitor"
+let running = NSRunningApplication.runningApplications(withBundleIdentifier: myBundleID)
+let isAlreadyRunning = running.contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+if isAlreadyRunning {
+    DistributedNotificationCenter.default().post(
+        name: NSNotification.Name("com.claude.cc-cost-monitor.show"),
+        object: nil
+    )
+    // Small delay so the notification is delivered before we exit
+    Thread.sleep(forTimeInterval: 0.3)
+    exit(0)
+}
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
