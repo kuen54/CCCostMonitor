@@ -50,6 +50,15 @@ MODEL_PRICING = {}        # model_class -> {input, output, cache_write, cache_re
 _LITELLM_RAW = {}         # full raw model_name -> pricing from LiteLLM
 _PRICING_SOURCE = "fallback"
 
+# Populated by scan_sessions — surfaced in JSON / text output so format drift
+# (e.g. Claude Code changing how it splits content blocks) shows up as an
+# anomaly in the inflation factor instead of silently skewing the numbers.
+_SCAN_STATS = {
+    "raw_usage_lines": 0,       # assistant-with-usage lines in range, pre-dedup
+    "unique_messages": 0,       # unique message.id (or missing-id) lines kept
+    "null_msg_id_lines": 0,     # lines without message.id — can't be deduped
+}
+
 
 def _fetch_litellm_pricing() -> Optional[dict]:
     """Fetch pricing JSON from LiteLLM GitHub, with local file cache."""
@@ -316,6 +325,40 @@ def pricing_source_line() -> str:
     return "💲 定价来源: 内置 fallback 定价"
 
 
+def scan_diagnostics() -> dict:
+    """Return the current scan's self-diagnostic counters + inflation factor.
+
+    `inflation_factor` = raw_usage_lines / unique_messages, where raw is how many
+    assistant-with-usage lines sat in the requested time range before dedup.
+    Claude Code writes one JSONL line per content block of each API response,
+    so healthy values cluster around 1.5–3x. A drop to ~1.0 suggests Claude
+    Code changed its JSONL format and dedup may no longer be necessary; a
+    spike above 5x suggests a new repeat pattern worth investigating.
+    """
+    raw = _SCAN_STATS["raw_usage_lines"]
+    uniq = _SCAN_STATS["unique_messages"]
+    return {
+        "raw_usage_lines": raw,
+        "unique_messages": uniq,
+        "null_msg_id_lines": _SCAN_STATS["null_msg_id_lines"],
+        "inflation_factor": round(raw / uniq, 3) if uniq else None,
+    }
+
+
+def diagnostics_line() -> str:
+    d = scan_diagnostics()
+    if not d["unique_messages"]:
+        return ""
+    flag = ""
+    f = d["inflation_factor"] or 0
+    if f >= 5.0:
+        flag = "  ⚠️ unusually high (format change?)"
+    elif f <= 1.05:
+        flag = "  ℹ️ near 1.0 — dedup had little effect (direct API or new format)"
+    nulls = f"  null_ids={d['null_msg_id_lines']}" if d["null_msg_id_lines"] else ""
+    return f"🔬 扫描自检: 原始行={d['raw_usage_lines']}  去重后={d['unique_messages']}  inflation={f}x{nulls}{flag}"
+
+
 def friendly_project(raw: str) -> str:
     """Turn the escaped project directory name into something readable."""
     return (
@@ -354,6 +397,11 @@ def resolve_range(spec: str):
 def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, project_filter: Optional[str]):
     """Scan all JSONL files and return structured session data."""
     start_epoch = start_dt.timestamp()
+
+    # Reset diagnostic counters for this scan
+    _SCAN_STATS["raw_usage_lines"] = 0
+    _SCAN_STATS["unique_messages"] = 0
+    _SCAN_STATS["null_msg_id_lines"] = 0
 
     # Convert local-time range boundaries to UTC for comparing with message timestamps
     _local_tz = datetime.now().astimezone().tzinfo
@@ -440,12 +488,16 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
                         # Filter: only count messages whose timestamp falls within the requested range
                         if ts and (ts < start_utc or ts >= end_utc):
                             continue
+                        _SCAN_STATS["raw_usage_lines"] += 1
                         # Dedup by message.id (see comment at top of this function)
                         msg_id = m.get("id")
                         if msg_id:
                             if msg_id in seen_msg_ids:
                                 continue
                             seen_msg_ids.add(msg_id)
+                        else:
+                            _SCAN_STATS["null_msg_id_lines"] += 1
+                        _SCAN_STATS["unique_messages"] += 1
                         model_str = m.get("model", "") or ""
                         model_cls = classify_model(model_str)
                         cw = usage_raw.get("cache_creation_input_tokens", 0)
@@ -552,6 +604,8 @@ def print_detail(sessions: dict, range_label: str):
 {'=' * 115}
 """)
     print(pricing_source_line())
+    _d = diagnostics_line()
+    if _d: print(_d)
     print("\u26a0\ufe0f  \u8d39\u7528\u57fa\u4e8e API \u516c\u5f00\u5b9a\u4ef7\u9884\u4f30\uff0c\u8ba2\u9605\u7528\u6237\u7684\u5b9e\u9645\u8ba1\u8d39\u65b9\u5f0f\u4e0d\u540c")
 
 
@@ -596,6 +650,8 @@ def print_by_project(sessions: dict, range_label: str):
           f"total:{fmt(grand_agg['total'])}")
     print(f"\U0001f4b0 \u603b\u8d39\u7528: ${grand_cost:.2f}")
     print(pricing_source_line())
+    _d = diagnostics_line()
+    if _d: print(_d)
     print(f"{'=' * 100}")
 
 
@@ -640,6 +696,8 @@ def print_by_day(sessions: dict, range_label: str):
           f"total:{fmt(grand_agg['total'])}")
     print(f"\U0001f4b0 \u603b\u8d39\u7528: ${grand_cost:.2f}")
     print(pricing_source_line())
+    _d = diagnostics_line()
+    if _d: print(_d)
     print(f"{'=' * 100}")
 
 
@@ -694,6 +752,8 @@ def print_json(sessions: dict):
             day_entry["total_cost"] += c
         day_entry["total_cost"] = round(day_entry["total_cost"], 4)
         result["daily_breakdown"][day_key] = day_entry
+
+    result["diagnostics"] = scan_diagnostics()
 
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
 
