@@ -206,12 +206,33 @@ def lookup_model_pricing(model_str: str) -> Optional[dict]:
     norm = _normalize_model_name(model_str)
     if norm and norm in _LITELLM_RAW:
         return _extract_litellm_entry(_LITELLM_RAW[norm])
-    # 3. Try prefixed canonical variants that LiteLLM commonly uses
+    # 3. Try prefixed variants. Try BOTH the original string and the normalized form,
+    # because Claude entries use hyphens (`claude-opus-4-7`) but non-Claude providers
+    # often keep dots (`azure_ai/kimi-k2.5`).
+    prefixes = ("bedrock/", "vertex_ai/", "anthropic/",
+                "azure_ai/", "moonshotai/", "openrouter/")
+    candidates = {model_str}
     if norm:
-        for prefix in ("bedrock/", "vertex_ai/", "anthropic/"):
-            key = prefix + norm
+        candidates.add(norm)
+    for c in candidates:
+        # strip leading provider segment from the raw string too
+        bare = c.split(".", 1)[-1] if "." in c and c.split(".", 1)[0].lower() in (
+            "aws", "anthropic", "bedrock", "vertex_ai", "azure_ai", "us", "eu", "au") else c
+        for prefix in prefixes:
+            key = prefix + bare
             if key in _LITELLM_RAW:
                 return _extract_litellm_entry(_LITELLM_RAW[key])
+    # 4. Last resort: substring suffix match. Walk LiteLLM keys once looking for any
+    # key that ENDS with `/{candidate}` or `.{candidate}`. Covers region-specific
+    # Bedrock entries like `bedrock/ap-northeast-1/moonshotai.kimi-k2.5`.
+    for c in candidates:
+        suffix1 = "/" + c
+        suffix2 = "." + c
+        for key in _LITELLM_RAW:
+            if key.endswith(suffix1) or key.endswith(suffix2):
+                pricing = _extract_litellm_entry(_LITELLM_RAW[key])
+                if pricing:
+                    return pricing
     return None
 
 
@@ -219,7 +240,14 @@ def lookup_model_pricing(model_str: str) -> Optional[dict]:
 # Helpers
 # ---------------------------------------------------------------------------
 def classify_model(model_str: str) -> str:
-    """Classify a model identifier string into opus/sonnet/haiku."""
+    """Classify a model identifier string into opus/sonnet/haiku/other.
+
+    `other` covers non-Claude models the user runs through Claude Code via
+    ANTHROPIC_BASE_URL overrides (Kimi, Qwen, GLM, …). Those get real pricing
+    from LiteLLM via `lookup_model_pricing`; this classification is only used
+    as a bucket for aggregation and a fallback for when LiteLLM doesn't know
+    the model at all.
+    """
     if not model_str:
         return "sonnet"
     m = model_str.lower()
@@ -227,6 +255,15 @@ def classify_model(model_str: str) -> str:
         return "opus"
     if "haiku" in m:
         return "haiku"
+    if "sonnet" in m:
+        return "sonnet"
+    # Non-Claude models that show up via base-URL overrides
+    for marker in ("kimi", "qwen", "glm", "deepseek", "moonshot", "yi-", "mistral",
+                   "gpt-", "gemini", "llama"):
+        if marker in m:
+            return "other"
+    # Unknown — default to sonnet bucket for aggregation but trust per-message
+    # pricing to be correct (cost_for_message still tries lookup_model_pricing first).
     return "sonnet"
 
 
