@@ -701,7 +701,7 @@ def print_by_day(sessions: dict, range_label: str):
     print(f"{'=' * 100}")
 
 
-def print_json(sessions: dict):
+def print_json(sessions: dict, subscription_quota: Optional[dict] = None):
     """Output structured JSON."""
     result = {
         "pricing_source": _PRICING_SOURCE,
@@ -755,7 +755,89 @@ def print_json(sessions: dict):
 
     result["diagnostics"] = scan_diagnostics()
 
+    if subscription_quota is not None:
+        result["subscription_quota"] = subscription_quota
+
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Subscription OAuth quota fetcher
+# ---------------------------------------------------------------------------
+# Anthropic exposes a private-but-documented OAuth endpoint at
+#   GET https://api.anthropic.com/api/oauth/usage
+# with header `anthropic-beta: oauth-2025-04-20`, that Claude Code itself uses
+# to drive /status and usage reporting. Response shape:
+#   { "five_hour":  {"utilization": 45, "resets_at": "..."},
+#     "seven_day":  {"utilization": 32, "resets_at": "..."},
+#     "extra_usage": {"is_enabled": bool, "used_credits": N, "monthly_limit": N} }
+#
+# This is ONLY meaningful for users who authenticated via `claude login`
+# (subscription). API key users (Bedrock/Vertex/Console) have no OAuth token
+# in `~/.claude/.credentials.json` and this function returns None for them —
+# which is correct behaviour: they have no subscription quota to report.
+
+OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA_HEADER = "oauth-2025-04-20"
+CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+
+
+def _read_oauth_token() -> Optional[str]:
+    """Return the Claude Code OAuth access token, or None if unavailable."""
+    env_token = __import__("os").environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env_token:
+        return env_token
+    if not CREDENTIALS_PATH.exists():
+        return None
+    try:
+        with open(CREDENTIALS_PATH, "r") as f:
+            data = json.load(f)
+        return (data.get("claudeAiOauth") or {}).get("accessToken") or None
+    except Exception:
+        return None
+
+
+def fetch_oauth_usage() -> Optional[dict]:
+    """Call Anthropic's OAuth usage endpoint and return the parsed JSON.
+
+    Returns None (not an error) when no OAuth token is available — this is
+    the normal state for Bedrock/Vertex/Console API-key users.
+    """
+    token = _read_oauth_token()
+    if not token:
+        return None
+    try:
+        req = urllib.request.Request(
+            OAUTH_USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": OAUTH_BETA_HEADER,
+                "Content-Type": "application/json",
+                "User-Agent": "local-cc-cost/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _print_quota_line(quota: Optional[dict]) -> None:
+    """Append a one-line subscription-quota summary to text output."""
+    if quota is None:
+        token_present = _read_oauth_token() is not None
+        if token_present:
+            print("📊 订阅配额: API 调用失败（网络/token 过期）")
+        else:
+            print("📊 订阅配额: 未检测到 OAuth token（API-key 用户无订阅限额）")
+        return
+    five = quota.get("five_hour") or {}
+    seven = quota.get("seven_day") or {}
+    extra = quota.get("extra_usage") or {}
+    msg = f"📊 订阅配额: 5h {five.get('utilization', '?')}% · 7d {seven.get('utilization', '?')}%"
+    if extra.get("is_enabled"):
+        msg += f" · extra ${extra.get('used_credits', 0):.2f}/${extra.get('monthly_limit', 0):.2f}"
+    print(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -775,10 +857,17 @@ def main():
                         help="Group results by day")
     parser.add_argument("--json", action="store_true",
                         help="Output JSON format")
+    parser.add_argument("--include-quota", action="store_true",
+                        help="Also fetch Anthropic's OAuth subscription quota (5h + 7d). "
+                             "Only works for Pro/Max users who used `claude login`. "
+                             "API-key users (Bedrock/Vertex) get no quota info — they have no cap.")
     args = parser.parse_args()
 
     # Load model pricing (LiteLLM with cache, or fallback)
     load_pricing()
+
+    # Optionally fetch OAuth quota. Done BEFORE scanning so failures are fast.
+    subscription_quota = fetch_oauth_usage() if args.include_quota else None
 
     projects_dir = Path.home() / ".claude" / "projects"
     if not projects_dir.exists():
@@ -797,13 +886,16 @@ def main():
         sys.exit(0)
 
     if args.json:
-        print_json(sessions)
+        print_json(sessions, subscription_quota=subscription_quota)
     elif args.by_project:
         print_by_project(sessions, range_label)
     elif args.by_day:
         print_by_day(sessions, range_label)
     else:
         print_detail(sessions, range_label)
+
+    if args.include_quota and not args.json:
+        _print_quota_line(subscription_quota)
 
 
 if __name__ == "__main__":

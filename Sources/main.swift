@@ -68,6 +68,113 @@ struct MonthlySnapshot: Codable {
     var dailyBreakdown: [DailyUsage]?
 }
 
+// MARK: - Subscription Quota (OAuth)
+
+/// Response from `GET https://api.anthropic.com/api/oauth/usage`.
+/// Only available to users who authenticated via `claude login` (Pro/Max/Team/Enterprise).
+/// API-key users (Bedrock/Vertex/Console) don't have an OAuth token and this returns nil.
+struct OAuthUsageWindow: Codable {
+    let utilization: Int           // 0–100
+    let resets_at: String?         // ISO-8601 timestamp
+}
+
+struct OAuthExtraUsage: Codable {
+    let is_enabled: Bool
+    let used_credits: Double?
+    let monthly_limit: Double?
+}
+
+struct OAuthUsage: Codable {
+    let five_hour: OAuthUsageWindow
+    let seven_day: OAuthUsageWindow
+    let extra_usage: OAuthExtraUsage?
+
+    var fiveHourResetDate: Date? { Self.parseISO(five_hour.resets_at) }
+    var sevenDayResetDate: Date? { Self.parseISO(seven_day.resets_at) }
+
+    static func parseISO(_ s: String?) -> Date? {
+        guard let s = s else { return nil }
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: s)
+    }
+}
+
+/// Self-contained service: reads credentials, calls Anthropic's OAuth usage endpoint,
+/// caches response for 5 minutes. Returns nil whenever the user doesn't have a
+/// subscription OAuth token (the expected state for API-key users).
+final class SubscriptionQuotaService {
+    static let shared = SubscriptionQuotaService()
+    private let url = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+    private let ttl: TimeInterval = 300
+    private var cached: (quota: OAuthUsage, at: Date)?
+    private let lock = NSLock()
+
+    /// True if a credentials file with an OAuth access token was found on disk.
+    /// Distinguishes "API-key user (expected no quota)" from "network/API failure".
+    var hasOAuthToken: Bool {
+        return readToken() != nil
+    }
+
+    private func readToken() -> String? {
+        if let env = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !env.isEmpty {
+            return env
+        }
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/.credentials.json")
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String,
+              !token.isEmpty else {
+            return nil
+        }
+        return token
+    }
+
+    /// Fetch quota. Returns cached value if fresh. Returns nil if no token (API-key user)
+    /// or on network failure (caller can distinguish via `hasOAuthToken`).
+    func fetch(forceRefresh: Bool = false, completion: @escaping (OAuthUsage?) -> Void) {
+        lock.lock()
+        if !forceRefresh, let c = cached, Date().timeIntervalSince(c.at) < ttl {
+            let q = c.quota
+            lock.unlock()
+            completion(q)
+            return
+        }
+        lock.unlock()
+
+        guard let token = readToken() else {
+            completion(nil)
+            return
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 8
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("CCCostMonitor/1.2.0", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            guard let self = self,
+                  let data = data,
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let quota = try? JSONDecoder().decode(OAuthUsage.self, from: data)
+            else {
+                completion(nil)
+                return
+            }
+            self.lock.lock()
+            self.cached = (quota, Date())
+            self.lock.unlock()
+            completion(quota)
+        }.resume()
+    }
+}
+
 // Tab selection
 enum DisplayTab: Int, CaseIterable {
     case cost = 0
@@ -134,6 +241,17 @@ private let i18n: [AppLanguage: [String: String]] = [
         "mTokens":      "%.1fm tokens",
         "kTokens":      "%.1fk tokens",
         "nTokens":      "%d tokens",
+        "win5hHeader":       "5-hour window",
+        "win5hResetsIn":     "Resets in %@",
+        "win5hLocal":        "Local this window",
+        "win5hQuotaSection": "Subscription quota",
+        "win5hMsgs":         "msgs",
+        "quota5h":           "5h",
+        "quota7d":           "7d",
+        "quotaWarnHigh":     "⏰ Close to limit",
+        "quotaExtra":        "💸 Extra usage on",
+        "quotaFetchFail":    "Quota API failed",
+        "bedrockNote":       "API-key auth — no subscription 5h/weekly quota applies.",
     ],
     .zhHans: [
         "tkIn":         "输入",
@@ -163,6 +281,17 @@ private let i18n: [AppLanguage: [String: String]] = [
         "mTokens":      "%.1fm tokens",
         "kTokens":      "%.1fk tokens",
         "nTokens":      "%d tokens",
+        "win5hHeader":       "5 小时窗口",
+        "win5hResetsIn":     "%@ 后重置",
+        "win5hLocal":        "本窗口本机消耗",
+        "win5hQuotaSection": "订阅配额",
+        "win5hMsgs":         "条",
+        "quota5h":           "5小时",
+        "quota7d":           "7天",
+        "quotaWarnHigh":     "⏰ 接近上限",
+        "quotaExtra":        "💸 已开启额外用量",
+        "quotaFetchFail":    "订阅配额 API 失败",
+        "bedrockNote":       "API key 鉴权 — 不受订阅的 5h/周限额约束",
     ],
     .zhHant: [
         "tkIn":         "輸入",
@@ -192,6 +321,17 @@ private let i18n: [AppLanguage: [String: String]] = [
         "mTokens":      "%.1fm tokens",
         "kTokens":      "%.1fk tokens",
         "nTokens":      "%d tokens",
+        "win5hHeader":       "5 小時視窗",
+        "win5hResetsIn":     "%@ 後重置",
+        "win5hLocal":        "本視窗本機消耗",
+        "win5hQuotaSection": "訂閱配額",
+        "win5hMsgs":         "條",
+        "quota5h":           "5小時",
+        "quota7d":           "7天",
+        "quotaWarnHigh":     "⏰ 接近上限",
+        "quotaExtra":        "💸 已啟用額外用量",
+        "quotaFetchFail":    "訂閱配額 API 失敗",
+        "bedrockNote":       "API key 驗證 — 不受訂閱的 5h/週限額約束",
     ],
     .ja: [
         "tkIn":         "入力",
@@ -221,6 +361,17 @@ private let i18n: [AppLanguage: [String: String]] = [
         "mTokens":      "%.1fm トークン",
         "kTokens":      "%.1fk トークン",
         "nTokens":      "%d トークン",
+        "win5hHeader":       "5 時間ウィンドウ",
+        "win5hResetsIn":     "%@後にリセット",
+        "win5hLocal":        "このウィンドウの消費",
+        "win5hQuotaSection": "サブスク配分",
+        "win5hMsgs":         "件",
+        "quota5h":           "5h",
+        "quota7d":           "7d",
+        "quotaWarnHigh":     "⏰ 上限間近",
+        "quotaExtra":        "💸 追加利用が有効",
+        "quotaFetchFail":    "配分 API 失敗",
+        "bedrockNote":       "API キー認証 — サブスクの 5h/週の制限は適用されません",
     ],
 ]
 
@@ -244,6 +395,10 @@ class UsageStore: ObservableObject {
 
     // Localization
     @Published var language: AppLanguage
+
+    // Subscription quota (from Anthropic OAuth endpoint, only populated for Pro/Max users)
+    @Published var subscriptionQuota: OAuthUsage?
+    @Published var hasOAuthToken: Bool = false
 
     var isCurrentMonth: Bool {
         let cal = Calendar.current
@@ -298,6 +453,21 @@ class UsageStore: ObservableObject {
         }
         let candidates = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
         pythonPath = candidates.first { FileManager.default.fileExists(atPath: $0) } ?? "/usr/bin/python3"
+
+        // Probe OAuth state once at startup so UI can choose Bedrock vs subscription branch.
+        hasOAuthToken = SubscriptionQuotaService.shared.hasOAuthToken
+    }
+
+    /// Fetch subscription quota from Anthropic's OAuth endpoint and update @Published state.
+    /// Safe to call repeatedly — the service caches for 5 minutes internally.
+    func refreshQuota(force: Bool = false) {
+        SubscriptionQuotaService.shared.fetch(forceRefresh: force) { [weak self] quota in
+            DispatchQueue.main.async {
+                self?.subscriptionQuota = quota
+                // Update the token flag in case credentials changed (e.g. user ran `claude login`)
+                self?.hasOAuthToken = SubscriptionQuotaService.shared.hasOAuthToken
+            }
+        }
     }
 
     func loc(_ key: String) -> String {
@@ -365,6 +535,9 @@ class UsageStore: ObservableObject {
     // MARK: - Refresh (current month)
 
     func refresh() {
+        // Refresh subscription quota in parallel (no-op for API-key users)
+        refreshQuota()
+
         // If not viewing current month, just reload historical
         guard isCurrentMonth else {
             loadHistoricalMonth()
@@ -1343,6 +1516,187 @@ struct LanguageSwitcher: NSViewRepresentable {
 }
 
 // ── Main popover content ──
+// MARK: - Five-Hour Window Card (subscription quota + local measurement)
+
+/// Horizontal progress bar with color coding (< 70 green / 70–90 amber / > 90 red / > 100 purple).
+struct QuotaProgressBar: View {
+    let percent: Int   // 0-100+
+    var height: CGFloat = 8
+
+    private var fraction: CGFloat { min(1.0, CGFloat(percent) / 100.0) }
+    private var color: Color {
+        switch percent {
+        case ..<70:  return Color(red: 0.20, green: 0.78, blue: 0.45) // green
+        case 70..<90: return Color(red: 0.95, green: 0.70, blue: 0.25) // amber
+        case 90..<100: return Color(red: 0.90, green: 0.40, blue: 0.30) // coral
+        default: return Color(red: 0.60, green: 0.35, blue: 0.75) // purple (> 100%)
+        }
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: height / 2)
+                    .fill(Color.gray.opacity(0.18))
+                RoundedRectangle(cornerRadius: height / 2)
+                    .fill(color)
+                    .frame(width: max(2, geo.size.width * fraction))
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+/// One row: label on the left, progress bar in the middle, pct + reset on the right.
+struct QuotaRow: View {
+    let label: String
+    let percent: Int
+    let resetAt: Date?
+    let loc: (String) -> String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.secondary)
+                .frame(width: 36, alignment: .leading)
+            QuotaProgressBar(percent: percent)
+            Text("\(percent)%")
+                .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                .frame(width: 38, alignment: .trailing)
+            if let r = resetAt {
+                Text(resetLabel(r))
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .frame(width: 50, alignment: .trailing)
+            }
+        }
+    }
+
+    private func resetLabel(_ date: Date) -> String {
+        let seconds = max(0, date.timeIntervalSinceNow)
+        if seconds < 60 { return "<1m" }
+        if seconds < 3600 { return "\(Int(seconds / 60))m" }
+        if seconds < 86400 { return "\(Int(seconds / 3600))h" }
+        return "\(Int(seconds / 86400))d"
+    }
+}
+
+struct FiveHourWindowCard: View {
+    @ObservedObject var store: UsageStore
+    let loc: (String) -> String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Header
+            HStack {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Text(loc("win5hHeader"))
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                if let q = store.subscriptionQuota, let reset = q.fiveHourResetDate {
+                    Text(resetHeaderLabel(reset))
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            // Local measurement (always shown; from JSONL)
+            if let today = store.today {
+                HStack(spacing: 6) {
+                    Image(systemName: "desktopcomputer")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                    Text(loc("win5hLocal"))
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text(String(format: "$%.2f  ·  %d %@  ·  %@",
+                                today.cost,
+                                today.totalMessages,
+                                loc("win5hMsgs"),
+                                formatTokensShort(today.totalTokens)))
+                        .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                }
+            }
+
+            Divider()
+                .padding(.vertical, 2)
+
+            // Subscription quota section — one of three states
+            if let quota = store.subscriptionQuota {
+                Text(loc("win5hQuotaSection"))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.secondary)
+                QuotaRow(label: loc("quota5h"),
+                         percent: quota.five_hour.utilization,
+                         resetAt: quota.fiveHourResetDate,
+                         loc: loc)
+                QuotaRow(label: loc("quota7d"),
+                         percent: quota.seven_day.utilization,
+                         resetAt: quota.sevenDayResetDate,
+                         loc: loc)
+                // Optional footnote flags
+                HStack(spacing: 10) {
+                    if quota.five_hour.utilization >= 90 {
+                        Text(loc("quotaWarnHigh"))
+                            .font(.system(size: 10))
+                            .foregroundColor(Color(red: 0.90, green: 0.40, blue: 0.30))
+                    }
+                    if quota.extra_usage?.is_enabled == true {
+                        Text(loc("quotaExtra"))
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
+            } else if store.hasOAuthToken {
+                // Token present, API call failed
+                HStack {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                    Text(loc("quotaFetchFail"))
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                // No OAuth token: user is API-key auth (Bedrock/Vertex/Console).
+                // Correct state per Anthropic docs — not an error.
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                    Text(loc("bedrockNote"))
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(0.04))
+        )
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
+    private func resetHeaderLabel(_ date: Date) -> String {
+        let seconds = max(0, date.timeIntervalSinceNow)
+        if seconds < 60 { return String(format: loc("win5hResetsIn"), "<1m") }
+        if seconds < 3600 {
+            return String(format: loc("win5hResetsIn"), "\(Int(seconds / 60))m")
+        }
+        let h = Int(seconds / 3600)
+        let m = Int((seconds.truncatingRemainder(dividingBy: 3600)) / 60)
+        return String(format: loc("win5hResetsIn"), "\(h)h \(m)m")
+    }
+}
+
 struct PopoverView: View {
     @ObservedObject var store: UsageStore
     let onQuit: () -> Void
@@ -1410,6 +1764,12 @@ struct PopoverView: View {
             .pickerStyle(.segmented)
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
+
+            // ── 5-hour Window Card (subscription quota + local measurement) ──
+            // Only show on current month; historical view has no meaningful "current window".
+            if store.isCurrentMonth {
+                FiveHourWindowCard(store: store, loc: store.loc)
+            }
 
             // ── Content (no scroll, show everything) ──
             if store.isCurrentMonth {
