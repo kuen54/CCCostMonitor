@@ -73,18 +73,18 @@ struct MonthlySnapshot: Codable {
 /// Response from `GET https://api.anthropic.com/api/oauth/usage`.
 /// Only available to users who authenticated via `claude login` (Pro/Max/Team/Enterprise).
 /// API-key users (Bedrock/Vertex/Console) don't have an OAuth token and this returns nil.
-struct OAuthUsageWindow: Codable {
+struct OAuthUsageWindow: Codable, Equatable {
     let utilization: Int           // 0–100
     let resets_at: String?         // ISO-8601 timestamp
 }
 
-struct OAuthExtraUsage: Codable {
+struct OAuthExtraUsage: Codable, Equatable {
     let is_enabled: Bool
     let used_credits: Double?
     let monthly_limit: Double?
 }
 
-struct OAuthUsage: Codable {
+struct OAuthUsage: Codable, Equatable {
     let five_hour: OAuthUsageWindow
     let seven_day: OAuthUsageWindow
     let extra_usage: OAuthExtraUsage?
@@ -459,13 +459,24 @@ class UsageStore: ObservableObject {
     }
 
     /// Fetch subscription quota from Anthropic's OAuth endpoint and update @Published state.
-    /// Safe to call repeatedly — the service caches for 5 minutes internally.
+    /// Fast-paths for API-key users (no token): avoids unnecessary @Published churn and
+    /// network calls. Safe to call repeatedly — the service caches for 5 minutes internally.
     func refreshQuota(force: Bool = false) {
+        let probedHasToken = SubscriptionQuotaService.shared.hasOAuthToken
+        if !probedHasToken {
+            // API-key user. Only publish if state drifted (e.g. user ran `claude logout`).
+            if hasOAuthToken || subscriptionQuota != nil {
+                hasOAuthToken = false
+                subscriptionQuota = nil
+            }
+            return
+        }
         SubscriptionQuotaService.shared.fetch(forceRefresh: force) { [weak self] quota in
             DispatchQueue.main.async {
-                self?.subscriptionQuota = quota
-                // Update the token flag in case credentials changed (e.g. user ran `claude login`)
-                self?.hasOAuthToken = SubscriptionQuotaService.shared.hasOAuthToken
+                guard let self = self else { return }
+                // Only publish if something actually changed — avoids spurious view re-renders.
+                if self.subscriptionQuota != quota { self.subscriptionQuota = quota }
+                if !self.hasOAuthToken { self.hasOAuthToken = true }
             }
         }
     }
@@ -1603,33 +1614,8 @@ struct FiveHourWindowCard: View {
                 }
             }
 
-            // Local measurement (always shown; from JSONL)
-            if let today = store.today {
-                HStack(spacing: 6) {
-                    Image(systemName: "desktopcomputer")
-                        .font(.system(size: 9))
-                        .foregroundColor(.secondary)
-                    Text(loc("win5hLocal"))
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Text(String(format: "$%.2f  ·  %d %@  ·  %@",
-                                today.cost,
-                                today.totalMessages,
-                                loc("win5hMsgs"),
-                                formatTokensShort(today.totalTokens)))
-                        .font(.system(size: 10.5, weight: .medium).monospacedDigit())
-                }
-            }
-
-            Divider()
-                .padding(.vertical, 2)
-
-            // Subscription quota section — one of three states
+            // Subscription quota section — one of two states (API-key users never see this card)
             if let quota = store.subscriptionQuota {
-                Text(loc("win5hQuotaSection"))
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(.secondary)
                 QuotaRow(label: loc("quota5h"),
                          percent: quota.five_hour.utilization,
                          resetAt: quota.fiveHourResetDate,
@@ -1639,40 +1625,31 @@ struct FiveHourWindowCard: View {
                          resetAt: quota.sevenDayResetDate,
                          loc: loc)
                 // Optional footnote flags
-                HStack(spacing: 10) {
-                    if quota.five_hour.utilization >= 90 {
-                        Text(loc("quotaWarnHigh"))
-                            .font(.system(size: 10))
-                            .foregroundColor(Color(red: 0.90, green: 0.40, blue: 0.30))
+                if quota.five_hour.utilization >= 90 || quota.extra_usage?.is_enabled == true {
+                    HStack(spacing: 10) {
+                        if quota.five_hour.utilization >= 90 {
+                            Text(loc("quotaWarnHigh"))
+                                .font(.system(size: 10))
+                                .foregroundColor(Color(red: 0.90, green: 0.40, blue: 0.30))
+                        }
+                        if quota.extra_usage?.is_enabled == true {
+                            Text(loc("quotaExtra"))
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
                     }
-                    if quota.extra_usage?.is_enabled == true {
-                        Text(loc("quotaExtra"))
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                    }
-                    Spacer()
                 }
-            } else if store.hasOAuthToken {
-                // Token present, API call failed
-                HStack {
+            } else {
+                // Has OAuth token but API call failed (network/token expired/schema change).
+                // API-key users are filtered out upstream so they never reach this branch.
+                HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                     Text(loc("quotaFetchFail"))
                         .font(.system(size: 10.5))
                         .foregroundColor(.secondary)
-                }
-            } else {
-                // No OAuth token: user is API-key auth (Bedrock/Vertex/Console).
-                // Correct state per Anthropic docs — not an error.
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "info.circle")
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                    Text(loc("bedrockNote"))
-                        .font(.system(size: 10.5))
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
