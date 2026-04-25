@@ -25,6 +25,7 @@ struct ModelUsage: Identifiable, Codable {
         case "opus":   return Color(red: 0.56, green: 0.27, blue: 0.96) // purple
         case "sonnet": return Color(red: 0.24, green: 0.52, blue: 0.98) // blue
         case "haiku":  return Color(red: 0.20, green: 0.78, blue: 0.45) // green
+        case "other":  return Color(red: 0.65, green: 0.65, blue: 0.65) // gray — non-Claude (Kimi/Qwen/etc.)
         default:       return .gray
         }
     }
@@ -769,8 +770,8 @@ class UsageStore: ObservableObject {
         let grandTotal = json["grand_total_cost"] as? Double ?? 0
         var models: [ModelUsage] = []
         var totalMessages = 0, totalTokens = 0
-        let order = ["opus", "sonnet", "haiku"]
-        let names = ["opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku"]
+        let order = ["opus", "sonnet", "haiku", "other"]
+        let names = ["opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku", "other": "Other"]
 
         if let totals = json["totals_by_model"] as? [String: Any] {
             for key in order {
@@ -801,8 +802,8 @@ class UsageStore: ObservableObject {
         guard let breakdown = json["daily_breakdown"] as? [String: Any], !breakdown.isEmpty else {
             return nil
         }
-        let order = ["opus", "sonnet", "haiku"]
-        let names = ["opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku"]
+        let order = ["opus", "sonnet", "haiku", "other"]
+        let names = ["opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku", "other": "Other"]
 
         var result: [DailyUsage] = []
         for dateStr in breakdown.keys.sorted() {
@@ -878,8 +879,8 @@ class UsageStore: ObservableObject {
         guard !days.isEmpty else {
             return PeriodUsage(cost: 0, models: [], totalMessages: 0, totalTokens: 0)
         }
-        let order = ["opus", "sonnet", "haiku"]
-        let names = ["opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku"]
+        let order = ["opus", "sonnet", "haiku", "other"]
+        let names = ["opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku", "other": "Other"]
         var totalCost = 0.0
         var accum: [String: (inp: Int, out: Int, cr: Int, cw: Int, msgs: Int, cost: Double)] = [:]
         for day in days {
