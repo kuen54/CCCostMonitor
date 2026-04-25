@@ -880,6 +880,22 @@ def main():
     sessions = scan_sessions(projects_dir, start_dt, end_dt, args.project)
 
     if not sessions:
+        # Emit a well-formed empty result in JSON mode so callers (e.g. the Swift UI)
+        # can parse stdout unconditionally. Prose-only output breaks JSONSerialization.
+        if args.json:
+            empty = {
+                "pricing_source": _PRICING_SOURCE,
+                "model_pricing": {mc: p for mc, p in MODEL_PRICING.items()},
+                "sessions": [],
+                "totals_by_model": {},
+                "grand_total_cost": 0.0,
+                "daily_breakdown": {},
+                "diagnostics": scan_diagnostics(),
+            }
+            if subscription_quota is not None:
+                empty["subscription_quota"] = subscription_quota
+            print(json.dumps(empty, indent=2, ensure_ascii=False, default=str))
+            sys.exit(0)
         print(f"No sessions found for range: {range_label}")
         if args.project:
             print(f"  (with project filter: {args.project})")

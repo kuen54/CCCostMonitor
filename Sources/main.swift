@@ -74,8 +74,13 @@ struct MonthlySnapshot: Codable {
 /// Only available to users who authenticated via `claude login` (Pro/Max/Team/Enterprise).
 /// API-key users (Bedrock/Vertex/Console) don't have an OAuth token and this returns nil.
 struct OAuthUsageWindow: Codable, Equatable {
-    let utilization: Int           // 0–100
+    /// Anthropic currently sends Int but we decode as Double to survive any schema
+    /// drift to fractional percentages (e.g. 45.3). UI renders via `displayPercent`.
+    let utilization: Double
     let resets_at: String?         // ISO-8601 timestamp
+
+    /// Integer percent for display, clamped to non-negative (shouldn't happen but cheap).
+    var displayPercent: Int { max(0, Int(utilization.rounded())) }
 }
 
 struct OAuthExtraUsage: Codable, Equatable {
@@ -88,9 +93,14 @@ struct OAuthUsage: Codable, Equatable {
     let five_hour: OAuthUsageWindow
     let seven_day: OAuthUsageWindow
     let extra_usage: OAuthExtraUsage?
+    /// Optional Sonnet-specific 7-day bucket. Anthropic exposes this separately for
+    /// Max plans (all-models + Sonnet-only caps). May be absent on Pro or when the
+    /// API hasn't rolled it out to this endpoint — decoded defensively.
+    let seven_day_sonnet: OAuthUsageWindow?
 
     var fiveHourResetDate: Date? { Self.parseISO(five_hour.resets_at) }
     var sevenDayResetDate: Date? { Self.parseISO(seven_day.resets_at) }
+    var sevenDaySonnetResetDate: Date? { Self.parseISO(seven_day_sonnet?.resets_at) }
 
     static func parseISO(_ s: String?) -> Date? {
         guard let s = s else { return nil }
@@ -100,6 +110,24 @@ struct OAuthUsage: Codable, Equatable {
         f.formatOptions = [.withInternetDateTime]
         return f.date(from: s)
     }
+}
+
+/// UI-facing subset of QuotaFetchResult — only the states worth surfacing to the user.
+enum QuotaError: Equatable {
+    case unauthorized     // 401/403 — token expired or revoked
+    case rateLimited      // 429 — Anthropic throttled us
+    case networkFailure   // transient
+    case decodeFailure    // schema drift — likely benign but worth logging
+}
+
+/// Result type that lets the UI distinguish "no subscription" from real failures.
+enum QuotaFetchResult {
+    case success(OAuthUsage)
+    case noToken                 // API-key user — expected state, hide the card
+    case unauthorized            // 401, token expired — suggest `claude login`
+    case rateLimited             // 429 — Anthropic throttled us
+    case networkFailure          // connection/timeout — transient
+    case decodeFailure           // 200 response but unexpected schema — worth logging
 }
 
 /// Self-contained service: reads credentials, calls Anthropic's OAuth usage endpoint,
@@ -133,20 +161,27 @@ final class SubscriptionQuotaService {
         return token
     }
 
-    /// Fetch quota. Returns cached value if fresh. Returns nil if no token (API-key user)
-    /// or on network failure (caller can distinguish via `hasOAuthToken`).
-    func fetch(forceRefresh: Bool = false, completion: @escaping (OAuthUsage?) -> Void) {
+    /// Fetch quota. Always returns a `QuotaFetchResult` so callers can differentiate
+    /// "no subscription auth" (expected, hide UI) from actual error states (401/429/etc).
+    func fetch(forceRefresh: Bool = false, completion: @escaping (QuotaFetchResult) -> Void) {
         lock.lock()
         if !forceRefresh, let c = cached, Date().timeIntervalSince(c.at) < ttl {
             let q = c.quota
             lock.unlock()
-            completion(q)
+            completion(.success(q))
             return
         }
         lock.unlock()
 
         guard let token = readToken() else {
-            completion(nil)
+            completion(.noToken)
+            return
+        }
+
+        // Belt-and-suspenders HTTPS assertion. URL is hardcoded `https://` but prevents
+        // future edits from accidentally introducing a plaintext URL.
+        guard url.scheme == "https" else {
+            completion(.networkFailure)
             return
         }
 
@@ -156,21 +191,31 @@ final class SubscriptionQuotaService {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("CCCostMonitor/1.2.0", forHTTPHeaderField: "User-Agent")
+        req.setValue("CCCostMonitor/1.2.3", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
-            guard let self = self,
-                  let data = data,
-                  (resp as? HTTPURLResponse)?.statusCode == 200,
-                  let quota = try? JSONDecoder().decode(OAuthUsage.self, from: data)
-            else {
-                completion(nil)
-                return
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            guard let self = self else { return }
+            let http = resp as? HTTPURLResponse
+            let status = http?.statusCode ?? -1
+            switch status {
+            case 200:
+                guard let data = data,
+                      let quota = try? JSONDecoder().decode(OAuthUsage.self, from: data)
+                else {
+                    completion(.decodeFailure)
+                    return
+                }
+                self.lock.lock()
+                self.cached = (quota, Date())
+                self.lock.unlock()
+                completion(.success(quota))
+            case 401, 403:
+                completion(.unauthorized)
+            case 429:
+                completion(.rateLimited)
+            default:
+                completion(.networkFailure)
             }
-            self.lock.lock()
-            self.cached = (quota, Date())
-            self.lock.unlock()
-            completion(quota)
         }.resume()
     }
 }
@@ -248,9 +293,13 @@ private let i18n: [AppLanguage: [String: String]] = [
         "win5hMsgs":         "msgs",
         "quota5h":           "5h",
         "quota7d":           "7d",
+        "quota7dSonnet":     "7d · Sonnet",
         "quotaWarnHigh":     "⏰ Close to limit",
         "quotaExtra":        "💸 Extra usage on",
         "quotaFetchFail":    "Quota API failed",
+        "quotaTokenExpired": "Token expired — run `claude login`",
+        "quotaRateLimited":  "Rate limited — retrying soon",
+        "quotaDecodeFail":   "Unexpected response schema",
         "bedrockNote":       "API-key auth — no subscription 5h/weekly quota applies.",
     ],
     .zhHans: [
@@ -288,9 +337,13 @@ private let i18n: [AppLanguage: [String: String]] = [
         "win5hMsgs":         "条",
         "quota5h":           "5小时",
         "quota7d":           "7天",
+        "quota7dSonnet":     "7天 · Sonnet",
         "quotaWarnHigh":     "⏰ 接近上限",
         "quotaExtra":        "💸 已开启额外用量",
         "quotaFetchFail":    "订阅配额 API 失败",
+        "quotaTokenExpired": "Token 过期,请运行 `claude login`",
+        "quotaRateLimited":  "被限流了,稍后重试",
+        "quotaDecodeFail":   "响应格式异常",
         "bedrockNote":       "API key 鉴权 — 不受订阅的 5h/周限额约束",
     ],
     .zhHant: [
@@ -328,9 +381,13 @@ private let i18n: [AppLanguage: [String: String]] = [
         "win5hMsgs":         "條",
         "quota5h":           "5小時",
         "quota7d":           "7天",
+        "quota7dSonnet":     "7天 · Sonnet",
         "quotaWarnHigh":     "⏰ 接近上限",
         "quotaExtra":        "💸 已啟用額外用量",
         "quotaFetchFail":    "訂閱配額 API 失敗",
+        "quotaTokenExpired": "Token 過期,請執行 `claude login`",
+        "quotaRateLimited":  "被限流了,稍後重試",
+        "quotaDecodeFail":   "回應格式異常",
         "bedrockNote":       "API key 驗證 — 不受訂閱的 5h/週限額約束",
     ],
     .ja: [
@@ -368,9 +425,13 @@ private let i18n: [AppLanguage: [String: String]] = [
         "win5hMsgs":         "件",
         "quota5h":           "5h",
         "quota7d":           "7d",
+        "quota7dSonnet":     "7d · Sonnet",
         "quotaWarnHigh":     "⏰ 上限間近",
         "quotaExtra":        "💸 追加利用が有効",
         "quotaFetchFail":    "配分 API 失敗",
+        "quotaTokenExpired": "Token 期限切れ — `claude login` を実行",
+        "quotaRateLimited":  "レート制限中 — 後ほど再試行",
+        "quotaDecodeFail":   "予期しない応答形式",
         "bedrockNote":       "API キー認証 — サブスクの 5h/週の制限は適用されません",
     ],
 ]
@@ -399,6 +460,9 @@ class UsageStore: ObservableObject {
     // Subscription quota (from Anthropic OAuth endpoint, only populated for Pro/Max users)
     @Published var subscriptionQuota: OAuthUsage?
     @Published var hasOAuthToken: Bool = false
+    /// Last non-success result for the quota fetch, if any. Used to show error hints
+    /// (token expired, rate limited, network, schema change).
+    @Published var quotaError: QuotaError?
 
     var isCurrentMonth: Bool {
         let cal = Calendar.current
@@ -465,18 +529,37 @@ class UsageStore: ObservableObject {
         let probedHasToken = SubscriptionQuotaService.shared.hasOAuthToken
         if !probedHasToken {
             // API-key user. Only publish if state drifted (e.g. user ran `claude logout`).
-            if hasOAuthToken || subscriptionQuota != nil {
+            if hasOAuthToken || subscriptionQuota != nil || quotaError != nil {
                 hasOAuthToken = false
                 subscriptionQuota = nil
+                quotaError = nil
             }
             return
         }
-        SubscriptionQuotaService.shared.fetch(forceRefresh: force) { [weak self] quota in
+        SubscriptionQuotaService.shared.fetch(forceRefresh: force) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                // Only publish if something actually changed — avoids spurious view re-renders.
-                if self.subscriptionQuota != quota { self.subscriptionQuota = quota }
                 if !self.hasOAuthToken { self.hasOAuthToken = true }
+                switch result {
+                case .success(let quota):
+                    if self.subscriptionQuota != quota { self.subscriptionQuota = quota }
+                    if self.quotaError != nil { self.quotaError = nil }
+                case .noToken:
+                    // Token disappeared between probe and fetch (user ran `claude logout`).
+                    self.hasOAuthToken = false
+                    self.subscriptionQuota = nil
+                    self.quotaError = nil
+                case .unauthorized:
+                    self.subscriptionQuota = nil
+                    self.quotaError = .unauthorized
+                case .rateLimited:
+                    // Keep any previously cached quota visible; just surface the error.
+                    if self.quotaError != .rateLimited { self.quotaError = .rateLimited }
+                case .networkFailure:
+                    if self.quotaError != .networkFailure { self.quotaError = .networkFailure }
+                case .decodeFailure:
+                    if self.quotaError != .decodeFailure { self.quotaError = .decodeFailure }
+                }
             }
         }
     }
@@ -1534,7 +1617,7 @@ struct QuotaProgressBar: View {
     let percent: Int   // 0-100+
     var height: CGFloat = 8
 
-    private var fraction: CGFloat { min(1.0, CGFloat(percent) / 100.0) }
+    private var fraction: CGFloat { max(0.0, min(1.0, CGFloat(percent) / 100.0)) }
     private var color: Color {
         switch percent {
         case ..<70:  return Color(red: 0.20, green: 0.78, blue: 0.45) // green
@@ -1617,17 +1700,25 @@ struct FiveHourWindowCard: View {
             // Subscription quota section — one of two states (API-key users never see this card)
             if let quota = store.subscriptionQuota {
                 QuotaRow(label: loc("quota5h"),
-                         percent: quota.five_hour.utilization,
+                         percent: quota.five_hour.displayPercent,
                          resetAt: quota.fiveHourResetDate,
                          loc: loc)
                 QuotaRow(label: loc("quota7d"),
-                         percent: quota.seven_day.utilization,
+                         percent: quota.seven_day.displayPercent,
                          resetAt: quota.sevenDayResetDate,
                          loc: loc)
+                // Sonnet-specific 7-day bucket — Max plans have a separate cap for Sonnet
+                // in addition to the all-models 7-day cap. Shown only if the API returned it.
+                if let sonnet = quota.seven_day_sonnet {
+                    QuotaRow(label: loc("quota7dSonnet"),
+                             percent: sonnet.displayPercent,
+                             resetAt: quota.sevenDaySonnetResetDate,
+                             loc: loc)
+                }
                 // Optional footnote flags
-                if quota.five_hour.utilization >= 90 || quota.extra_usage?.is_enabled == true {
+                if quota.five_hour.displayPercent >= 90 || quota.extra_usage?.is_enabled == true {
                     HStack(spacing: 10) {
-                        if quota.five_hour.utilization >= 90 {
+                        if quota.five_hour.displayPercent >= 90 {
                             Text(loc("quotaWarnHigh"))
                                 .font(.system(size: 10))
                                 .foregroundColor(Color(red: 0.90, green: 0.40, blue: 0.30))
@@ -1641,13 +1732,13 @@ struct FiveHourWindowCard: View {
                     }
                 }
             } else {
-                // Has OAuth token but API call failed (network/token expired/schema change).
+                // Has OAuth token but no cached quota yet (initial load, or fetch error).
                 // API-key users are filtered out upstream so they never reach this branch.
                 HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle")
+                    Image(systemName: errorIcon)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
-                    Text(loc("quotaFetchFail"))
+                    Text(errorText)
                         .font(.system(size: 10.5))
                         .foregroundColor(.secondary)
                 }
@@ -1671,6 +1762,25 @@ struct FiveHourWindowCard: View {
         let h = Int(seconds / 3600)
         let m = Int((seconds.truncatingRemainder(dividingBy: 3600)) / 60)
         return String(format: loc("win5hResetsIn"), "\(h)h \(m)m")
+    }
+
+    private var errorIcon: String {
+        switch store.quotaError {
+        case .unauthorized:    return "lock.slash"
+        case .rateLimited:     return "hourglass"
+        case .decodeFailure:   return "questionmark.circle"
+        default:               return "exclamationmark.triangle"
+        }
+    }
+
+    private var errorText: String {
+        switch store.quotaError {
+        case .unauthorized:    return loc("quotaTokenExpired")
+        case .rateLimited:     return loc("quotaRateLimited")
+        case .decodeFailure:   return loc("quotaDecodeFail")
+        case .networkFailure, nil:
+            return loc("quotaFetchFail")
+        }
     }
 }
 
