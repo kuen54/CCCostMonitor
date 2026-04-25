@@ -1765,9 +1765,12 @@ struct PopoverView: View {
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
 
-            // ── 5-hour Window Card (subscription quota + local measurement) ──
-            // Only show on current month; historical view has no meaningful "current window".
-            if store.isCurrentMonth {
+            // ── 5-hour Window Card (subscription quota) ──
+            // Only meaningful for Pro/Max users who signed in via OAuth. API-key users
+            // (Bedrock / Vertex / Console) have no subscription quota to show — hide
+            // the card entirely for them rather than cluttering the popover with a
+            // "not applicable" note.
+            if store.isCurrentMonth && store.hasOAuthToken {
                 FiveHourWindowCard(store: store, loc: store.loc)
             }
 
