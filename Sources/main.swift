@@ -633,19 +633,20 @@ class UsageStore: ObservableObject {
         // Refresh subscription quota in parallel (no-op for API-key users)
         refreshQuota()
 
-        // If not viewing current month, just reload historical
-        guard isCurrentMonth else {
+        if isCurrentMonth {
+            // Restore cached today/week/month synchronously so UI doesn't flash
+            // empty while the async fetch runs.
+            if self.today == nil {
+                loadCacheForCurrentMonth()
+            }
+            if self.month == nil {
+                DispatchQueue.main.async { self.isLoading = true }
+            }
+        } else {
+            // Viewing a historical month: reload that view (cache hit or re-fetch).
+            // The current-month async fetch below still runs so the menu-bar total
+            // and on-disk cache stay fresh regardless of what the user is viewing.
             loadHistoricalMonth()
-            return
-        }
-        // If returning from a historical month (today/week nil but stale month data present),
-        // immediately restore cached current month data so UI doesn't flash error
-        if self.today == nil {
-            loadCacheForCurrentMonth()
-        }
-        // Only show loading spinner if no cached data is displayed yet
-        if self.month == nil {
-            DispatchQueue.main.async { self.isLoading = true }
         }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
@@ -663,20 +664,28 @@ class UsageStore: ObservableObject {
             let t = self.deriveToday(daily)
             let w = self.deriveWeek(daily)
             DispatchQueue.main.async {
-                self.today = t
-                self.week = w
-                self.month = m
-                self.dailyBreakdown = daily
+                // Menu-bar total and cache persistence are always about the current month,
+                // so update them regardless of what the user is currently viewing.
                 self.currentMonthData = m
                 self.lastUpdate = Date()
-                self.isLoading = false
-                // Persist current month snapshot
                 if let m = m {
                     self.saveCache(
                         year: cal.component(.year, from: now),
                         month: cal.component(.month, from: now),
                         data: m, daily: daily)
                 }
+                // Popover fields (today/week/month/dailyBreakdown) feed the active view.
+                // If the user navigated to a historical month while this fetch was in
+                // flight, do NOT clobber their view with current-month data.
+                guard self.isCurrentMonth else {
+                    self.isLoading = false
+                    return
+                }
+                self.today = t
+                self.week = w
+                self.month = m
+                self.dailyBreakdown = daily
+                self.isLoading = false
             }
         }
     }
@@ -715,7 +724,16 @@ class UsageStore: ObservableObject {
         let now = Date()
         let y = cal.component(.year, from: now)
         let m = cal.component(.month, from: now)
-        guard let snapshot = loadCacheSnapshot(year: y, month: m) else { return }
+        guard let snapshot = loadCacheSnapshot(year: y, month: m) else {
+            // No cache yet (fresh install, or returning to current month with only
+            // historical state loaded). Clear stale fields so the UI shows the
+            // loading spinner rather than a historical-month-data ghost or errorView.
+            self.today = nil
+            self.week = nil
+            self.month = nil
+            self.dailyBreakdown = nil
+            return
+        }
         let daily = snapshot.dailyBreakdown
         // Derive today/week from daily breakdown, or set empty fallback (old cache format)
         if daily != nil {
