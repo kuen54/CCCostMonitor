@@ -1868,7 +1868,7 @@ struct PopoverView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 10)
             .padding(.bottom, 8)
 
             // ── 5-hour Window Card (subscription quota) ──
