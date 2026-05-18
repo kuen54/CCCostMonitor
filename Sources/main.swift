@@ -1835,7 +1835,7 @@ struct PopoverView: View {
                 Button(action: { store.navigateMonth(offset: -1) }) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 28, height: 28)
+                        .frame(width: 28, height: 28, alignment: .leading)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
@@ -1851,7 +1851,7 @@ struct PopoverView: View {
                 Button(action: { store.navigateMonth(offset: 1) }) {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 28, height: 28)
+                        .frame(width: 28, height: 28, alignment: .trailing)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
@@ -1868,6 +1868,7 @@ struct PopoverView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .padding(.horizontal, 10)
             .padding(.bottom, 8)
 
