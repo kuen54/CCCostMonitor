@@ -2283,9 +2283,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.image = makeClaudeIcon()
             button.imagePosition = .imageLeft
             button.title = " … "
+            // Left-align so the icon+text hug the left edge of the fixed-width cell
+            // and don't recenter as the title width changes between tabs.
+            button.alignment = .left
             button.action = #selector(togglePopover)
             button.target = self
         }
+        // Pin the item to a fixed width. With variableLength, changing the title per
+        // tab resized the button, and NSPopover — anchored to that button — drifted
+        // left as it re-tracked the resizing anchor on every switch. A fixed width
+        // keeps the anchor stationary, so the popover stays put.
+        statusItem.length = computedStatusBarWidth()
 
         // Popover with SwiftUI content
         popover = NSPopover()
@@ -2359,6 +2367,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.showPopover()
         }
+    }
+
+    /// A fixed status-bar width sized to the widest realistic title across all tabs
+    /// (icon + text + padding), measured in the button's own font so it survives
+    /// font/locale differences. Values wider than these templates would clip on the
+    /// right rather than move the anchor — an acceptable trade for a rock-stable popover.
+    private func computedStatusBarWidth() -> CGFloat {
+        guard let button = statusItem.button else { return 90 }
+        let font = button.font ?? NSFont.menuBarFont(ofSize: 0)
+        // Same surrounding spaces as the live titles (" \(title) ").
+        let templates = [" $99999 ", " 999.9b ", " 5h 100% "]
+        let textWidth = templates
+            .map { ($0 as NSString).size(withAttributes: [.font: font]).width }
+            .max() ?? 60
+        let imageWidth = button.image?.size.width ?? 18
+        let spacing: CGFloat = 6   // image-to-title gap + a little breathing room
+        return ceil(imageWidth + spacing + textWidth)
     }
 
     private func showPopover() {
