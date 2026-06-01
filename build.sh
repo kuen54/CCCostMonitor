@@ -16,11 +16,13 @@ mkdir -p "$BUILD_DIR"
 swiftc "$SCRIPT_DIR/Sources/main.swift" \
     -o "$BUILD_DIR/${APP_NAME}_arm64" \
     -framework Cocoa \
+    -framework Security \
     -O \
     -target arm64-apple-macosx13.0
 swiftc "$SCRIPT_DIR/Sources/main.swift" \
     -o "$BUILD_DIR/${APP_NAME}_x86_64" \
     -framework Cocoa \
+    -framework Security \
     -O \
     -target x86_64-apple-macosx13.0
 lipo -create \

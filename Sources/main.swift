@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import Combine
+import Security
 
 // ╔══════════════════════════════════════════════════════════════╗
 // ║  CC Cost Monitor — macOS Menu Bar App                       ║
@@ -151,15 +152,49 @@ final class SubscriptionQuotaService {
         if let env = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !env.isEmpty {
             return env
         }
+        // 1. `~/.claude/.credentials.json` — used on Linux and on macOS when the
+        //    user opted out of Keychain storage.
         let path = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/.credentials.json")
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let token = Self.tokenFromCredentialsJSON(data) {
+            return token
+        }
+        // 2. macOS Keychain — the DEFAULT location Claude Code uses on macOS.
+        //    Item: service "Claude Code-credentials", account = login name.
+        //    Without this, Max/Pro users who never had a plaintext credentials
+        //    file (the common case) appear as "no subscription".
+        if let data = Self.keychainCredentials(), let token = Self.tokenFromCredentialsJSON(data) {
+            return token
+        }
+        return nil
+    }
+
+    /// Extract `claudeAiOauth.accessToken` from a Claude Code credentials JSON blob.
+    private static func tokenFromCredentialsJSON(_ data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = json["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String,
               !token.isEmpty else {
             return nil
         }
         return token
+    }
+
+    /// Read the raw "Claude Code-credentials" generic-password blob from the macOS Keychain.
+    private static func keychainCredentials() -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecAttrAccount as String: NSUserName(),
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else {
+            return nil
+        }
+        return data
     }
 
     /// Fetch quota. Always returns a `QuotaFetchResult` so callers can differentiate
@@ -225,9 +260,20 @@ final class SubscriptionQuotaService {
 enum DisplayTab: Int, CaseIterable {
     case cost = 0
     case tokens = 1
-    var icon: String { self == .cost ? "dollarsign.circle" : "number.circle" }
+    case subscription = 2
+    var icon: String {
+        switch self {
+        case .cost:         return "dollarsign.circle"
+        case .tokens:       return "number.circle"
+        case .subscription: return "gauge.with.dots.needle.67percent"
+        }
+    }
     func label(_ loc: (String) -> String) -> String {
-        self == .cost ? loc("cost") : loc("tokens")
+        switch self {
+        case .cost:         return loc("cost")
+        case .tokens:       return loc("tokens")
+        case .subscription: return loc("subTab")
+        }
     }
 }
 
@@ -302,6 +348,17 @@ private let i18n: [AppLanguage: [String: String]] = [
         "quotaRateLimited":  "Rate limited — retrying soon",
         "quotaDecodeFail":   "Unexpected response schema",
         "bedrockNote":       "API-key auth — no subscription 5h/weekly quota applies.",
+        "subTab":            "Plan",
+        "subTitle":          "Remaining quota",
+        "subRemaining":      "%@ left",
+        "subUsedFmt":        "%d%% used",
+        "subResetFmt":       "resets in %@",
+        "sub5hLabel":        "5-hour window",
+        "sub7dLabel":        "7-day · all models",
+        "sub7dSonnetLabel":  "7-day · Sonnet",
+        "subWaitData":       "Loading quota…",
+        "subNoToken":        "No subscription detected. API-key users (Bedrock / Vertex / Console) have no 5h / weekly cap.",
+        "subExtraOn":        "Extra usage enabled — overage billed beyond plan limits.",
     ],
     .zhHans: [
         "tkIn":         "输入",
@@ -346,6 +403,17 @@ private let i18n: [AppLanguage: [String: String]] = [
         "quotaRateLimited":  "被限流了,稍后重试",
         "quotaDecodeFail":   "响应格式异常",
         "bedrockNote":       "API key 鉴权 — 不受订阅的 5h/周限额约束",
+        "subTab":            "订阅",
+        "subTitle":          "剩余用量",
+        "subRemaining":      "剩余 %@",
+        "subUsedFmt":        "已用 %d%%",
+        "subResetFmt":       "%@ 后重置",
+        "sub5hLabel":        "5 小时窗口",
+        "sub7dLabel":        "7 天 · 全部模型",
+        "sub7dSonnetLabel":  "7 天 · Sonnet",
+        "subWaitData":       "正在获取配额…",
+        "subNoToken":        "未检测到订阅。API-key 用户（Bedrock / Vertex / Console）没有 5 小时 / 每周限额。",
+        "subExtraOn":        "已开启额外用量 — 超出套餐部分将另行计费。",
     ],
     .zhHant: [
         "tkIn":         "輸入",
@@ -390,6 +458,17 @@ private let i18n: [AppLanguage: [String: String]] = [
         "quotaRateLimited":  "被限流了,稍後重試",
         "quotaDecodeFail":   "回應格式異常",
         "bedrockNote":       "API key 驗證 — 不受訂閱的 5h/週限額約束",
+        "subTab":            "訂閱",
+        "subTitle":          "剩餘用量",
+        "subRemaining":      "剩餘 %@",
+        "subUsedFmt":        "已用 %d%%",
+        "subResetFmt":       "%@ 後重置",
+        "sub5hLabel":        "5 小時視窗",
+        "sub7dLabel":        "7 天 · 全部模型",
+        "sub7dSonnetLabel":  "7 天 · Sonnet",
+        "subWaitData":       "正在取得配額…",
+        "subNoToken":        "未偵測到訂閱。API-key 使用者（Bedrock / Vertex / Console）沒有 5 小時 / 每週限額。",
+        "subExtraOn":        "已啟用額外用量 — 超出方案部分將另行計費。",
     ],
     .ja: [
         "tkIn":         "入力",
@@ -434,6 +513,17 @@ private let i18n: [AppLanguage: [String: String]] = [
         "quotaRateLimited":  "レート制限中 — 後ほど再試行",
         "quotaDecodeFail":   "予期しない応答形式",
         "bedrockNote":       "API キー認証 — サブスクの 5h/週の制限は適用されません",
+        "subTab":            "プラン",
+        "subTitle":          "残りクォータ",
+        "subRemaining":      "残り %@",
+        "subUsedFmt":        "%d%% 使用",
+        "subResetFmt":       "%@後にリセット",
+        "sub5hLabel":        "5 時間ウィンドウ",
+        "sub7dLabel":        "7 日間 · 全モデル",
+        "sub7dSonnetLabel":  "7 日間 · Sonnet",
+        "subWaitData":       "クォータを取得中…",
+        "subNoToken":        "サブスクが検出されません。API キー（Bedrock / Vertex / Console）には 5h / 週の上限はありません。",
+        "subExtraOn":        "追加利用が有効 — プラン上限を超過分は別途課金されます。",
     ],
 ]
 
@@ -460,7 +550,15 @@ class UsageStore: ObservableObject {
 
     // Subscription quota (from Anthropic OAuth endpoint, only populated for Pro/Max users)
     @Published var subscriptionQuota: OAuthUsage?
-    @Published var hasOAuthToken: Bool = false
+    @Published var hasOAuthToken: Bool = false {
+        didSet {
+            // The Plan tab is hidden for API-key users; if the token vanishes while
+            // it's selected, drop back to Cost so the segmented picker stays valid.
+            if !hasOAuthToken && selectedTab == .subscription {
+                selectedTab = .cost
+            }
+        }
+    }
     /// Last non-success result for the quota fetch, if any. Used to show error hints
     /// (token expired, rate limited, network, schema change).
     @Published var quotaError: QuotaError?
@@ -1803,9 +1901,159 @@ struct FiveHourWindowCard: View {
     }
 }
 
+// MARK: - Subscription tab
+
+/// One subscription window rendered with a "remaining" framing (how much quota is
+/// LEFT, not how much is used) — that's the question subscription users actually ask.
+/// Anthropic's API reports `utilization` (percent used); remaining = 100 - used.
+struct SubWindowRow: View {
+    let label: String
+    let usedPercent: Int          // 0-100+ as reported by the API
+    let resetAt: Date?
+    let loc: (String) -> String
+
+    private var remaining: Int { max(0, 100 - usedPercent) }
+    private var remainingFraction: CGFloat { max(0, min(1, CGFloat(remaining) / 100.0)) }
+
+    /// Green when there's plenty left, amber when getting low, red when nearly out.
+    private var color: Color {
+        switch remaining {
+        case 30...:  return Color(red: 0.20, green: 0.78, blue: 0.45)  // green
+        case 10..<30: return Color(red: 0.95, green: 0.70, blue: 0.25) // amber
+        default:      return Color(red: 0.90, green: 0.40, blue: 0.30) // coral
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(label)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.primary)
+                Spacer()
+                if let r = resetAt {
+                    Text(String(format: loc("subResetFmt"), shortDuration(r)))
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                }
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(String(format: loc("subRemaining"), "\(remaining)%"))
+                    .font(.system(size: 20, weight: .bold).monospacedDigit())
+                    .foregroundColor(color)
+                Spacer()
+                Text(String(format: loc("subUsedFmt"), usedPercent))
+                    .font(.system(size: 10.5).monospacedDigit())
+                    .foregroundColor(.secondary)
+            }
+            // Remaining bar (fills with what's LEFT)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 4).fill(Color.gray.opacity(0.18))
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(color)
+                        .frame(width: max(2, geo.size.width * remainingFraction))
+                }
+            }
+            .frame(height: 8)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func shortDuration(_ date: Date) -> String {
+        let s = max(0, date.timeIntervalSinceNow)
+        if s < 60 { return "<1m" }
+        if s < 3600 { return "\(Int(s / 60))m" }
+        if s < 86400 {
+            let h = Int(s / 3600), m = Int((s.truncatingRemainder(dividingBy: 3600)) / 60)
+            return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+        }
+        return "\(Int(s / 86400))d"
+    }
+}
+
+/// Dedicated tab: remaining subscription quota across the 5-hour and weekly windows.
+/// Sourced from Anthropic's official OAuth usage endpoint (the real numbers Claude
+/// Code's own /status uses) rather than estimated from local logs.
+struct SubscriptionView: View {
+    @ObservedObject var store: UsageStore
+    let loc: (String) -> String
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if let q = store.subscriptionQuota {
+                SubWindowRow(label: loc("sub5hLabel"),
+                             usedPercent: q.five_hour.displayPercent,
+                             resetAt: q.fiveHourResetDate, loc: loc)
+                SubWindowRow(label: loc("sub7dLabel"),
+                             usedPercent: q.seven_day.displayPercent,
+                             resetAt: q.sevenDayResetDate, loc: loc)
+                // Max plans expose a separate Sonnet 7-day cap. Show it only when the
+                // API actually returns a bucket with activity or a reset time.
+                if let sonnet = q.seven_day_sonnet,
+                   sonnet.displayPercent > 0 || sonnet.resets_at != nil {
+                    SubWindowRow(label: loc("sub7dSonnetLabel"),
+                                 usedPercent: sonnet.displayPercent,
+                                 resetAt: q.sevenDaySonnetResetDate, loc: loc)
+                }
+                if q.extra_usage?.is_enabled == true {
+                    HStack(spacing: 6) {
+                        Image(systemName: "creditcard")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                        Text(loc("subExtraOn"))
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 2)
+                }
+            } else if store.quotaError != nil {
+                stateMessage(icon: "exclamationmark.triangle", text: errorText)
+            } else {
+                // Has a token but quota not loaded yet.
+                VStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(loc("subWaitData"))
+                        .font(.system(size: 11)).foregroundColor(.secondary)
+                }
+                .frame(height: 80)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
+    private func stateMessage(icon: String, text: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon).font(.system(size: 11)).foregroundColor(.secondary)
+            Text(text).font(.system(size: 11)).foregroundColor(.secondary)
+            Spacer()
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+
+    private var errorText: String {
+        switch store.quotaError {
+        case .unauthorized:    return loc("quotaTokenExpired")
+        case .rateLimited:     return loc("quotaRateLimited")
+        case .decodeFailure:   return loc("quotaDecodeFail")
+        case .networkFailure, nil:
+            return loc("quotaFetchFail")
+        }
+    }
+}
+
 struct PopoverView: View {
     @ObservedObject var store: UsageStore
     let onQuit: () -> Void
+
+    /// Cost + Tokens always; the Plan tab only when the user has subscription auth.
+    private var visibleTabs: [DisplayTab] {
+        store.hasOAuthToken ? DisplayTab.allCases : [.cost, .tokens]
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1861,9 +2109,11 @@ struct PopoverView: View {
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
 
-            // ── Tab Picker (Cost / Tokens) ──
+            // ── Tab Picker (Cost / Tokens / Plan) ──
+            // The Plan tab is only shown to subscription (OAuth) users — API-key users
+            // (Bedrock / Vertex / Console) have no 5h/weekly quota to display.
             Picker("", selection: $store.selectedTab) {
-                ForEach(DisplayTab.allCases, id: \.self) { tab in
+                ForEach(visibleTabs, id: \.self) { tab in
                     Label(tab.label(store.loc), systemImage: tab.icon).tag(tab)
                 }
             }
@@ -1877,12 +2127,14 @@ struct PopoverView: View {
             // (Bedrock / Vertex / Console) have no subscription quota to show — hide
             // the card entirely for them rather than cluttering the popover with a
             // "not applicable" note.
-            if store.isCurrentMonth && store.hasOAuthToken {
+            if store.isCurrentMonth && store.hasOAuthToken && store.selectedTab != .subscription {
                 FiveHourWindowCard(store: store, loc: store.loc)
             }
 
             // ── Content (no scroll, show everything) ──
-            if store.isCurrentMonth {
+            if store.selectedTab == .subscription {
+                SubscriptionView(store: store, loc: store.loc)
+            } else if store.isCurrentMonth {
                 if let today = store.today, let week = store.week, let month = store.month {
                     VStack(spacing: 8) {
                         if store.selectedTab == .cost {
@@ -2232,9 +2484,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // Observe current month data + tab changes to update menu bar title
         // Always shows current month regardless of which month is being viewed
-        cancellable = Publishers.CombineLatest3(store.$currentMonthData, store.$selectedTab, store.$language)
+        cancellable = Publishers.CombineLatest4(
+            store.$currentMonthData, store.$selectedTab, store.$language, store.$subscriptionQuota)
             .receive(on: RunLoop.main)
-            .sink { [weak self] monthData, tab, _ in
+            .sink { [weak self] monthData, tab, _, quota in
                 guard let self = self, let monthData = monthData else { return }
                 let title: String
                 switch tab {
@@ -2242,6 +2495,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     title = formatCost(monthData.cost)
                 case .tokens:
                     title = formatTokensShort(monthData.totalTokens)
+                case .subscription:
+                    // Show what's LEFT in the 5-hour window — the limit subs hit first.
+                    if let q = quota {
+                        title = "5h \(max(0, 100 - q.five_hour.displayPercent))%"
+                    } else {
+                        title = formatCost(monthData.cost)
+                    }
                 }
                 self.statusItem.button?.title = " \(title) "
             }

@@ -819,19 +819,48 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 
 
-def _read_oauth_token() -> Optional[str]:
-    """Return the Claude Code OAuth access token, or None if unavailable."""
-    env_token = __import__("os").environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    if env_token:
-        return env_token
-    if not CREDENTIALS_PATH.exists():
-        return None
+def _token_from_credentials_blob(text: str) -> Optional[str]:
+    """Extract claudeAiOauth.accessToken from a credentials JSON string."""
     try:
-        with open(CREDENTIALS_PATH, "r") as f:
-            data = json.load(f)
+        data = json.loads(text)
         return (data.get("claudeAiOauth") or {}).get("accessToken") or None
     except Exception:
         return None
+
+
+def _read_oauth_token() -> Optional[str]:
+    """Return the Claude Code OAuth access token, or None if unavailable.
+
+    Checks, in order: env var, `~/.claude/.credentials.json`, then (on macOS) the
+    login Keychain — which is the DEFAULT location Claude Code stores credentials
+    on macOS, so Pro/Max users typically have no plaintext file at all.
+    """
+    import os
+    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env_token:
+        return env_token
+    if CREDENTIALS_PATH.exists():
+        try:
+            with open(CREDENTIALS_PATH, "r") as f:
+                token = _token_from_credentials_blob(f.read())
+            if token:
+                return token
+        except Exception:
+            pass
+    # macOS Keychain fallback
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return _token_from_credentials_blob(out.stdout.strip())
+        except Exception:
+            pass
+    return None
 
 
 def fetch_oauth_usage() -> Optional[dict]:
