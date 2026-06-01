@@ -20,6 +20,7 @@ This app reads all your local session data and puts it in one place. One menu ba
 ### What you get
 
 - **Cost & Tokens** — switch views, with per-model breakdown (Opus / Sonnet / Haiku)
+- **Subscription quota** (Pro / Max) — dedicated tab showing how much is *left* in the 5-hour, 7-day and 7-day Sonnet windows, with reset countdowns. Live from Anthropic's official usage endpoint — the same source Claude Code's `/usage` uses
 - **Today / This Week / This Month** — token distribution by type (input, output, cache read, cache write)
 - **Daily bar chart** — hover for details
 - **Month navigation** — browse past months, cached locally
@@ -62,6 +63,8 @@ The app shells out to a bundled Python script that scans `~/.claude/projects/**/
     → SwiftUI popover
 ```
 
+The **Subscription** tab is separate: it calls Anthropic's OAuth usage endpoint directly (no local logs involved). The access token is read from `~/.claude/.credentials.json` or — the default on macOS — the login **Keychain** (`Claude Code-credentials`). macOS may prompt for Keychain access on first use; choose *Always Allow*. API-key users (Bedrock / Vertex / Console) have no subscription quota, so the tab is hidden for them.
+
 ### Project structure
 
 Single-file Swift app. No Xcode, no SPM. Just `swiftc`.
@@ -94,6 +97,7 @@ Claude Code 的 `/cost` 只显示当前会话。如果你有多个 Anthropic 账
 ### 功能
 
 - **费用 & Tokens** — 双视图切换，按模型分类（Opus / Sonnet / Haiku）
+- **订阅剩余用量**（Pro / Max）— 独立 tab，查看 5 小时 / 7 天 / 7 天 Sonnet 窗口**还剩多少**及重置倒计时。数据来自 Anthropic 官方用量接口 —— 与 Claude Code `/usage` 同源
 - **今日 / 本周 / 本月** — 按类型拆分 token（输入、输出、缓存读、缓存写）
 - **每日柱状图** — 悬浮查看详情
 - **月份导航** — 浏览历史月份，本地缓存
@@ -135,6 +139,8 @@ open build/CCCostMonitor.app
     → analyze_usage.py --json
     → SwiftUI 弹窗
 ```
+
+**订阅** tab 走的是另一条路：直接调用 Anthropic 的 OAuth 用量接口（不读本地日志）。访问 token 从 `~/.claude/.credentials.json` 读取，或——在 macOS 上的默认情况——从登录**钥匙串**（`Claude Code-credentials`）读取。首次使用时 macOS 可能弹出钥匙串授权框，请选择*始终允许*。API-key 用户（Bedrock / Vertex / Console）没有订阅限额，该 tab 对他们隐藏。
 
 ### 项目结构
 
