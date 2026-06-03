@@ -47,11 +47,18 @@ First launch: right-click → Open (bypasses Gatekeeper for unsigned apps).
 ```bash
 git clone https://github.com/kuen54/CCCostMonitor.git
 cd CCCostMonitor
+bash setup_signing.sh   # optional, one-time — see below
 bash build.sh
 open build/CCCostMonitor.app
 ```
 
 > If `swiftc` complains about `redefinition of module 'SwiftBridging'`, run `bash fix_swift.sh`.
+
+> **`setup_signing.sh`** (optional, run once) creates a stable self-signed code-signing
+> identity. `build.sh` then signs every build with it, so the macOS Keychain *Always Allow*
+> grant for the OAuth token survives rebuilds. Without it the build falls back to ad-hoc
+> signing, whose identity changes each build — you'd have to re-authorize Keychain access
+> (and the Subscription tab would keep vanishing) after every rebuild.
 
 ### How it works
 
@@ -72,6 +79,7 @@ Single-file Swift app. No Xcode, no SPM. Just `swiftc`.
 ```
 Sources/main.swift      ← everything
 build.sh                ← compile + bundle + DMG
+setup_signing.sh        ← one-time stable self-signed signing identity
 generate_icon.swift     ← ASCII-art app icon generator
 Info.plist              ← LSUIElement=true
 ```
@@ -124,11 +132,17 @@ Claude Code 的 `/cost` 只显示当前会话。如果你有多个 Anthropic 账
 ```bash
 git clone https://github.com/kuen54/CCCostMonitor.git
 cd CCCostMonitor
+bash setup_signing.sh   # 可选，一次性 — 见下方说明
 bash build.sh
 open build/CCCostMonitor.app
 ```
 
 > 如果 `swiftc` 报错 `redefinition of module 'SwiftBridging'`，运行 `bash fix_swift.sh`。
+
+> **`setup_signing.sh`**（可选，跑一次即可）会生成一个稳定的自签名代码签名证书。之后
+> `build.sh` 每次都用它签名，这样 macOS 钥匙串对 OAuth token 的*始终允许*授权就能在重新
+> 构建后依然有效。不跑它则回退到 ad-hoc 签名，其身份每次构建都变 —— 每次重新构建后你都得
+> 重新授权钥匙串（且订阅 tab 会反复消失）。
 
 ### 工作原理
 
@@ -149,6 +163,7 @@ open build/CCCostMonitor.app
 ```
 Sources/main.swift      ← 全部源码
 build.sh                ← 编译 + 打包 + DMG
+setup_signing.sh        ← 一次性生成稳定自签名证书
 generate_icon.swift     ← ASCII art 风格图标生成器
 Info.plist              ← LSUIElement=true
 ```

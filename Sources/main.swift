@@ -2042,6 +2042,10 @@ struct PopoverView: View {
             .padding(.vertical, 10)
         }
         .frame(width: 360)
+        // Switch tabs instantly. Without this, SwiftUI animates the content-height
+        // change when selectedTab flips, which ripples up and makes the month-nav row
+        // jitter as the popover resizes. nil animation = instant swap, no resize wobble.
+        .animation(nil, value: store.selectedTab)
     }
 
     private var loadingView: some View {
@@ -2087,6 +2091,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var store = UsageStore()
     private var refreshTimer: Timer?
     private var cancellable: AnyCancellable?
+    // Latest desired menu-bar title. While the popover is open we defer applying it to
+    // the button (a resizing anchor makes NSPopover drift left); popoverDidClose flushes it.
+    private var latestMenuTitle = " … "
 
     // Claude official logo as a menu bar template image
     // SVG path from SimpleIcons (https://simpleicons.org/?q=claude), viewBox 0 0 24 24
@@ -2283,17 +2290,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.image = makeClaudeIcon()
             button.imagePosition = .imageLeft
             button.title = " … "
-            // Left-align so the icon+text hug the left edge of the fixed-width cell
-            // and don't recenter as the title width changes between tabs.
-            button.alignment = .left
             button.action = #selector(togglePopover)
             button.target = self
         }
-        // Pin the item to a fixed width. With variableLength, changing the title per
-        // tab resized the button, and NSPopover — anchored to that button — drifted
-        // left as it re-tracked the resizing anchor on every switch. A fixed width
-        // keeps the anchor stationary, so the popover stays put.
-        statusItem.length = computedStatusBarWidth()
+        // Status item stays variableLength (sizes to content — the idiomatic menu-bar
+        // behavior). Popover drift is prevented by freezing the title while the popover
+        // is open (see the title sink + popoverDidClose), not by pinning the width.
 
         // Popover with SwiftUI content
         popover = NSPopover()
@@ -2329,7 +2331,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         title = formatCost(monthData.cost)
                     }
                 }
-                self.statusItem.button?.title = " \(title) "
+                let display = " \(title) "
+                self.latestMenuTitle = display
+                // Don't resize the status button while the popover is open — a resizing
+                // anchor makes NSPopover creep left. popoverDidClose applies the latest.
+                if !self.popover.isShown {
+                    self.statusItem.button?.title = display
+                }
             }
 
         // Load cached data instantly, then refresh in background
@@ -2369,21 +2377,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    /// A fixed status-bar width sized to the widest realistic title across all tabs
-    /// (icon + text + padding), measured in the button's own font so it survives
-    /// font/locale differences. Values wider than these templates would clip on the
-    /// right rather than move the anchor — an acceptable trade for a rock-stable popover.
-    private func computedStatusBarWidth() -> CGFloat {
-        guard let button = statusItem.button else { return 90 }
-        let font = button.font ?? NSFont.menuBarFont(ofSize: 0)
-        // Same surrounding spaces as the live titles (" \(title) ").
-        let templates = [" $99999 ", " 999.9b ", " 5h 100% "]
-        let textWidth = templates
-            .map { ($0 as NSString).size(withAttributes: [.font: font]).width }
-            .max() ?? 60
-        let imageWidth = button.image?.size.width ?? 18
-        let spacing: CGFloat = 6   // image-to-title gap + a little breathing room
-        return ceil(imageWidth + spacing + textWidth)
+    // NSPopoverDelegate: the title may have changed (data refresh or tab switch) while
+    // the popover was open and we deferred it to keep the anchor stable. Apply it now.
+    func popoverDidClose(_ notification: Notification) {
+        statusItem.button?.title = latestMenuTitle
+    }
+
+    // Animate the open, but stop animating once shown so per-tab content-height
+    // changes resize the popover instantly instead of jittering the rows above.
+    func popoverDidShow(_ notification: Notification) {
+        popover.animates = false
     }
 
     private func showPopover() {
@@ -2391,6 +2394,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         statusItem.isVisible = true
         guard let button = statusItem.button else { return }
         if !popover.isShown {
+            popover.animates = true
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
@@ -2407,6 +2411,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            popover.animates = true
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             // Bring popover window to front
             popover.contentViewController?.view.window?.makeKey()
