@@ -66,8 +66,20 @@ else
     echo "  ⚠️  analyze_usage.py not found — app will look for it at runtime"
 fi
 
-# Ad-hoc code sign (allows running without Gatekeeper warning on same machine)
-codesign --force --sign - "$APP_BUNDLE" 2>/dev/null && echo "  ✅ Ad-hoc signed" || echo "  ⚠️  Skipped signing"
+# Code sign. Prefer a stable self-signed identity so every rebuild keeps a CONSTANT
+# code identity (cert-based Designated Requirement). That lets the macOS Keychain
+# "Always Allow" grant for the Claude Code OAuth token survive rebuilds — ad-hoc
+# signing changes the cdhash each build and loses the grant. Run setup_signing.sh
+# once to create the identity; falls back to ad-hoc if it's absent (e.g. other machine).
+SIGN_IDENTITY="CCCostMonitor Self-Signed"
+if security find-certificate -c "$SIGN_IDENTITY" >/dev/null 2>&1 \
+   && codesign --force --sign "$SIGN_IDENTITY" "$APP_BUNDLE" 2>/dev/null; then
+    echo "  ✅ Signed with stable identity ($SIGN_IDENTITY)"
+elif codesign --force --sign - "$APP_BUNDLE" 2>/dev/null; then
+    echo "  ✅ Ad-hoc signed (run setup_signing.sh for a stable identity)"
+else
+    echo "  ⚠️  Skipped signing"
+fi
 
 echo "  ✅ Bundle ready: $APP_BUNDLE"
 
