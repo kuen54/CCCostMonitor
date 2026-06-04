@@ -38,9 +38,9 @@ PRICING_CACHE_TTL = 86400  # 24 hours in seconds
 # Mirrors the latest public Anthropic list prices for Claude 4.x
 # (Opus 4.6/4.7, Sonnet 4.6, Haiku 4.5). Keep in sync with class_candidates below.
 FALLBACK_PRICING = {
-    "opus":   {"input":  5.00, "output": 25.00, "cache_write":  6.25, "cache_read": 0.50},
-    "sonnet": {"input":  3.00, "output": 15.00, "cache_write":  3.75, "cache_read": 0.30},
-    "haiku":  {"input":  1.00, "output":  5.00, "cache_write":  1.25, "cache_read": 0.10},
+    "opus":   {"input":  5.00, "output": 25.00, "cache_write":  6.25, "cache_write_1h": 10.00, "cache_read": 0.50},
+    "sonnet": {"input":  3.00, "output": 15.00, "cache_write":  3.75, "cache_write_1h":  6.00, "cache_read": 0.30},
+    "haiku":  {"input":  1.00, "output":  5.00, "cache_write":  1.25, "cache_write_1h":  2.00, "cache_read": 0.10},
 }
 
 EMOJI = {"opus": "\U0001f7e3", "sonnet": "\U0001f535", "haiku": "\U0001f7e2"}  # 🟣🔵🟢
@@ -104,13 +104,17 @@ def _extract_litellm_entry(entry: dict) -> Optional[dict]:
     out = entry.get("output_cost_per_token")
     if inp is None or out is None:
         return None
-    cw = entry.get("cache_creation_input_token_cost", inp * 1.25)  # default: 1.25x input
+    cw = entry.get("cache_creation_input_token_cost", inp * 1.25)  # default: 1.25x input (5m TTL)
+    # 1-hour cache write costs more (2x input). Claude Code + Opus 4.8 use the 1h tier
+    # heavily; pricing it at the 5m rate under-reports cost. Default 2x input when absent.
+    cw1h = entry.get("cache_creation_input_token_cost_above_1hr", inp * 2.0)
     cr = entry.get("cache_read_input_token_cost", inp * 0.1)       # default: 0.1x input
     return {
-        "input":       _per_token_to_per_million(inp),
-        "output":      _per_token_to_per_million(out),
-        "cache_write": _per_token_to_per_million(cw),
-        "cache_read":  _per_token_to_per_million(cr),
+        "input":          _per_token_to_per_million(inp),
+        "output":         _per_token_to_per_million(out),
+        "cache_write":    _per_token_to_per_million(cw),
+        "cache_write_1h": _per_token_to_per_million(cw1h),
+        "cache_read":     _per_token_to_per_million(cr),
     }
 
 
@@ -289,10 +293,16 @@ def cost_for_message(usage: dict, model_str: str) -> float:
     if p is None:
         cls = classify_model(model_str)
         p = MODEL_PRICING.get(cls, FALLBACK_PRICING.get(cls, FALLBACK_PRICING["sonnet"]))
+    # Cache creation splits into a 1-hour tier (pricier) and the default 5-minute tier.
+    # `cache_write` holds total creation tokens; `cache_write_1h` the 1h subset.
+    cw_1h = usage.get("cache_write_1h", 0)
+    cw_5m = max(0, usage["cache_write"] - cw_1h)
+    cw_1h_price = p.get("cache_write_1h", p["cache_write"])  # older pricing dicts lack 1h
     return (
         usage["input_tokens"]  * p["input"]       / 1_000_000
       + usage["output_tokens"] * p["output"]      / 1_000_000
-      + usage["cache_write"]   * p["cache_write"] / 1_000_000
+      + cw_5m                  * p["cache_write"] / 1_000_000
+      + cw_1h                  * cw_1h_price      / 1_000_000
       + usage["cache_read"]    * p["cache_read"]  / 1_000_000
     )
 
@@ -539,9 +549,14 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
                         model_cls = classify_model(model_str)
                         cw = usage_raw.get("cache_creation_input_tokens", 0)
                         cr = usage_raw.get("cache_read_input_tokens", 0)
+                        # 1-hour cache tier (priced higher than 5m). Newer Claude Code +
+                        # Opus 4.8 put most cache creation here; needed for correct cost.
+                        cc_detail = usage_raw.get("cache_creation") or {}
+                        cw_1h = cc_detail.get("ephemeral_1h_input_tokens", 0)
                         # Per-message cost using the exact model string (preferred over
                         # class-level pricing — avoids mis-pricing Opus 4.7 as Opus 4).
-                        single = {"input_tokens": inp, "output_tokens": out, "cache_write": cw, "cache_read": cr}
+                        single = {"input_tokens": inp, "output_tokens": out, "cache_write": cw,
+                                  "cache_write_1h": cw_1h, "cache_read": cr}
                         msg_cost = cost_for_message(single, model_str)
                         # Session-level aggregation
                         mu = sessions[sid]["models"][model_cls]
