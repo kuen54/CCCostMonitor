@@ -330,7 +330,7 @@ final class SubscriptionQuotaService {
         req.httpMethod = "POST"
         req.timeoutInterval = 15
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("CCCostMonitor/1.3.4", forHTTPHeaderField: "User-Agent")
+        req.setValue("CCCostMonitor/1.3.5", forHTTPHeaderField: "User-Agent")
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
             "grant_type": "refresh_token",
             "refresh_token": refresh,
@@ -412,7 +412,7 @@ final class SubscriptionQuotaService {
         req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("CCCostMonitor/1.3.4", forHTTPHeaderField: "User-Agent")
+        req.setValue("CCCostMonitor/1.3.5", forHTTPHeaderField: "User-Agent")
 
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
             guard let self = self else { return }
