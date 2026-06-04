@@ -142,59 +142,235 @@ final class SubscriptionQuotaService {
     private var cached: (quota: OAuthUsage, at: Date)?
     private let lock = NSLock()
 
-    /// True if a credentials file with an OAuth access token was found on disk.
-    /// Distinguishes "API-key user (expected no quota)" from "network/API failure".
-    var hasOAuthToken: Bool {
-        return readToken() != nil
+    // Keychain item + OAuth refresh endpoint (mirrors Claude Code's own values).
+    private static let keychainService = "Claude Code-credentials"
+    private static let refreshURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+    private static let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    private static let oauthScopes =
+        "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+    private static let refreshBufferMs: Double = 5 * 60 * 1000  // refresh 5 min before expiry
+
+    /// Parsed Claude Code OAuth credentials plus where they were read from, so a refreshed
+    /// token can be written back to the same place.
+    private struct OAuthCredentials {
+        var accessToken: String
+        var refreshToken: String?
+        var expiresAtMs: Double?        // epoch ms — matches Claude Code's `expiresAt`
+        let source: Source
+        var fullData: [String: Any]     // entire credentials JSON, round-tripped on save
+
+        enum Source {
+            case env                    // CLAUDE_CODE_OAUTH_TOKEN — read-only, no refresh
+            case file(path: String)
+            case keychain(service: String)
+        }
+
+        /// Fold the (possibly refreshed) token fields back into `fullData` so every other
+        /// field Claude Code stores (scopes, subscriptionType, …) survives the write-back.
+        mutating func syncIntoFullData() {
+            var oauth = (fullData["claudeAiOauth"] as? [String: Any]) ?? [:]
+            oauth["accessToken"] = accessToken
+            if let r = refreshToken { oauth["refreshToken"] = r }
+            if let e = expiresAtMs { oauth["expiresAt"] = Int(e.rounded()) }
+            fullData["claudeAiOauth"] = oauth
+        }
     }
 
-    private func readToken() -> String? {
+    /// True if a subscription OAuth token is present. Uses an attributes-only Keychain
+    /// lookup (no `-w`), so merely deciding whether to show the Plan tab never triggers a
+    /// password prompt — only the actual quota fetch reads the secret.
+    var hasOAuthToken: Bool {
         if let env = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !env.isEmpty {
-            return env
+            return true
         }
-        // 1. `~/.claude/.credentials.json` — used on Linux and on macOS when the
-        //    user opted out of Keychain storage.
         let path = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/.credentials.json")
         if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let token = Self.tokenFromCredentialsJSON(data) {
-            return token
+           Self.parseCredentials(data, source: .file(path: path)) != nil {
+            return true
         }
-        // 2. macOS Keychain — the DEFAULT location Claude Code uses on macOS.
-        //    Item: service "Claude Code-credentials", account = login name.
-        //    Without this, Max/Pro users who never had a plaintext credentials
-        //    file (the common case) appear as "no subscription".
-        if let data = Self.keychainCredentials(), let token = Self.tokenFromCredentialsJSON(data) {
-            return token
+        return Self.runSecurity(["find-generic-password", "-s", Self.keychainService]) != nil
+    }
+
+    /// Load credentials from env → plaintext file → Keychain (via the `security` CLI).
+    private func loadCredentials() -> OAuthCredentials? {
+        if let env = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !env.isEmpty {
+            return OAuthCredentials(accessToken: env, refreshToken: nil, expiresAtMs: nil,
+                                    source: .env, fullData: [:])
+        }
+        // 1. `~/.claude/.credentials.json` — Linux, or macOS opted out of Keychain.
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/.credentials.json")
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let creds = Self.parseCredentials(data, source: .file(path: path)) {
+            return creds
+        }
+        // 2. macOS Keychain — the default location Claude Code uses on macOS.
+        if let data = Self.securityReadBlob(service: Self.keychainService),
+           let creds = Self.parseCredentials(data, source: .keychain(service: Self.keychainService)) {
+            return creds
         }
         return nil
     }
 
-    /// Extract `claudeAiOauth.accessToken` from a Claude Code credentials JSON blob.
-    private static func tokenFromCredentialsJSON(_ data: Data) -> String? {
+    /// Extract the OAuth fields + retain the full JSON from a Claude Code credentials blob.
+    private static func parseCredentials(_ data: Data, source: OAuthCredentials.Source) -> OAuthCredentials? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String,
-              !token.isEmpty else {
+              let token = oauth["accessToken"] as? String, !token.isEmpty else {
             return nil
         }
-        return token
+        return OAuthCredentials(
+            accessToken: token,
+            refreshToken: oauth["refreshToken"] as? String,
+            expiresAtMs: oauth["expiresAt"] as? Double,
+            source: source,
+            fullData: json
+        )
     }
 
-    /// Read the raw "Claude Code-credentials" generic-password blob from the macOS Keychain.
-    private static func keychainCredentials() -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecAttrAccount as String: NSUserName(),
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else {
-            return nil
+    // MARK: Keychain access via the `security` CLI
+    //
+    // We deliberately shell out to the Apple-signed `/usr/bin/security` instead of calling
+    // `SecItemCopyMatching` in-process. macOS binds the "Always Allow" Keychain grant to the
+    // *requesting process's* code signature: in-process that's CCCostMonitor's own self-signed,
+    // frequently-rebuilt identity, so the grant breaks on every rebuild / Claude Code token
+    // refresh and the user is re-prompted. Routing through `/usr/bin/security` binds the grant
+    // to that binary's stable system signature, so it's granted once and then persists.
+    //
+    // Tradeoff: once `security` is "Always Allow"-ed, any same-user process can read the item by
+    // spawning `security` too. That's the same exposure Claude Code's own item already has.
+
+    /// Run `/usr/bin/security` with `args`; return stdout on exit 0 (empty string allowed), else nil.
+    private static func runSecurity(_ args: [String]) -> String? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        task.arguments = args
+        let out = Pipe()
+        task.standardOutput = out
+        task.standardError = Pipe()
+        do { try task.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else { return nil }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// Read the credentials blob (`-w` reads the secret → this is the call that may prompt once).
+    private static func securityReadBlob(service: String) -> Data? {
+        guard let out = runSecurity(["find-generic-password", "-s", service, "-w"]) else { return nil }
+        return decodeSecurityValue(out)
+    }
+
+    /// `security -w` returns the raw value, except it hex-encodes values containing newlines
+    /// (which is how Claude Code's pretty-printed JSON comes back). Handle both forms.
+    private static func decodeSecurityValue(_ text: String) -> Data? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+        if let d = trimmed.data(using: .utf8),
+           (try? JSONSerialization.jsonObject(with: d)) != nil {
+            return d
         }
-        return data
+        var hex = trimmed
+        if hex.hasPrefix("0x") || hex.hasPrefix("0X") { hex = String(hex.dropFirst(2)) }
+        guard hex.count % 2 == 0,
+              hex.range(of: "^[0-9a-fA-F]+$", options: .regularExpression) != nil else {
+            return trimmed.data(using: .utf8)
+        }
+        var bytes = [UInt8](); bytes.reserveCapacity(hex.count / 2)
+        var i = hex.startIndex
+        while i < hex.endIndex {
+            let j = hex.index(i, offsetBy: 2)
+            guard let b = UInt8(hex[i..<j], radix: 16) else { return trimmed.data(using: .utf8) }
+            bytes.append(b); i = j
+        }
+        return Data(bytes)
+    }
+
+    /// Discover the item's account for write-back (attributes only, no `-w`, no prompt).
+    private static func securityAccount(service: String) -> String {
+        if let out = runSecurity(["find-generic-password", "-s", service]) {
+            for line in out.split(separator: "\n") {
+                if let r = line.range(of: "\"acct\"<blob>=\"") {
+                    let rest = line[r.upperBound...]
+                    if let end = rest.firstIndex(of: "\"") { return String(rest[..<end]) }
+                }
+            }
+        }
+        return NSUserName()
+    }
+
+    /// Write refreshed credentials back via `security ... -U`. Value must be newline-free JSON
+    /// (see decodeSecurityValue) or Claude Code can't read its own item back.
+    @discardableResult
+    private static func securityWriteBlob(service: String, account: String, json: Data) -> Bool {
+        guard let str = String(data: json, encoding: .utf8) else { return false }
+        // NOTE: the value is passed as a CLI argument, briefly visible to same-user processes
+        // via `ps`. Acceptable: any same-user process can already read the item via `security`.
+        return runSecurity(["add-generic-password", "-U", "-a", account, "-s", service, "-w", str]) != nil
+    }
+
+    // MARK: Token refresh (mirrors openusage / Claude Code's own OAuth refresh)
+
+    private func needsRefresh(_ creds: OAuthCredentials) -> Bool {
+        guard let exp = creds.expiresAtMs else { return false }
+        return Date().timeIntervalSince1970 * 1000 >= exp - Self.refreshBufferMs
+    }
+
+    /// Refresh proactively if the token is expired / expiring; otherwise pass through unchanged.
+    private func ensureFreshToken(_ creds: OAuthCredentials,
+                                  completion: @escaping (OAuthCredentials) -> Void) {
+        guard needsRefresh(creds), creds.refreshToken != nil else { completion(creds); return }
+        performRefresh(creds) { completion($0 ?? creds) }
+    }
+
+    /// Exchange the refresh token for a new access token and persist it back to its source.
+    private func performRefresh(_ creds: OAuthCredentials,
+                                completion: @escaping (OAuthCredentials?) -> Void) {
+        guard let refresh = creds.refreshToken, !refresh.isEmpty else { completion(nil); return }
+        var req = URLRequest(url: Self.refreshURL)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 15
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("CCCostMonitor/1.3.4", forHTTPHeaderField: "User-Agent")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": Self.oauthClientID,
+            "scope": Self.oauthScopes,
+        ])
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            guard let self = self else { completion(nil); return }
+            let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            guard (200..<300).contains(status), let data = data,
+                  let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let newAccess = body["access_token"] as? String, !newAccess.isEmpty else {
+                completion(nil)
+                return
+            }
+            var updated = creds
+            updated.accessToken = newAccess
+            if let r = body["refresh_token"] as? String, !r.isEmpty { updated.refreshToken = r }
+            if let e = body["expires_in"] as? Double {
+                updated.expiresAtMs = Date().timeIntervalSince1970 * 1000 + e * 1000
+            }
+            self.saveCredentials(updated)
+            completion(updated)
+        }.resume()
+    }
+
+    /// Persist (refreshed) credentials back to whichever source they came from.
+    private func saveCredentials(_ creds: OAuthCredentials) {
+        var creds = creds
+        creds.syncIntoFullData()
+        guard let json = try? JSONSerialization.data(withJSONObject: creds.fullData) else { return }
+        switch creds.source {
+        case .env:
+            break  // injected token — nothing to persist
+        case .file(let path):
+            try? json.write(to: URL(fileURLWithPath: path))
+        case .keychain(let service):
+            Self.securityWriteBlob(service: service, account: Self.securityAccount(service: service), json: json)
+        }
     }
 
     /// Fetch quota. Always returns a `QuotaFetchResult` so callers can differentiate
@@ -209,11 +385,20 @@ final class SubscriptionQuotaService {
         }
         lock.unlock()
 
-        guard let token = readToken() else {
+        guard let creds = loadCredentials() else {
             completion(.noToken)
             return
         }
 
+        // Refresh proactively when expired/expiring, then fetch usage. requestUsage also
+        // force-refreshes once on a 401 in case Claude Code rotated the token out from under us.
+        ensureFreshToken(creds) { [weak self] fresh in
+            self?.requestUsage(fresh, allowRefreshRetry: true, completion: completion)
+        }
+    }
+
+    private func requestUsage(_ creds: OAuthCredentials, allowRefreshRetry: Bool,
+                              completion: @escaping (QuotaFetchResult) -> Void) {
         // Belt-and-suspenders HTTPS assertion. URL is hardcoded `https://` but prevents
         // future edits from accidentally introducing a plaintext URL.
         guard url.scheme == "https" else {
@@ -224,10 +409,10 @@ final class SubscriptionQuotaService {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.timeoutInterval = 8
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("CCCostMonitor/1.2.3", forHTTPHeaderField: "User-Agent")
+        req.setValue("CCCostMonitor/1.3.4", forHTTPHeaderField: "User-Agent")
 
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
             guard let self = self else { return }
@@ -246,7 +431,17 @@ final class SubscriptionQuotaService {
                 self.lock.unlock()
                 completion(.success(quota))
             case 401, 403:
-                completion(.unauthorized)
+                if allowRefreshRetry, creds.refreshToken != nil {
+                    self.performRefresh(creds) { refreshed in
+                        if let r = refreshed {
+                            self.requestUsage(r, allowRefreshRetry: false, completion: completion)
+                        } else {
+                            completion(.unauthorized)
+                        }
+                    }
+                } else {
+                    completion(.unauthorized)
+                }
             case 429:
                 completion(.rateLimited)
             default:
