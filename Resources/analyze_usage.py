@@ -35,15 +35,16 @@ PRICING_CACHE_PATH = Path.home() / ".claude" / "cache" / "litellm_pricing.json"
 PRICING_CACHE_TTL = 86400  # 24 hours in seconds
 
 # Fallback pricing (USD per million tokens) when LiteLLM is unavailable.
-# Mirrors the latest public Anthropic list prices for Claude 4.x
-# (Opus 4.6/4.7, Sonnet 4.6, Haiku 4.5). Keep in sync with class_candidates below.
+# Mirrors the latest public Anthropic list prices for Claude
+# (Fable 5, Opus 4.6/4.7/4.8, Sonnet 4.6, Haiku 4.5). Keep in sync with class_candidates below.
 FALLBACK_PRICING = {
+    "fable":  {"input": 10.00, "output": 50.00, "cache_write": 12.50, "cache_write_1h": 20.00, "cache_read": 1.00},
     "opus":   {"input":  5.00, "output": 25.00, "cache_write":  6.25, "cache_write_1h": 10.00, "cache_read": 0.50},
     "sonnet": {"input":  3.00, "output": 15.00, "cache_write":  3.75, "cache_write_1h":  6.00, "cache_read": 0.30},
     "haiku":  {"input":  1.00, "output":  5.00, "cache_write":  1.25, "cache_write_1h":  2.00, "cache_read": 0.10},
 }
 
-EMOJI = {"opus": "\U0001f7e3", "sonnet": "\U0001f535", "haiku": "\U0001f7e2"}  # 🟣🔵🟢
+EMOJI = {"fable": "\U0001f7e0", "opus": "\U0001f7e3", "sonnet": "\U0001f535", "haiku": "\U0001f7e2"}  # 🟠🟣🔵🟢
 
 # Runtime: populated by load_pricing()
 MODEL_PRICING = {}        # model_class -> {input, output, cache_write, cache_read} (per million)
@@ -136,24 +137,26 @@ def load_pricing():
     _LITELLM_RAW = raw
     _PRICING_SOURCE = "litellm"
 
-    # Dynamic representative: scan LiteLLM for `claude-<class>-<major>-<minor>`
+    # Dynamic representative: scan LiteLLM for `claude-<class>-<major>[-<minor>]`
     # and pick the newest by (major, minor). Pure-canonical form only
     # (no provider prefixes, no date suffix) to avoid picking regional variants.
     # Minor is capped to 1–2 digits so a date-suffixed legacy key like
     # `claude-opus-4-20250514` (minor=20250514) doesn't outrank `claude-opus-4-7`.
+    # Minor is optional because newer tiers drop it entirely (`claude-fable-5`).
     import re as _re
-    pat = _re.compile(r"^claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})$")
+    pat = _re.compile(r"^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?$")
     newest: dict[str, tuple[tuple[int, int], str]] = {}
     for key in raw.keys():
         m = pat.match(key)
         if not m:
             continue
-        cls, major, minor = m.group(1), int(m.group(2)), int(m.group(3))
+        cls, major = m.group(1), int(m.group(2))
+        minor = int(m.group(3)) if m.group(3) else 0
         ver = (major, minor)
         if cls not in newest or ver > newest[cls][0]:
             newest[cls] = (ver, key)
 
-    for cls in ("opus", "sonnet", "haiku"):
+    for cls in ("fable", "opus", "sonnet", "haiku"):
         picked = newest.get(cls)
         if picked:
             pricing = _extract_litellm_entry(raw[picked[1]])
@@ -171,10 +174,15 @@ def _normalize_model_name(model_str: str) -> str:
         us.anthropic.claude-opus-4-7-v1:0   -> claude-opus-4-7
         bedrock/claude-sonnet-4.6           -> claude-sonnet-4-6
         vertex_ai/claude-opus-4.7@default   -> claude-opus-4-7
+        claude-fable-5[1m]                  -> claude-fable-5
     """
     if not model_str:
         return ""
+    import re as _re
     s = model_str.strip()
+    # Strip bracketed context-window markers like `[1m]` (Claude Code appends
+    # these for long-context sessions; LiteLLM keys don't carry them).
+    s = _re.sub(r"\[\w+\]$", "", s)
     # Strip `provider/` or `provider.` prefixes, keeping only the last segment.
     for sep in ("/", "."):
         while sep in s:
@@ -244,7 +252,7 @@ def lookup_model_pricing(model_str: str) -> Optional[dict]:
 # Helpers
 # ---------------------------------------------------------------------------
 def classify_model(model_str: str) -> str:
-    """Classify a model identifier string into opus/sonnet/haiku/other.
+    """Classify a model identifier string into fable/opus/sonnet/haiku/other.
 
     `other` covers non-Claude models the user runs through Claude Code via
     ANTHROPIC_BASE_URL overrides (Kimi, Qwen, GLM, …). Those get real pricing
@@ -255,6 +263,8 @@ def classify_model(model_str: str) -> str:
     if not model_str:
         return "sonnet"
     m = model_str.lower()
+    if "fable" in m:
+        return "fable"
     if "opus" in m:
         return "opus"
     if "haiku" in m:
@@ -610,7 +620,7 @@ def print_detail(sessions: dict, range_label: str):
         print(f"\n\U0001f539 {date_str}  {sdata['project']}/{sid[:8]}  \U0001f4b0${session_cost:.2f}")
         print(f"   \u300c{first_msg}\u300d")
 
-        for mc in ("opus", "sonnet", "haiku"):
+        for mc in ("fable", "opus", "sonnet", "haiku"):
             if mc not in sdata["models"]:
                 continue
             mu = sdata["models"][mc]
@@ -631,7 +641,7 @@ def print_detail(sessions: dict, range_label: str):
 
     total_tokens = 0
     total_cost = 0.0
-    for mc in ("opus", "sonnet", "haiku"):
+    for mc in ("fable", "opus", "sonnet", "haiku"):
         if mc not in grand_by_model:
             continue
         mu = grand_by_model[mc]
@@ -684,7 +694,7 @@ def print_by_project(sessions: dict, range_label: str):
         print(f"\n\U0001f4c1 {proj}  \U0001f4b0${proj_cost:.2f}")
         print(f"   msgs:{agg['messages']}  in:{fmt(agg['input_tokens'])}  out:{fmt(agg['output_tokens'])}  "
               f"cache_r:{fmt(agg['cache_read'])}  cache_w:{fmt(agg['cache_write'])}  total:{fmt(agg['total'])}")
-        for mc in ("opus", "sonnet", "haiku"):
+        for mc in ("fable", "opus", "sonnet", "haiku"):
             if mc not in projects[proj]:
                 continue
             mu = projects[proj][mc]
@@ -730,7 +740,7 @@ def print_by_day(sessions: dict, range_label: str):
         print(f"\n\U0001f4c5 {day}  \U0001f4b0${day_cost:.2f}")
         print(f"   msgs:{agg['messages']}  in:{fmt(agg['input_tokens'])}  out:{fmt(agg['output_tokens'])}  "
               f"cache_r:{fmt(agg['cache_read'])}  cache_w:{fmt(agg['cache_write'])}  total:{fmt(agg['total'])}")
-        for mc in ("opus", "sonnet", "haiku"):
+        for mc in ("fable", "opus", "sonnet", "haiku"):
             if mc not in days[day]:
                 continue
             mu = days[day][mc]
