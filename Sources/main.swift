@@ -2072,6 +2072,28 @@ struct PopoverView: View {
     @ObservedObject var store: UsageStore
     let onQuit: () -> Void
 
+    /// Measured height of the content section (cards + chart). Drives the scroll
+    /// area's frame so the popover hugs its content when short and caps when tall.
+    @State private var contentHeight: CGFloat = 0
+
+    private struct ContentHeightKey: PreferenceKey {
+        static var defaultValue: CGFloat = 0
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = max(value, nextValue())
+        }
+    }
+
+    /// Cap so the whole popover always fits below the menu bar. If the content
+    /// outgrows the screen, NSPopover silently repositions the popover sideways
+    /// (arrow detaches from the status item) — scrolling instead prevents that.
+    private var maxContentHeight: CGFloat {
+        // visibleFrame already excludes the menu bar and Dock.
+        let screenH = NSScreen.main?.visibleFrame.height ?? 900
+        // Fixed chrome around the scroll area: header + month nav + tab picker
+        // above, divider + footer below, plus popover arrow/margins.
+        return max(240, screenH - 190)
+    }
+
     /// Cost + Tokens always; the Plan tab only when the user has subscription auth.
     private var visibleTabs: [DisplayTab] {
         store.hasOAuthToken ? DisplayTab.allCases : [.cost, .tokens]
@@ -2144,9 +2166,33 @@ struct PopoverView: View {
             .padding(.horizontal, 10)
             .padding(.bottom, 8)
 
-            // ── Content (no scroll, show everything) ──
+            // ── Content (sized to fit, scrolls only when taller than the screen) ──
             // Subscription quota lives in its own "Plan" tab; the Cost/Token tabs
             // stay focused on spend.
+            ScrollView(showsIndicators: false) {
+                contentSection
+                    .background(GeometryReader { geo in
+                        Color.clear.preference(key: ContentHeightKey.self,
+                                               value: geo.size.height)
+                    })
+            }
+            .onPreferenceChange(ContentHeightKey.self) { contentHeight = $0 }
+            .frame(height: min(max(contentHeight, 1), maxContentHeight))
+
+            Divider()
+                .padding(.horizontal, 10)
+
+            footer
+        }
+        .frame(width: 360)
+        // Switch tabs instantly. Without this, SwiftUI animates the content-height
+        // change when selectedTab flips, which ripples up and makes the month-nav row
+        // jitter as the popover resizes. nil animation = instant swap, no resize wobble.
+        .animation(nil, value: store.selectedTab)
+    }
+
+    @ViewBuilder
+    private var contentSection: some View {
             if store.selectedTab == .subscription {
                 SubscriptionView(store: store, loc: store.loc)
             } else if store.isCurrentMonth {
@@ -2198,12 +2244,11 @@ struct PopoverView: View {
                     noDataView
                 }
             }
+    }
 
-            Divider()
-                .padding(.horizontal, 10)
-
-            // ── Footer ──
-            HStack(spacing: 12) {
+    // ── Footer ──
+    private var footer: some View {
+        HStack(spacing: 12) {
                 if let time = store.lastUpdate, store.isCurrentMonth {
                     Text(String(format: store.loc("updated"),
                                 timeAgo(time, store.loc)))
@@ -2234,15 +2279,9 @@ struct PopoverView: View {
                 }
                 .buttonStyle(.borderless)
                 .help(store.loc("quit"))
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
         }
-        .frame(width: 360)
-        // Switch tabs instantly. Without this, SwiftUI animates the content-height
-        // change when selectedTab flips, which ripples up and makes the month-nav row
-        // jitter as the popover resizes. nil animation = instant swap, no resize wobble.
-        .animation(nil, value: store.selectedTab)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 
     private var loadingView: some View {
