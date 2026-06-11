@@ -72,6 +72,22 @@ class UsageStore: ObservableObject {
     // scan is in flight must not queue a second identical scan behind it.
     private var isRefreshInFlight = false
 
+    // P1-4(a) fingerprint short-circuit (scriptQueue only): if nothing the month
+    // scan reads has changed since the last SUCCESSFUL scan, skip spawning Python
+    // and republish the stored results. Both fields are read/written exclusively
+    // inside scriptQueue work items (serial queue), so no extra locking is needed.
+    private var lastScanFingerprint: String?
+    private var lastScanResults: ScanResults?
+
+    /// Parsed output of the last successful current-month scan, kept so a
+    /// fingerprint-matched refresh can republish without re-running the script.
+    private struct ScanResults {
+        let today: PeriodUsage
+        let week: PeriodUsage
+        let month: PeriodUsage
+        let daily: [DailyUsage]?
+    }
+
     // Cache directory: ~/.claude/cache/cc-monitor/
     private var cacheDir: String {
         let dir = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/cache/cc-monitor")
@@ -211,8 +227,12 @@ class UsageStore: ObservableObject {
 
     // MARK: - Refresh (current month)
 
-    func refresh() {
-        // Refresh subscription quota in parallel (no-op for API-key users)
+    /// - Parameter force: bypass the fingerprint short-circuit and always run a
+    ///   real scan (manual ⌘R). Does NOT bypass isRefreshInFlight coalescing.
+    func refresh(force: Bool = false) {
+        // Refresh subscription quota in parallel (no-op for API-key users).
+        // It keeps its own independent 5-minute cache — unaffected by the
+        // JSONL fingerprint below.
         refreshQuota()
 
         if isCurrentMonth {
@@ -248,9 +268,52 @@ class UsageStore: ObservableObject {
             let nowYear = cal.component(.year, from: now)
             let nowMonth = cal.component(.month, from: now)
             let ym = String(format: "%04d-%02d", nowYear, nowMonth)
+
+            // P1-4(a): cheap (path, mtime, size) stat-walk over everything the
+            // month scan reads, plus the scan-range inputs (month key, today's
+            // day key, cross-month-week flag — so midnight/month/week rollovers
+            // naturally bust it). Computed BEFORE the scan so a file changing
+            // mid-scan can't be masked: the stored (pre-scan) fingerprint then
+            // differs from the next computation → next refresh scans for real.
+            let weekMonday = AppDate.mondayOfWeek(containing: now)
+            let weekCrossesMonth = weekMonday.map { AppDate.monthKey($0) != ym } ?? false
+            var fingerprint = self.computeScanFingerprint(
+                monthKey: ym, dayKey: AppDate.dayKey(now), weekCrossesMonth: weekCrossesMonth)
+            if !force,
+               let fp = fingerprint,
+               fp == self.lastScanFingerprint,
+               let cached = self.lastScanResults {
+                // Nothing the script reads has changed since the last SUCCESSFUL
+                // scan: skip spawning Python entirely and republish the stored
+                // results. lastUpdate IS refreshed — "data as of now" is honest
+                // because we just verified the data is current. isLoading was
+                // never raised for this path (the pre-queue code only shows the
+                // spinner when month == nil, which implies no stored results),
+                // so the spinner doesn't blink.
+                DispatchQueue.main.async {
+                    self.isRefreshInFlight = false
+                    self.currentMonthData = cached.month
+                    self.lastUpdate = Date()
+                    guard self.isCurrentMonth else {
+                        self.isLoading = false
+                        return
+                    }
+                    self.today = cached.today
+                    self.week = cached.week
+                    self.month = cached.month
+                    self.dailyBreakdown = cached.daily
+                    self.isLoading = false
+                }
+                return
+            }
+
             let (m, daily) = self.fetchMonthData("month", yearMonth: ym)
             // If script failed, keep existing cached data visible
             guard m != nil else {
+                // A failed scan must never be short-circuited over: drop the
+                // stored fingerprint so the next refresh runs a real scan.
+                self.lastScanFingerprint = nil
+                self.lastScanResults = nil
                 DispatchQueue.main.async {
                     self.isRefreshInFlight = false
                     self.isLoading = false
@@ -278,8 +341,22 @@ class UsageStore: ObservableObject {
                        let crossWeek = UsageParser.parsePeriod(json),
                        crossWeek.cost >= w.cost {
                         w = crossWeek
+                    } else {
+                        // Extra scan failed (timeout/script error): the week card
+                        // falls back to the smaller month-derived value. Don't let
+                        // the fingerprint freeze that undercount — invalidate it so
+                        // the next refresh retries the extra scan.
+                        fingerprint = nil
                     }
                 }
+            }
+            // Scan succeeded: remember the PRE-scan fingerprint + parsed results
+            // (scriptQueue-only fields) so an unchanged-world refresh can skip
+            // the next spawn. `fingerprint` may be nil (enumeration error) — a
+            // nil stored value simply never matches, forcing a real scan.
+            self.lastScanFingerprint = fingerprint
+            if let m = m {
+                self.lastScanResults = ScanResults(today: t, week: w, month: m, daily: daily)
             }
             DispatchQueue.main.async {
                 self.isRefreshInFlight = false
@@ -402,5 +479,51 @@ class UsageStore: ObservableObject {
         let period = UsageParser.parsePeriod(json)
         let daily = UsageParser.parseDailyBreakdown(json, yearMonth: yearMonth)
         return (period, daily)
+    }
+
+    // MARK: - Scan fingerprint (P1-4a)
+
+    /// Aggregate (path, mtime, size) over every *.jsonl under ~/.claude/projects,
+    /// plus the scan-range inputs and the script identity. Pure stat() walk —
+    /// a few hundred files ≈ milliseconds. Runs ONLY inside scriptQueue work
+    /// items (it's I/O; and the lastScanFingerprint fields it feeds are
+    /// scriptQueue-confined).
+    ///
+    /// Returns nil on ANY enumeration/stat error → caller treats it as
+    /// "changed" and runs a real scan.
+    private func computeScanFingerprint(monthKey: String, dayKey: String,
+                                        weekCrossesMonth: Bool) -> String? {
+        let fm = FileManager.default
+        let projectsDir = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/projects")
+        var enumerationFailed = false
+        guard let enumerator = fm.enumerator(
+            at: URL(fileURLWithPath: projectsDir, isDirectory: true),
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [],
+            errorHandler: { _, _ in
+                enumerationFailed = true
+                return false  // stop walking; we'll run a real scan instead
+            }
+        ) else { return nil }
+
+        var entries: [String] = []
+        for case let url as URL in enumerator {
+            guard url.pathExtension == "jsonl" else { continue }
+            guard let values = try? url.resourceValues(
+                      forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                  let mtime = values.contentModificationDate,
+                  let size = values.fileSize else { return nil }
+            entries.append("\(url.path)|\(mtime.timeIntervalSinceReferenceDate)|\(size)")
+        }
+        if enumerationFailed { return nil }
+        // Enumeration order isn't guaranteed stable across runs — sort so the
+        // same file set always digests identically.
+        entries.sort()
+        // Hasher's per-process random seed is fine: the fingerprint is only
+        // ever compared against one computed earlier in this same process.
+        var hasher = Hasher()
+        for entry in entries { hasher.combine(entry) }
+        let fileDigest = hasher.finalize()
+        return "\(fileDigest)|n=\(entries.count)|\(monthKey)|\(dayKey)|w=\(weekCrossesMonth)|\(scriptClient.scriptPath)"
     }
 }

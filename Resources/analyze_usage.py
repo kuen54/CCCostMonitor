@@ -70,6 +70,7 @@ _SCAN_STATS = {
     "skipped_lines": 0,         # malformed lines skipped (bad JSON / unexpected types) — file keeps scanning
     "files_failed": 0,          # files skipped entirely due to I/O errors (open/read)
     "null_ts_lines": 0,         # usage lines without a parseable timestamp (bypass the range filter)
+    "prefiltered_lines": 0,     # non-assistant lines skipped before json.loads (substring prefilter)
 }
 
 
@@ -335,6 +336,35 @@ def parse_iso_ts(ts_str) -> Optional[datetime]:
         return None
 
 
+def _line_may_lower_first_ts(line: str, current_min: datetime) -> bool:
+    """Conservative substring check used by the scan prefilter: could this raw
+    JSONL line's top-level "timestamp" be earlier than current_min?
+
+    Scans every '"timestamp":"<value>"' occurrence in the raw line. The
+    top-level key is necessarily among them: an unescaped '"timestamp":"'
+    cannot occur *inside* a JSON string value (quotes there are always
+    escaped as \\"), so every match is a real key — possibly nested, which
+    only makes the check conservative. Returns True if any occurrence parses
+    to a datetime earlier than current_min (caller then does the full
+    json.loads; the existing top-level logic decides). A nested-key false
+    positive costs one json.loads; there are no false negatives, because the
+    top-level value is always inspected. Lines with no string-valued
+    timestamp return False — the old full-parse path got None for them too.
+    """
+    for key in ('"timestamp":"', '"timestamp": "'):
+        start = line.find(key)
+        while start != -1:
+            vstart = start + len(key)
+            vend = line.find('"', vstart)
+            if vend == -1:
+                return True  # truncated/odd line — let the full parser judge
+            ts = parse_iso_ts(line[vstart:vend])
+            if ts is not None and ts < current_min:
+                return True
+            start = line.find(key, vend)
+    return False
+
+
 def cost_for_message(usage: dict, model_str: str) -> float:
     """Compute cost for a single API response, using LiteLLM's exact-model price when possible.
 
@@ -446,6 +476,7 @@ def scan_diagnostics() -> dict:
         "skipped_lines": _SCAN_STATS["skipped_lines"],
         "files_failed": _SCAN_STATS["files_failed"],
         "null_ts_lines": _SCAN_STATS["null_ts_lines"],
+        "prefiltered_lines": _SCAN_STATS["prefiltered_lines"],
         "inflation_factor": round(raw / uniq, 3) if uniq else None,
     }
 
@@ -465,7 +496,8 @@ def diagnostics_line() -> str:
     skipped = f"  skipped_lines={d['skipped_lines']}" if d["skipped_lines"] else ""
     failed = f"  files_failed={d['files_failed']}" if d["files_failed"] else ""
     null_ts = f"  null_ts={d['null_ts_lines']}" if d["null_ts_lines"] else ""
-    return f"🔬 扫描自检: 原始行={d['raw_usage_lines']}  去重后={d['unique_messages']}  inflation={f}x{nulls}{upgraded}{skipped}{failed}{null_ts}{flag}"
+    prefiltered = f"  prefiltered={d['prefiltered_lines']}" if d["prefiltered_lines"] else ""
+    return f"🔬 扫描自检: 原始行={d['raw_usage_lines']}  去重后={d['unique_messages']}  inflation={f}x{nulls}{upgraded}{skipped}{failed}{null_ts}{prefiltered}{flag}"
 
 
 def friendly_project(raw: str) -> str:
@@ -614,9 +646,39 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
         # and crash the whole scan); the mangled line then fails json.loads and is
         # counted in skipped_lines while the rest of the file survives.
         try:
+            sdata = sessions[sid]
+            is_sub = finfo["is_subagent"]
             with open(finfo["path"], "r", errors="replace") as f:
                 for line in f:
                     if not line.strip():
+                        continue
+                    # Assistant-line prefilter: ~57% of lines (74% of bytes) are
+                    # non-assistant, and the only things non-assistant lines
+                    # contribute are session metadata: first_msg (user lines,
+                    # main-session files only) and first_ts (min over all
+                    # lines' top-level timestamps). The gate is data-driven,
+                    # not order-lucky: every line is fully parsed until
+                    # first_msg is captured (subagent files never contribute
+                    # it) and first_ts is set; after that a non-assistant line
+                    # is skipped only if _line_may_lower_first_ts proves its
+                    # timestamp cannot lower the running min (Claude Code
+                    # writes the first burst of lines with ~200ms out-of-order
+                    # jitter, so "metadata already captured" alone is not
+                    # sufficient — measured on real data).
+                    # Invariant: Claude Code writes compact JSON where
+                    # '"type":"assistant"' appears verbatim in assistant lines;
+                    # the spaced variant covers a non-compact encoder. If the
+                    # format ever drifts so assistant lines fail this substring
+                    # test, raw_usage_lines/unique_messages collapse toward 0
+                    # and inflation_factor toward None — visible in diagnostics —
+                    # while prefiltered_lines (counted here) shows the skip
+                    # volume.
+                    if ((is_sub or sdata["first_msg"])
+                            and sdata["first_ts"] is not None
+                            and '"type":"assistant"' not in line
+                            and '"type": "assistant"' not in line
+                            and not _line_may_lower_first_ts(line, sdata["first_ts"])):
+                        _SCAN_STATS["prefiltered_lines"] += 1
                         continue
                     try:
                         data = json.loads(line)
