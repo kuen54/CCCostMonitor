@@ -18,6 +18,21 @@ jobs:
       - name: Syntax-check analyze_usage.py
         run: python3 -m py_compile Resources/analyze_usage.py
 
+      - name: Run core unit tests (swift test)
+        run: |
+          # Tests use swift-testing (import Testing), which needs a Swift 6
+          # toolchain. macos-14's default Xcode may be 15.x, so prefer the
+          # newest installed Xcode 16+ for this step only (build.sh below
+          # keeps the default toolchain).
+          XCODE16="$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$XCODE16" ]; then
+            echo "::error::Xcode 16+ not found on runner — swift-testing needs a Swift 6 toolchain" >&2
+            exit 1
+          fi
+          export DEVELOPER_DIR="$XCODE16/Contents/Developer"
+          swift --version
+          swift test
+
       - name: Build app + DMG
         run: bash build.sh
 
