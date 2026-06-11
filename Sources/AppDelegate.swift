@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import Combine
+import CoreServices
 
 // MARK: - App Delegate
 
@@ -10,6 +11,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var store = UsageStore()
     private var refreshTimer: Timer?
     private var cancellable: AnyCancellable?
+    // P1-4(b): FSEvents watcher on ~/.claude/projects — push-based refresh so new
+    // usage shows up within seconds instead of up to 30 min. The 30-min timer
+    // stays as a fallback (cross-midnight repaint with zero file changes still
+    // needs it; the fingerprint includes dayKey so that timer tick really scans).
+    private var fsEventStream: FSEventStreamRef?
+    // Debounce (main thread only — FSEvents callbacks are delivered on the main
+    // queue via FSEventStreamSetDispatchQueue): each burst of events reschedules
+    // this work item so the refresh fires only after a quiet period.
+    private var fsRefreshDebounce: DispatchWorkItem?
+    // Main thread only. When the last FSEvents-triggered refresh fired; enforces a
+    // minimum gap between FSEvents-driven scans (the trailing debounce alone can't —
+    // FSEvents' 5s latency delivers callbacks farther apart than the 3s window during
+    // sustained writes, so the work item would fire every cycle and spawn Python ~2s
+    // of CPU each time). Timer / wake / ⌘R / popover-open refreshes are unaffected.
+    private var lastFSTriggeredRefresh: Date?
     // Latest desired menu-bar title. While the popover is open we defer applying it to
     // the button (a resizing anchor makes NSPopover drift left); popoverDidClose flushes it.
     private var latestMenuTitle = " … "
@@ -268,6 +284,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.store.refresh()
         }
 
+        // FSEvents: refresh shortly after JSONL files actually change (P1-4b)
+        startProjectsWatcher()
+
         // Refresh on system wake
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(onWake),
@@ -316,6 +335,88 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.animates = true
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
+            // Non-forced kick: the fingerprint short-circuit makes this nearly
+            // free when nothing changed, and catches changes the debounced
+            // FSEvents refresh hasn't delivered yet.
+            store.refresh()
+        }
+    }
+
+    // MARK: - FSEvents watcher (P1-4b)
+
+    private func startProjectsWatcher() {
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/projects")
+        var context = FSEventStreamContext(
+            version: 0,
+            // passUnretained is safe: AppDelegate lives for the whole app
+            // lifetime, and applicationWillTerminate stops + invalidates the
+            // stream before the process goes away.
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil, release: nil, copyDescription: nil)
+        // Directory-level events suffice (we only need "something changed";
+        // FSEvents watches recursively by default — no FileEvents flag needed).
+        // latency 5s lets the kernel coalesce write bursts before calling us.
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info = info else { return }
+            let delegate = Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
+            delegate.scheduleDebouncedRefresh()
+        }
+        guard let stream = FSEventStreamCreate(
+            kCFAllocatorDefault,
+            callback,
+            &context,
+            [path] as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            5.0,  // seconds of kernel-side coalescing
+            FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone)
+        ) else { return }
+        fsEventStream = stream
+        // Deliver callbacks on the main queue: scheduleDebouncedRefresh touches
+        // main-thread-only state (fsRefreshDebounce) and store.refresh() expects main.
+        FSEventStreamSetDispatchQueue(stream, DispatchQueue.main)
+        if !FSEventStreamStart(stream) {
+            // Start failure leaves a dead stream — clean up and fall back to
+            // the 30-min timer (which keeps working regardless).
+            NSLog("CCCostMonitor: FSEventStreamStart failed; falling back to timer-only refresh")
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            fsEventStream = nil
+        }
+    }
+
+    /// Main thread only. Trailing 3s debounce + a minimum 120s gap between
+    /// FSEvents-triggered refreshes. The debounce alone coalesces only bursts
+    /// shorter than FSEvents' 5s coalescing latency; during sustained Claude Code
+    /// usage callbacks arrive every ~5s and each would fire a real Python scan.
+    /// The 120s floor caps that at ~30 scans/hour; data is at most ~2 min stale
+    /// during active use, and the non-forced popover-open refresh still delivers
+    /// instant freshness when the user actually looks.
+    private func scheduleDebouncedRefresh() {
+        fsRefreshDebounce?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.lastFSTriggeredRefresh = Date()
+            // Non-forced: FSEvents over-fires (any write under ~/.claude/projects,
+            // not just *.jsonl) — the fingerprint short-circuit confirms whether
+            // the scan inputs really changed before spawning Python.
+            self.store.refresh()
+        }
+        fsRefreshDebounce = item
+        var delay: TimeInterval = 3
+        if let last = lastFSTriggeredRefresh {
+            delay = max(delay, last.addingTimeInterval(120).timeIntervalSinceNow)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        fsRefreshDebounce?.cancel()
+        fsRefreshDebounce = nil
+        if let stream = fsEventStream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            fsEventStream = nil
         }
     }
 
@@ -334,6 +435,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             // Bring popover window to front
             popover.contentViewController?.view.window?.makeKey()
+            // Non-forced kick on open — fingerprint makes it nearly free (see showPopover).
+            store.refresh()
         }
     }
 }

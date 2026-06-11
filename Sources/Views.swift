@@ -1051,7 +1051,9 @@ struct PopoverView: View {
                 // Language switcher
                 LanguageSwitcher(store: store)
 
-                Button(action: { store.refresh() }) {
+                // Manual refresh ALWAYS runs a real scan: force bypasses the
+                // fingerprint short-circuit (the user is explicitly asking).
+                Button(action: { store.refresh(force: true) }) {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 11, weight: .medium))
                 }
