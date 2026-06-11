@@ -74,6 +74,60 @@ struct MonthlySnapshot: Codable {
     let data: PeriodUsage
     let lastUpdated: Date
     var dailyBreakdown: [DailyUsage]?
+    /// Cross-month-safe "This Week" totals persisted alongside the month data:
+    /// when the week's Monday falls in the previous month, the month scan
+    /// (1st..today) can't cover those days, so the derived week would undercount.
+    /// Optional so caches written by older versions still decode.
+    var week: PeriodUsage?
+    /// "yyyy-MM-dd" Monday of the week `week` covers — staleness check on restore.
+    var weekStart: String?
+}
+
+// MARK: - Date utilities (Gregorian, locale-stable)
+//
+// All data-path date math MUST go through these instead of Calendar.current /
+// bare DateFormatter(): on a non-Gregorian system calendar (Japanese, Buddhist,
+// …) Calendar.current yields era-relative years (e.g. 2569) and locale-less
+// formatters can emit non-Gregorian or non-ASCII digits — every "yyyy-MM-dd"
+// key would then mismatch the Python script's Gregorian local-date keys and
+// Today/Week silently show 0. Human-facing display (viewingMonthLabel, …)
+// intentionally keeps locale-aware formatting.
+//
+// Thread-safety: DateFormatter is NOT thread-safe and these helpers are hit
+// from both the main thread and scriptQueue closures, so no DateFormatter is
+// shared — `dayKey`/`monthKey` build their strings from Gregorian date
+// components via String(format:), which is safe from any thread. Calendar
+// itself is a thread-safe value type.
+enum AppDate {
+    /// Gregorian calendar pinned for data-path math. Keeps the user's LOCAL
+    /// time zone: day keys must match the Python script's local-date buckets.
+    static let gregorian: Calendar = {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone.current
+        return cal
+    }()
+
+    /// "yyyy-MM-dd" key in the local time zone, Gregorian, ASCII digits.
+    static func dayKey(_ date: Date) -> String {
+        let c = gregorian.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    /// "yyyy-MM" key in the local time zone, Gregorian, ASCII digits.
+    static func monthKey(_ date: Date) -> String {
+        let c = gregorian.dateComponents([.year, .month], from: date)
+        return String(format: "%04d-%02d", c.year ?? 0, c.month ?? 0)
+    }
+
+    /// Monday 00:00 (local) of the week containing `date`.
+    static func mondayOfWeek(containing date: Date) -> Date? {
+        let weekday = gregorian.component(.weekday, from: date)  // 1=Sun, 2=Mon, …
+        let daysFromMonday = (weekday + 5) % 7                   // Mon=0 … Sun=6
+        guard let monday = gregorian.date(byAdding: .day, value: -daysFromMonday, to: date) else {
+            return nil
+        }
+        return gregorian.startOfDay(for: monday)
+    }
 }
 
 // MARK: - Subscription Quota (OAuth)
@@ -865,7 +919,7 @@ class UsageStore: ObservableObject {
     @Published var quotaError: QuotaError?
 
     var isCurrentMonth: Bool {
-        let cal = Calendar.current
+        let cal = AppDate.gregorian
         let now = Date()
         return viewingYear == cal.component(.year, from: now)
             && viewingMonth == cal.component(.month, from: now)
@@ -879,7 +933,9 @@ class UsageStore: ObservableObject {
         comps.year = viewingYear
         comps.month = viewingMonth
         comps.day = 1
-        guard let date = Calendar.current.date(from: comps) else { return "" }
+        // Date construction is data-path (Gregorian year/month ints); only the
+        // df.string(from:) output is human-facing and stays locale-aware.
+        guard let date = AppDate.gregorian.date(from: comps) else { return "" }
         return df.string(from: date)
     }
 
@@ -905,7 +961,7 @@ class UsageStore: ObservableObject {
     }
 
     init() {
-        let cal = Calendar.current
+        let cal = AppDate.gregorian
         let now = Date()
         viewingYear = cal.component(.year, from: now)
         viewingMonth = cal.component(.month, from: now)
@@ -990,8 +1046,8 @@ class UsageStore: ObservableObject {
         comps.year = viewingYear
         comps.month = viewingMonth + offset
         comps.day = 1
-        guard let date = Calendar.current.date(from: comps) else { return }
-        let cal = Calendar.current
+        guard let date = AppDate.gregorian.date(from: comps) else { return }
+        let cal = AppDate.gregorian
         viewingYear = cal.component(.year, from: date)
         viewingMonth = cal.component(.month, from: date)
 
@@ -1077,9 +1133,11 @@ class UsageStore: ObservableObject {
         scriptQueue.async { [weak self] in
             guard let self = self else { return }
             // Single script call for the whole month
-            let cal = Calendar.current
+            let cal = AppDate.gregorian
             let now = Date()
-            let ym = String(format: "%04d-%02d", cal.component(.year, from: now), cal.component(.month, from: now))
+            let nowYear = cal.component(.year, from: now)
+            let nowMonth = cal.component(.month, from: now)
+            let ym = String(format: "%04d-%02d", nowYear, nowMonth)
             let (m, daily) = self.fetchMonthData("month", yearMonth: ym)
             // If script failed, keep existing cached data visible
             guard m != nil else {
@@ -1091,7 +1149,28 @@ class UsageStore: ObservableObject {
             }
             // Derive today & week from daily breakdown
             let t = self.deriveToday(daily)
-            let w = self.deriveWeek(daily)
+            var w = self.deriveWeek(daily)
+            var weekStartKey: String? = nil
+            if let monday = AppDate.mondayOfWeek(containing: now) {
+                weekStartKey = AppDate.dayKey(monday)
+                if AppDate.monthKey(monday) != ym {
+                    // The week's Monday is in the PREVIOUS month: the month scan
+                    // (1st..today) misses up to 6 of this week's days, so run ONE
+                    // extra scan for exactly Monday..today. It runs sequentially
+                    // inside this same scriptQueue work item — no re-entrancy
+                    // with the isRefreshInFlight coalescing. A range scan returns
+                    // the same JSON shape as a month scan, so its totals ARE the
+                    // week totals. The week is a superset of the month-derived
+                    // week — never accept a smaller value (failed/partial scan
+                    // falls back to the month-derived week, same as before).
+                    let range = "\(weekStartKey!):\(AppDate.dayKey(now))"
+                    if let json = self.runScript(["--json", "--range", range]),
+                       let crossWeek = self.parsePeriod(json),
+                       crossWeek.cost >= w.cost {
+                        w = crossWeek
+                    }
+                }
+            }
             DispatchQueue.main.async {
                 self.isRefreshInFlight = false
                 // Menu-bar total and cache persistence are always about the current month,
@@ -1100,9 +1179,9 @@ class UsageStore: ObservableObject {
                 self.lastUpdate = Date()
                 if let m = m {
                     self.saveCache(
-                        year: cal.component(.year, from: now),
-                        month: cal.component(.month, from: now),
-                        data: m, daily: daily)
+                        year: nowYear, month: nowMonth,
+                        data: m, daily: daily,
+                        week: w, weekStart: weekStartKey)
                 }
                 // Popover fields (today/week/month/dailyBreakdown) feed the active view.
                 // Only skip painting when the user is viewing a historical month —
@@ -1128,9 +1207,12 @@ class UsageStore: ObservableObject {
             String(format: "%04d-%02d.json", year, month))
     }
 
-    private func saveCache(year: Int, month: Int, data: PeriodUsage, daily: [DailyUsage]? = nil) {
+    private func saveCache(year: Int, month: Int, data: PeriodUsage, daily: [DailyUsage]? = nil,
+                           week: PeriodUsage? = nil, weekStart: String? = nil) {
         var snapshot = MonthlySnapshot(year: year, month: month, data: data, lastUpdated: Date())
         snapshot.dailyBreakdown = daily
+        snapshot.week = week
+        snapshot.weekStart = weekStart
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let jsonData = try? encoder.encode(snapshot) else { return }
@@ -1151,7 +1233,7 @@ class UsageStore: ObservableObject {
 
     /// Load cached data for the current month and display immediately (before background refresh)
     func loadCacheForCurrentMonth() {
-        let cal = Calendar.current
+        let cal = AppDate.gregorian
         let now = Date()
         let y = cal.component(.year, from: now)
         let m = cal.component(.month, from: now)
@@ -1169,7 +1251,21 @@ class UsageStore: ObservableObject {
         // Derive today/week from daily breakdown, or set empty fallback (old cache format)
         if daily != nil {
             self.today = deriveToday(daily)
-            self.week = deriveWeek(daily)
+            // Restore the persisted (cross-month-safe) week only if it still covers
+            // THIS week — its Monday must match — and is at least the month-derived
+            // value (the persisted week is a superset). Otherwise, or for old cache
+            // files without the field, fall back to deriving from daily; the refresh
+            // that follows immediately self-corrects.
+            let derivedWeek = deriveWeek(daily)
+            if let cachedWeek = snapshot.week,
+               let cachedStart = snapshot.weekStart,
+               let monday = AppDate.mondayOfWeek(containing: now),
+               cachedStart == AppDate.dayKey(monday),
+               cachedWeek.cost >= derivedWeek.cost {
+                self.week = cachedWeek
+            } else {
+                self.week = derivedWeek
+            }
         } else {
             let empty = PeriodUsage(cost: 0, models: [], totalMessages: 0, totalTokens: 0)
             self.today = empty
@@ -1186,7 +1282,7 @@ class UsageStore: ObservableObject {
 
     /// Build a "YYYY-MM-01:YYYY-MM-DD" range string for a given year/month
     private func monthDateRange(year: Int, month: Int) -> String {
-        let cal = Calendar.current
+        let cal = AppDate.gregorian
         var startComps = DateComponents()
         startComps.year = year
         startComps.month = month
@@ -1290,9 +1386,7 @@ class UsageStore: ObservableObject {
 
     /// Derive today's PeriodUsage from daily breakdown
     private func deriveToday(_ daily: [DailyUsage]?) -> PeriodUsage {
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd"
-        let todayStr = df.string(from: Date())
+        let todayStr = AppDate.dayKey(Date())
         if let day = daily?.first(where: { $0.dateString == todayStr }) {
             return PeriodUsage(cost: day.cost, models: day.models,
                                totalMessages: day.models.reduce(0) { $0 + $1.messages },
@@ -1306,17 +1400,11 @@ class UsageStore: ObservableObject {
         guard let daily = daily else {
             return PeriodUsage(cost: 0, models: [], totalMessages: 0, totalTokens: 0)
         }
-        let cal = Calendar.current
-        let now = Date()
-        // Find Monday of current week
-        let weekday = cal.component(.weekday, from: now)  // 1=Sun, 2=Mon, ...
-        let daysFromMon = (weekday + 5) % 7  // Mon=0, Tue=1, ..., Sun=6
-        guard let monday = cal.date(byAdding: .day, value: -daysFromMon, to: now) else {
+        // Find Monday of current week (Gregorian, local time zone)
+        guard let monday = AppDate.mondayOfWeek(containing: Date()) else {
             return PeriodUsage(cost: 0, models: [], totalMessages: 0, totalTokens: 0)
         }
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd"
-        let mondayStr = df.string(from: monday)
+        let mondayStr = AppDate.dayKey(monday)
 
         // Sum all days from Monday onward
         let weekDays = daily.filter { $0.dateString >= mondayStr }
@@ -1667,7 +1755,7 @@ struct DailyChart: View {
     @State private var hoveredDay: Int? = nil
 
     private var daysInMonth: Int {
-        let cal = Calendar.current
+        let cal = AppDate.gregorian
         var comps = DateComponents()
         comps.year = year
         comps.month = month
