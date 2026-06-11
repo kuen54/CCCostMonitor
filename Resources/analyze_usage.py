@@ -18,6 +18,7 @@ Options:
 """
 
 import json
+import os
 import sys
 import argparse
 import urllib.request
@@ -46,7 +47,12 @@ FALLBACK_PRICING = {
     "haiku":  {"input":  1.00, "output":  5.00, "cache_write":  1.25, "cache_write_1h":  2.00, "cache_read": 0.10},
 }
 
-EMOJI = {"fable": "\U0001f7e0", "opus": "\U0001f7e3", "sonnet": "\U0001f535", "haiku": "\U0001f7e2"}  # 🟠🟣🔵🟢
+EMOJI = {"fable": "\U0001f7e0", "opus": "\U0001f7e3", "sonnet": "\U0001f535", "haiku": "\U0001f7e2", "other": "⚪"}  # 🟠🟣🔵🟢⚪
+
+# Canonical display/aggregation order for model classes. "other" covers non-Claude
+# models (Kimi/Qwen/GLM …) run through base-URL overrides — it has no entry in
+# MODEL_PRICING (each model is priced individually via lookup_model_pricing).
+MODEL_CLASSES = ("fable", "opus", "sonnet", "haiku", "other")
 
 # Runtime: populated by load_pricing()
 MODEL_PRICING = {}        # model_class -> {input, output, cache_write, cache_read} (per million)
@@ -59,8 +65,11 @@ _PRICING_SOURCE = "fallback"
 _SCAN_STATS = {
     "raw_usage_lines": 0,       # assistant-with-usage lines in range, pre-dedup
     "unique_messages": 0,       # unique message.id (or missing-id) lines kept
-    "null_msg_id_lines": 0,     # lines without message.id — can't be deduped
+    "null_msg_id_lines": 0,     # lines without message.id AND without requestId — can't be deduped
     "usage_upgraded_lines": 0,  # repeat-id lines whose usage grew (streaming rewrites)
+    "skipped_lines": 0,         # malformed lines skipped (bad JSON / unexpected types) — file keeps scanning
+    "files_failed": 0,          # files skipped entirely due to I/O errors (open/read)
+    "null_ts_lines": 0,         # usage lines without a parseable timestamp (bypass the range filter)
 }
 
 
@@ -81,20 +90,39 @@ def _fetch_litellm_pricing() -> Optional[dict]:
         req = urllib.request.Request(LITELLM_PRICING_URL, headers={"User-Agent": "local-cc-cost/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        # Save to cache
-        PRICING_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(PRICING_CACHE_PATH, "w") as f:
-            json.dump(data, f)
-        return data
     except Exception:
-        # Try reading stale cache as last resort
+        # Network failed (e.g. corporate proxy 502) — fall back to stale cache.
+        # Rate-limit refetches: bump the stale cache's mtime so remaining TTL ≈ 1h,
+        # letting the next runs within ~1 hour reuse it WITHOUT re-paying the
+        # HTTP timeout on every single run.
         if PRICING_CACHE_PATH.exists():
             try:
                 with open(PRICING_CACHE_PATH, "r") as f:
-                    return json.load(f)
+                    stale = json.load(f)
+                try:
+                    t = time.time() - (PRICING_CACHE_TTL - 3600)
+                    os.utime(PRICING_CACHE_PATH, (t, t))
+                except Exception:
+                    pass  # mtime bump is best-effort; stale data is still good
+                return stale
             except Exception:
                 pass
         return None
+    # Save to cache — atomic (temp file in same dir + os.replace), and a cache
+    # WRITE failure must not discard the successfully fetched in-memory data.
+    try:
+        PRICING_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = PRICING_CACHE_PATH.with_name(PRICING_CACHE_PATH.name + f".tmp{os.getpid()}")
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, PRICING_CACHE_PATH)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        pass  # proceed with in-memory pricing
+    return data
 
 
 def _per_token_to_per_million(cost_per_token: float) -> float:
@@ -103,16 +131,29 @@ def _per_token_to_per_million(cost_per_token: float) -> float:
 
 
 def _extract_litellm_entry(entry: dict) -> Optional[dict]:
-    """Extract pricing from a LiteLLM entry into our format (per million tokens)."""
+    """Extract pricing from a LiteLLM entry into our format (per million tokens).
+
+    Guards against malformed LiteLLM data (null / string / missing cost fields,
+    e.g. qwen3.5-plus ships with input_cost_per_token=None): any non-numeric
+    required field → return None → caller falls through to class fallback.
+    """
+    if not isinstance(entry, dict):
+        return None
     inp = entry.get("input_cost_per_token")
     out = entry.get("output_cost_per_token")
-    if inp is None or out is None:
+    if not isinstance(inp, (int, float)) or not isinstance(out, (int, float)):
         return None
-    cw = entry.get("cache_creation_input_token_cost", inp * 1.25)  # default: 1.25x input (5m TTL)
+    cw = entry.get("cache_creation_input_token_cost")
+    if not isinstance(cw, (int, float)):
+        cw = inp * 1.25  # default: 1.25x input (5m TTL)
     # 1-hour cache write costs more (2x input). Claude Code + Opus 4.8 use the 1h tier
     # heavily; pricing it at the 5m rate under-reports cost. Default 2x input when absent.
-    cw1h = entry.get("cache_creation_input_token_cost_above_1hr", inp * 2.0)
-    cr = entry.get("cache_read_input_token_cost", inp * 0.1)       # default: 0.1x input
+    cw1h = entry.get("cache_creation_input_token_cost_above_1hr")
+    if not isinstance(cw1h, (int, float)):
+        cw1h = inp * 2.0
+    cr = entry.get("cache_read_input_token_cost")
+    if not isinstance(cr, (int, float)):
+        cr = inp * 0.1                                             # default: 0.1x input
     return {
         "input":          _per_token_to_per_million(inp),
         "output":         _per_token_to_per_million(out),
@@ -402,6 +443,9 @@ def scan_diagnostics() -> dict:
         "unique_messages": uniq,
         "null_msg_id_lines": _SCAN_STATS["null_msg_id_lines"],
         "usage_upgraded_lines": _SCAN_STATS["usage_upgraded_lines"],
+        "skipped_lines": _SCAN_STATS["skipped_lines"],
+        "files_failed": _SCAN_STATS["files_failed"],
+        "null_ts_lines": _SCAN_STATS["null_ts_lines"],
         "inflation_factor": round(raw / uniq, 3) if uniq else None,
     }
 
@@ -418,7 +462,10 @@ def diagnostics_line() -> str:
         flag = "  ℹ️ near 1.0 — dedup had little effect (direct API or new format)"
     nulls = f"  null_ids={d['null_msg_id_lines']}" if d["null_msg_id_lines"] else ""
     upgraded = f"  usage_upgraded={d['usage_upgraded_lines']}" if d["usage_upgraded_lines"] else ""
-    return f"🔬 扫描自检: 原始行={d['raw_usage_lines']}  去重后={d['unique_messages']}  inflation={f}x{nulls}{upgraded}{flag}"
+    skipped = f"  skipped_lines={d['skipped_lines']}" if d["skipped_lines"] else ""
+    failed = f"  files_failed={d['files_failed']}" if d["files_failed"] else ""
+    null_ts = f"  null_ts={d['null_ts_lines']}" if d["null_ts_lines"] else ""
+    return f"🔬 扫描自检: 原始行={d['raw_usage_lines']}  去重后={d['unique_messages']}  inflation={f}x{nulls}{upgraded}{skipped}{failed}{null_ts}{flag}"
 
 
 def friendly_project(raw: str) -> str:
@@ -434,6 +481,16 @@ def friendly_project(raw: str) -> str:
 # ---------------------------------------------------------------------------
 # Time range parsing
 # ---------------------------------------------------------------------------
+def _parse_range_date(s: str) -> datetime:
+    """Parse one --range date bound; exit(2) with a clear error on bad input."""
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        print(f"Error: invalid --range date '{s}' (expected today, week, month, "
+              f"YYYY-MM-DD, or YYYY-MM-DD:YYYY-MM-DD)", file=sys.stderr)
+        sys.exit(2)
+
+
 def resolve_range(spec: str):
     """Return (start_date, end_date) as naive local datetimes."""
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -447,9 +504,18 @@ def resolve_range(spec: str):
         return first, today + timedelta(days=1)
     if ":" in spec:
         parts = spec.split(":")
-        return datetime.fromisoformat(parts[0]), datetime.fromisoformat(parts[1]) + timedelta(days=1)
+        if len(parts) != 2:
+            print(f"Error: invalid --range '{spec}' (expected YYYY-MM-DD:YYYY-MM-DD)", file=sys.stderr)
+            sys.exit(2)
+        start = _parse_range_date(parts[0])
+        end = _parse_range_date(parts[1])
+        if start > end:
+            print(f"Error: --range start '{parts[0]}' is after end '{parts[1]}'", file=sys.stderr)
+            sys.exit(2)
+        # end bound is exclusive (+1 day), so start == end is a valid single-day range
+        return start, end + timedelta(days=1)
     # Single date
-    d = datetime.fromisoformat(spec)
+    d = _parse_range_date(spec)
     return d, d + timedelta(days=1)
 
 
@@ -459,28 +525,53 @@ def resolve_range(spec: str):
 def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, project_filter: Optional[str]):
     """Scan all JSONL files and return structured session data."""
     start_epoch = start_dt.timestamp()
+    end_epoch = end_dt.timestamp()
 
     # Reset diagnostic counters for this scan
-    _SCAN_STATS["raw_usage_lines"] = 0
-    _SCAN_STATS["unique_messages"] = 0
-    _SCAN_STATS["null_msg_id_lines"] = 0
-    _SCAN_STATS["usage_upgraded_lines"] = 0
+    for _k in _SCAN_STATS:
+        _SCAN_STATS[_k] = 0
 
-    # Convert local-time range boundaries to UTC for comparing with message timestamps
-    _local_tz = datetime.now().astimezone().tzinfo
-    start_utc = start_dt.replace(tzinfo=_local_tz).astimezone(timezone.utc)
-    end_utc = end_dt.replace(tzinfo=_local_tz).astimezone(timezone.utc)
+    # Convert local-time range boundaries to UTC for comparing with message timestamps.
+    # astimezone() on a naive datetime attaches the system local zone *per datetime*,
+    # so DST transitions inside/across the range resolve correctly (a frozen
+    # "current offset" would shift boundaries by an hour across DST changes).
+    start_utc = start_dt.astimezone(timezone.utc)
+    end_utc = end_dt.astimezone(timezone.utc)
 
     # Collect JSONL files that might contain in-range messages.
-    # Only skip files last modified BEFORE the range start.
-    # Do NOT skip files modified after the range end — cross-day sessions
-    # may have mtime beyond the range but still contain in-range messages.
+    # Lower bound: skip files last modified BEFORE the range start (no writes after
+    # start ⇒ no in-range content). Do NOT skip on mtime after the range end —
+    # cross-day sessions may have mtime beyond the range but still contain
+    # in-range messages.
     all_files: list[dict] = []
     for p in projects_dir.rglob("*.jsonl"):
-        mtime = p.stat().st_mtime
-        if mtime < start_epoch:
+        try:
+            st = p.stat()
+        except OSError:
+            # Deleted mid-scan or dangling symlink — skip, don't kill the scan
             continue
-        is_sub = "subagents" in str(p)
+        if st.st_mtime < start_epoch:
+            continue
+        # Upper bound: peek the first line's timestamp — content is authoritative.
+        # st_birthtime is only a cheap pre-filter to decide whether the peek is
+        # worth doing: rsync/cp/migration resets birthtime to the copy date, so a
+        # birthtime after the range end does NOT prove the content is out of range.
+        # For current-month queries the end is in the future, so the peek almost
+        # never runs. Conservative: when in doubt, scan the file.
+        birthtime = getattr(st, "st_birthtime", None)
+        if birthtime is None or birthtime > end_epoch:
+            try:
+                with open(p, "r") as _f:
+                    _first = json.loads(_f.readline())
+                _first_ts = parse_iso_ts(_first.get("timestamp")) if isinstance(_first, dict) else None
+                if _first_ts and _first_ts >= end_utc:
+                    continue
+            except Exception:
+                pass  # unreadable/odd first line — scan the file anyway
+        # Subagent transcripts live at <session-id>/subagents/agent-*.jsonl. Match the
+        # path *component*, not a substring — a project dir literally named
+        # "my-subagents-tool" must not false-positive.
+        is_sub = p.parent.name == "subagents"
         parent_session = p.parent.parent.name if is_sub else p.stem
         project_raw = p.parent.parent.parent.name if is_sub else p.parent.name
         if project_filter and project_filter.lower() not in project_raw.lower():
@@ -515,121 +606,157 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
                 "daily_models": defaultdict(lambda: defaultdict(empty_usage)),
             }
 
+        # File-level fallback is deliberately narrow (I/O errors only): one malformed
+        # *line* must not discard the rest of the file's usage. Per-line problems are
+        # counted in skipped_lines below and the file keeps scanning.
+        # errors="replace": invalid UTF-8 bytes become U+FFFD instead of raising
+        # UnicodeDecodeError mid-iteration (which would escape the per-line handler
+        # and crash the whole scan); the mangled line then fails json.loads and is
+        # counted in skipped_lines while the rest of the file survives.
         try:
-            with open(finfo["path"], "r") as f:
+            with open(finfo["path"], "r", errors="replace") as f:
                 for line in f:
+                    if not line.strip():
+                        continue
                     try:
                         data = json.loads(line)
-                    except json.JSONDecodeError:
+                        if not isinstance(data, dict):
+                            _SCAN_STATS["skipped_lines"] += 1
+                            continue
+
+                        # Capture first user message (main session only)
+                        if not finfo["is_subagent"] and not sessions[sid]["first_msg"]:
+                            if data.get("type") == "user" and "message" in data:
+                                msg = data["message"]
+                                if isinstance(msg, dict):
+                                    content = msg.get("content", "")
+                                    if isinstance(content, list):
+                                        for part in content:
+                                            if isinstance(part, dict) and part.get("type") == "text":
+                                                sessions[sid]["first_msg"] = part.get("text", "")[:50]
+                                                break
+                                    elif isinstance(content, str):
+                                        sessions[sid]["first_msg"] = content[:50]
+                                elif isinstance(msg, str):
+                                    sessions[sid]["first_msg"] = msg[:50]
+
+                        # Timestamp
+                        ts = parse_iso_ts(data.get("timestamp"))
+                        if ts and (sessions[sid]["first_ts"] is None or ts < sessions[sid]["first_ts"]):
+                            sessions[sid]["first_ts"] = ts
+
+                        # Usage from assistant messages
+                        if data.get("type") == "assistant" and "message" in data:
+                            m = data["message"]
+                            if not isinstance(m, dict):
+                                _SCAN_STATS["skipped_lines"] += 1
+                                continue
+                            usage_raw = m.get("usage") or {}
+                            if not isinstance(usage_raw, dict):
+                                _SCAN_STATS["skipped_lines"] += 1
+                                continue
+                            inp = int(usage_raw.get("input_tokens") or 0)
+                            out = int(usage_raw.get("output_tokens") or 0)
+                            if not inp and not out:
+                                continue
+                            # Filter: only count messages whose timestamp falls within the requested range
+                            if ts:
+                                if ts < start_utc or ts >= end_utc:
+                                    continue
+                            else:
+                                # No parseable timestamp — keep the line (excluding it
+                                # would under-count) but track it for diagnostics.
+                                _SCAN_STATS["null_ts_lines"] += 1
+                            _SCAN_STATS["raw_usage_lines"] += 1
+                            cw = int(usage_raw.get("cache_creation_input_tokens") or 0)
+                            cr = int(usage_raw.get("cache_read_input_tokens") or 0)
+                            # 1-hour cache tier (priced higher than 5m). Newer Claude Code +
+                            # Opus 4.8 put most cache creation here; needed for correct cost.
+                            cc_detail = usage_raw.get("cache_creation") or {}
+                            if not isinstance(cc_detail, dict):
+                                cc_detail = {}
+                            cw_1h = int(cc_detail.get("ephemeral_1h_input_tokens") or 0)
+                            cw_5m = int(cc_detail.get("ephemeral_5m_input_tokens") or 0)
+                            # Top-level field is occasionally 0 while the detail breakdown is
+                            # populated; trust whichever is larger.
+                            cw = max(cw, cw_5m + cw_1h)
+                            # Dedup by message.id (see comment at top of this function).
+                            # Fallback: lines missing message.id but carrying a requestId
+                            # dedup on that instead (same max/delta mechanics).
+                            msg_id = m.get("id")
+                            if not msg_id and data.get("requestId"):
+                                msg_id = "req:" + str(data["requestId"])
+                            if msg_id and msg_id in seen_msgs:
+                                # Same message.id seen again: output_tokens grows as the
+                                # response streams (later lines carry the larger, truer value).
+                                # Take the per-field max and back-fill the delta into the
+                                # buckets this message was originally counted in.
+                                rec = seen_msgs[msg_id]
+                                u = rec["usage"]
+                                new_u = {
+                                    "input_tokens": max(u["input_tokens"], inp),
+                                    "output_tokens": max(u["output_tokens"], out),
+                                    "cache_write": max(u["cache_write"], cw),
+                                    "cache_write_1h": max(u["cache_write_1h"], cw_1h),
+                                    "cache_read": max(u["cache_read"], cr),
+                                }
+                                if new_u != u:
+                                    for field in ("input_tokens", "output_tokens", "cache_write", "cache_read"):
+                                        delta = new_u[field] - u[field]
+                                        rec["mu"][field] += delta
+                                        rec["dmu"][field] += delta
+                                    new_cost = cost_for_message(new_u, rec["model_str"])
+                                    rec["mu"]["cost"] += new_cost - rec["cost"]
+                                    rec["dmu"]["cost"] += new_cost - rec["cost"]
+                                    rec["usage"] = new_u
+                                    rec["cost"] = new_cost
+                                    _SCAN_STATS["usage_upgraded_lines"] += 1
+                                continue
+                            if not msg_id:
+                                _SCAN_STATS["null_msg_id_lines"] += 1
+                            _SCAN_STATS["unique_messages"] += 1
+                            model_str = m.get("model", "") or ""
+                            model_cls = classify_model(model_str)
+                            # Per-message cost using the exact model string (preferred over
+                            # class-level pricing — avoids mis-pricing Opus 4.7 as Opus 4).
+                            single = {"input_tokens": inp, "output_tokens": out, "cache_write": cw,
+                                      "cache_write_1h": cw_1h, "cache_read": cr}
+                            msg_cost = cost_for_message(single, model_str)
+                            # Session-level aggregation
+                            mu = sessions[sid]["models"][model_cls]
+                            mu["messages"] += 1
+                            mu["input_tokens"] += inp
+                            mu["output_tokens"] += out
+                            mu["cache_write"] += cw
+                            mu["cache_read"] += cr
+                            mu["cost"] += msg_cost
+                            # Per-day aggregation (using message's own local date;
+                            # astimezone() resolves the local zone per datetime → DST-safe)
+                            if ts:
+                                day_key = ts.astimezone().strftime("%Y-%m-%d")
+                            elif sessions[sid]["first_ts"]:
+                                day_key = sessions[sid]["first_ts"].astimezone().strftime("%Y-%m-%d")
+                            else:
+                                day_key = "unknown"
+                            dmu = sessions[sid]["daily_models"][day_key][model_cls]
+                            dmu["messages"] += 1
+                            dmu["input_tokens"] += inp
+                            dmu["output_tokens"] += out
+                            dmu["cache_write"] += cw
+                            dmu["cache_read"] += cr
+                            dmu["cost"] += msg_cost
+                            if msg_id:
+                                seen_msgs[msg_id] = {
+                                    "usage": single, "cost": msg_cost, "model_str": model_str,
+                                    "mu": mu, "dmu": dmu,
+                                }
+                    except Exception:
+                        # Malformed line (bad JSON / unexpected types) — count it and
+                        # keep scanning the rest of the file.
+                        _SCAN_STATS["skipped_lines"] += 1
                         continue
-
-                    # Capture first user message (main session only)
-                    if not finfo["is_subagent"] and not sessions[sid]["first_msg"]:
-                        if data.get("type") == "user" and "message" in data:
-                            msg = data["message"]
-                            if isinstance(msg, dict):
-                                content = msg.get("content", "")
-                                if isinstance(content, list):
-                                    for part in content:
-                                        if isinstance(part, dict) and part.get("type") == "text":
-                                            sessions[sid]["first_msg"] = part.get("text", "")[:50]
-                                            break
-                                elif isinstance(content, str):
-                                    sessions[sid]["first_msg"] = content[:50]
-                            elif isinstance(msg, str):
-                                sessions[sid]["first_msg"] = msg[:50]
-
-                    # Timestamp
-                    ts = parse_iso_ts(data.get("timestamp"))
-                    if ts and (sessions[sid]["first_ts"] is None or ts < sessions[sid]["first_ts"]):
-                        sessions[sid]["first_ts"] = ts
-
-                    # Usage from assistant messages
-                    if data.get("type") == "assistant" and "message" in data:
-                        m = data["message"]
-                        usage_raw = m.get("usage", {})
-                        inp = usage_raw.get("input_tokens", 0)
-                        out = usage_raw.get("output_tokens", 0)
-                        if not inp and not out:
-                            continue
-                        # Filter: only count messages whose timestamp falls within the requested range
-                        if ts and (ts < start_utc or ts >= end_utc):
-                            continue
-                        _SCAN_STATS["raw_usage_lines"] += 1
-                        cw = usage_raw.get("cache_creation_input_tokens", 0)
-                        cr = usage_raw.get("cache_read_input_tokens", 0)
-                        # 1-hour cache tier (priced higher than 5m). Newer Claude Code +
-                        # Opus 4.8 put most cache creation here; needed for correct cost.
-                        cc_detail = usage_raw.get("cache_creation") or {}
-                        cw_1h = cc_detail.get("ephemeral_1h_input_tokens", 0)
-                        cw_5m = cc_detail.get("ephemeral_5m_input_tokens", 0)
-                        # Top-level field is occasionally 0 while the detail breakdown is
-                        # populated; trust whichever is larger.
-                        cw = max(cw, cw_5m + cw_1h)
-                        # Dedup by message.id (see comment at top of this function)
-                        msg_id = m.get("id")
-                        if msg_id and msg_id in seen_msgs:
-                            # Same message.id seen again: output_tokens grows as the
-                            # response streams (later lines carry the larger, truer value).
-                            # Take the per-field max and back-fill the delta into the
-                            # buckets this message was originally counted in.
-                            rec = seen_msgs[msg_id]
-                            u = rec["usage"]
-                            new_u = {
-                                "input_tokens": max(u["input_tokens"], inp),
-                                "output_tokens": max(u["output_tokens"], out),
-                                "cache_write": max(u["cache_write"], cw),
-                                "cache_write_1h": max(u["cache_write_1h"], cw_1h),
-                                "cache_read": max(u["cache_read"], cr),
-                            }
-                            if new_u != u:
-                                for field in ("input_tokens", "output_tokens", "cache_write", "cache_read"):
-                                    delta = new_u[field] - u[field]
-                                    rec["mu"][field] += delta
-                                    rec["dmu"][field] += delta
-                                new_cost = cost_for_message(new_u, rec["model_str"])
-                                rec["mu"]["cost"] += new_cost - rec["cost"]
-                                rec["dmu"]["cost"] += new_cost - rec["cost"]
-                                rec["usage"] = new_u
-                                rec["cost"] = new_cost
-                                _SCAN_STATS["usage_upgraded_lines"] += 1
-                            continue
-                        if not msg_id:
-                            _SCAN_STATS["null_msg_id_lines"] += 1
-                        _SCAN_STATS["unique_messages"] += 1
-                        model_str = m.get("model", "") or ""
-                        model_cls = classify_model(model_str)
-                        # Per-message cost using the exact model string (preferred over
-                        # class-level pricing — avoids mis-pricing Opus 4.7 as Opus 4).
-                        single = {"input_tokens": inp, "output_tokens": out, "cache_write": cw,
-                                  "cache_write_1h": cw_1h, "cache_read": cr}
-                        msg_cost = cost_for_message(single, model_str)
-                        # Session-level aggregation
-                        mu = sessions[sid]["models"][model_cls]
-                        mu["messages"] += 1
-                        mu["input_tokens"] += inp
-                        mu["output_tokens"] += out
-                        mu["cache_write"] += cw
-                        mu["cache_read"] += cr
-                        mu["cost"] += msg_cost
-                        # Per-day aggregation (using message's own local date)
-                        if ts:
-                            day_key = ts.astimezone(_local_tz).strftime("%Y-%m-%d")
-                        else:
-                            day_key = sessions[sid]["first_ts"].strftime("%Y-%m-%d") if sessions[sid]["first_ts"] else "unknown"
-                        dmu = sessions[sid]["daily_models"][day_key][model_cls]
-                        dmu["messages"] += 1
-                        dmu["input_tokens"] += inp
-                        dmu["output_tokens"] += out
-                        dmu["cache_write"] += cw
-                        dmu["cache_read"] += cr
-                        dmu["cost"] += msg_cost
-                        if msg_id:
-                            seen_msgs[msg_id] = {
-                                "usage": single, "cost": msg_cost, "model_str": model_str,
-                                "mu": mu, "dmu": dmu,
-                            }
-        except Exception:
+        except OSError:
+            _SCAN_STATS["files_failed"] += 1
             continue
 
     # Drop sessions with no usage
@@ -650,18 +777,16 @@ def print_detail(sessions: dict, range_label: str):
     print("=" * 115)
 
     grand_by_model: dict[str, dict] = defaultdict(empty_usage)
-    grand_cost = 0.0
 
     for sid, sdata in sorted_sessions:
         session_cost = sum(u["cost"] for u in sdata["models"].values())
-        grand_cost += session_cost
         date_str = sdata["first_ts"].strftime("%m/%d %H:%M") if sdata["first_ts"] else "N/A"
         first_msg = sdata["first_msg"] or "-"
 
         print(f"\n\U0001f539 {date_str}  {sdata['project']}/{sid[:8]}  \U0001f4b0${session_cost:.2f}")
         print(f"   \u300c{first_msg}\u300d")
 
-        for mc in ("fable", "opus", "sonnet", "haiku"):
+        for mc in MODEL_CLASSES:
             if mc not in sdata["models"]:
                 continue
             mu = sdata["models"][mc]
@@ -682,17 +807,23 @@ def print_detail(sessions: dict, range_label: str):
 
     total_tokens = 0
     total_cost = 0.0
-    for mc in ("fable", "opus", "sonnet", "haiku"):
+    for mc in MODEL_CLASSES:
         if mc not in grand_by_model:
             continue
         mu = grand_by_model[mc]
         c = mu["cost"]
         total_cost += c
-        p = MODEL_PRICING[mc]
+        # "other" has no class-level representative price — each model in it is
+        # priced individually via lookup_model_pricing during the scan.
+        p = MODEL_PRICING.get(mc)
+        price_note = (
+            f"(Input ${p['input']}/M, Output ${p['output']}/M, CacheW ${p['cache_write']}/M, CacheR ${p['cache_read']}/M)"
+            if p else "(按各模型 LiteLLM 实价计费)"
+        )
         all_in = mu["input_tokens"] + mu["cache_write"] + mu["cache_read"]
         total_tokens += all_in + mu["output_tokens"]
         print(f"""
-{EMOJI[mc]} {mc.upper()}  (Input ${p['input']}/M, Output ${p['output']}/M, CacheW ${p['cache_write']}/M, CacheR ${p['cache_read']}/M)
+{EMOJI[mc]} {mc.upper()}  {price_note}
    \u6d88\u606f\u6570:         {fmt_full(mu['messages'])}
    Input:          {fmt_full(mu['input_tokens'])}
    Output:         {fmt_full(mu['output_tokens'])}
@@ -735,7 +866,7 @@ def print_by_project(sessions: dict, range_label: str):
         print(f"\n\U0001f4c1 {proj}  \U0001f4b0${proj_cost:.2f}")
         print(f"   msgs:{agg['messages']}  in:{fmt(agg['input_tokens'])}  out:{fmt(agg['output_tokens'])}  "
               f"cache_r:{fmt(agg['cache_read'])}  cache_w:{fmt(agg['cache_write'])}  total:{fmt(agg['total'])}")
-        for mc in ("fable", "opus", "sonnet", "haiku"):
+        for mc in MODEL_CLASSES:
             if mc not in projects[proj]:
                 continue
             mu = projects[proj][mc]
@@ -781,7 +912,7 @@ def print_by_day(sessions: dict, range_label: str):
         print(f"\n\U0001f4c5 {day}  \U0001f4b0${day_cost:.2f}")
         print(f"   msgs:{agg['messages']}  in:{fmt(agg['input_tokens'])}  out:{fmt(agg['output_tokens'])}  "
               f"cache_r:{fmt(agg['cache_read'])}  cache_w:{fmt(agg['cache_write'])}  total:{fmt(agg['total'])}")
-        for mc in ("fable", "opus", "sonnet", "haiku"):
+        for mc in MODEL_CLASSES:
             if mc not in days[day]:
                 continue
             mu = days[day][mc]
@@ -895,6 +1026,34 @@ def _token_from_credentials_blob(text: str) -> Optional[str]:
         return None
 
 
+def _decode_security_value(raw: str) -> Optional[str]:
+    """Decode `security -w` output into the stored string value.
+
+    `security -w` prints the raw value, EXCEPT it hex-encodes values that
+    contain newlines — and Claude Code stores pretty-printed JSON in the
+    Keychain, so default setups hit the hex path. Mirrors the Swift side's
+    decodeSecurityValue (Sources/main.swift): try as-is JSON first, then
+    hex-decode. NEVER print/log the value — it contains the OAuth token.
+    """
+    s = raw.strip()
+    if not s:
+        return None
+    # Already valid JSON (minified values without newlines come back verbatim)
+    try:
+        json.loads(s)
+        return s
+    except Exception:
+        pass
+    # Hex-encoded form: even length, all hex digits (optional 0x prefix)
+    h = s[2:] if s[:2] in ("0x", "0X") else s
+    if len(h) % 2 == 0 and h and all(c in "0123456789abcdefABCDEF" for c in h):
+        try:
+            return bytes.fromhex(h).decode("utf-8")
+        except Exception:
+            return None
+    return s  # not JSON, not hex — pass through; caller's JSON parse decides
+
+
 def _read_oauth_token() -> Optional[str]:
     """Return the Claude Code OAuth access token, or None if unavailable.
 
@@ -902,7 +1061,6 @@ def _read_oauth_token() -> Optional[str]:
     login Keychain — which is the DEFAULT location Claude Code stores credentials
     on macOS, so Pro/Max users typically have no plaintext file at all.
     """
-    import os
     env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     if env_token:
         return env_token
@@ -924,7 +1082,9 @@ def _read_oauth_token() -> Optional[str]:
                 capture_output=True, text=True, timeout=5,
             )
             if out.returncode == 0 and out.stdout.strip():
-                return _token_from_credentials_blob(out.stdout.strip())
+                blob = _decode_security_value(out.stdout)
+                if blob:
+                    return _token_from_credentials_blob(blob)
         except Exception:
             pass
     return None
