@@ -22,13 +22,13 @@ echo "🔨 Building $APP_NAME v$VERSION..."
 # ── Step 1: Compile Swift (Universal Binary: arm64 + x86_64) ──
 echo "  [1/4] Compiling Swift (universal binary)..."
 mkdir -p "$BUILD_DIR"
-swiftc "$SCRIPT_DIR/Sources/main.swift" \
+swiftc "$SCRIPT_DIR/Sources/"*.swift \
     -o "$BUILD_DIR/${APP_NAME}_arm64" \
     -framework Cocoa \
     -framework Security \
     -O \
     -target arm64-apple-macosx13.0
-swiftc "$SCRIPT_DIR/Sources/main.swift" \
+swiftc "$SCRIPT_DIR/Sources/"*.swift \
     -o "$BUILD_DIR/${APP_NAME}_x86_64" \
     -framework Cocoa \
     -framework Security \

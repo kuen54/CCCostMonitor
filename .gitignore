@@ -13,9 +13,6 @@ AUDIT_REPORT.md
 # Python bytecode
 __pycache__/
 
-# Unused SPM manifest
-Package.swift
-
 # Xcode (not used, but just in case)
 *.xcodeproj/
 *.xcworkspace/
