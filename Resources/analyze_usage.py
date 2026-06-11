@@ -58,6 +58,7 @@ _SCAN_STATS = {
     "raw_usage_lines": 0,       # assistant-with-usage lines in range, pre-dedup
     "unique_messages": 0,       # unique message.id (or missing-id) lines kept
     "null_msg_id_lines": 0,     # lines without message.id — can't be deduped
+    "usage_upgraded_lines": 0,  # repeat-id lines whose usage grew (streaming rewrites)
 }
 
 
@@ -398,6 +399,7 @@ def scan_diagnostics() -> dict:
         "raw_usage_lines": raw,
         "unique_messages": uniq,
         "null_msg_id_lines": _SCAN_STATS["null_msg_id_lines"],
+        "usage_upgraded_lines": _SCAN_STATS["usage_upgraded_lines"],
         "inflation_factor": round(raw / uniq, 3) if uniq else None,
     }
 
@@ -413,7 +415,8 @@ def diagnostics_line() -> str:
     elif f <= 1.05:
         flag = "  ℹ️ near 1.0 — dedup had little effect (direct API or new format)"
     nulls = f"  null_ids={d['null_msg_id_lines']}" if d["null_msg_id_lines"] else ""
-    return f"🔬 扫描自检: 原始行={d['raw_usage_lines']}  去重后={d['unique_messages']}  inflation={f}x{nulls}{flag}"
+    upgraded = f"  usage_upgraded={d['usage_upgraded_lines']}" if d["usage_upgraded_lines"] else ""
+    return f"🔬 扫描自检: 原始行={d['raw_usage_lines']}  去重后={d['unique_messages']}  inflation={f}x{nulls}{upgraded}{flag}"
 
 
 def friendly_project(raw: str) -> str:
@@ -459,6 +462,7 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
     _SCAN_STATS["raw_usage_lines"] = 0
     _SCAN_STATS["unique_messages"] = 0
     _SCAN_STATS["null_msg_id_lines"] = 0
+    _SCAN_STATS["usage_upgraded_lines"] = 0
 
     # Convert local-time range boundaries to UTC for comparing with message timestamps
     _local_tz = datetime.now().astimezone().tzinfo
@@ -492,7 +496,11 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
     # writes one JSONL line per content block (thinking / text / tool_use …), each
     # carrying the same `message.usage`. Without dedup, a response with N blocks
     # is counted N times — inflating tokens and cost by ~1.5–3x.
-    seen_msg_ids: set[str] = set()
+    # The usage is NOT identical across those lines though: output_tokens grows
+    # with streaming progress (first line often 1, last line the real value), so
+    # each id keeps its counted usage + the aggregation buckets it landed in,
+    # letting later lines back-fill the delta.
+    seen_msgs: dict[str, dict] = {}
     for finfo in all_files:
         sid = finfo["session_id"]
         if sid not in sessions:
@@ -546,23 +554,49 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
                         if ts and (ts < start_utc or ts >= end_utc):
                             continue
                         _SCAN_STATS["raw_usage_lines"] += 1
-                        # Dedup by message.id (see comment at top of this function)
-                        msg_id = m.get("id")
-                        if msg_id:
-                            if msg_id in seen_msg_ids:
-                                continue
-                            seen_msg_ids.add(msg_id)
-                        else:
-                            _SCAN_STATS["null_msg_id_lines"] += 1
-                        _SCAN_STATS["unique_messages"] += 1
-                        model_str = m.get("model", "") or ""
-                        model_cls = classify_model(model_str)
                         cw = usage_raw.get("cache_creation_input_tokens", 0)
                         cr = usage_raw.get("cache_read_input_tokens", 0)
                         # 1-hour cache tier (priced higher than 5m). Newer Claude Code +
                         # Opus 4.8 put most cache creation here; needed for correct cost.
                         cc_detail = usage_raw.get("cache_creation") or {}
                         cw_1h = cc_detail.get("ephemeral_1h_input_tokens", 0)
+                        cw_5m = cc_detail.get("ephemeral_5m_input_tokens", 0)
+                        # Top-level field is occasionally 0 while the detail breakdown is
+                        # populated; trust whichever is larger.
+                        cw = max(cw, cw_5m + cw_1h)
+                        # Dedup by message.id (see comment at top of this function)
+                        msg_id = m.get("id")
+                        if msg_id and msg_id in seen_msgs:
+                            # Same message.id seen again: output_tokens grows as the
+                            # response streams (later lines carry the larger, truer value).
+                            # Take the per-field max and back-fill the delta into the
+                            # buckets this message was originally counted in.
+                            rec = seen_msgs[msg_id]
+                            u = rec["usage"]
+                            new_u = {
+                                "input_tokens": max(u["input_tokens"], inp),
+                                "output_tokens": max(u["output_tokens"], out),
+                                "cache_write": max(u["cache_write"], cw),
+                                "cache_write_1h": max(u["cache_write_1h"], cw_1h),
+                                "cache_read": max(u["cache_read"], cr),
+                            }
+                            if new_u != u:
+                                for field in ("input_tokens", "output_tokens", "cache_write", "cache_read"):
+                                    delta = new_u[field] - u[field]
+                                    rec["mu"][field] += delta
+                                    rec["dmu"][field] += delta
+                                new_cost = cost_for_message(new_u, rec["model_str"])
+                                rec["mu"]["cost"] += new_cost - rec["cost"]
+                                rec["dmu"]["cost"] += new_cost - rec["cost"]
+                                rec["usage"] = new_u
+                                rec["cost"] = new_cost
+                                _SCAN_STATS["usage_upgraded_lines"] += 1
+                            continue
+                        if not msg_id:
+                            _SCAN_STATS["null_msg_id_lines"] += 1
+                        _SCAN_STATS["unique_messages"] += 1
+                        model_str = m.get("model", "") or ""
+                        model_cls = classify_model(model_str)
                         # Per-message cost using the exact model string (preferred over
                         # class-level pricing — avoids mis-pricing Opus 4.7 as Opus 4).
                         single = {"input_tokens": inp, "output_tokens": out, "cache_write": cw,
@@ -588,6 +622,11 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
                         dmu["cache_write"] += cw
                         dmu["cache_read"] += cr
                         dmu["cost"] += msg_cost
+                        if msg_id:
+                            seen_msgs[msg_id] = {
+                                "usage": single, "cost": msg_cost, "model_str": model_str,
+                                "mu": mu, "dmu": dmu,
+                            }
         except Exception:
             continue
 
