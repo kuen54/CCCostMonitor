@@ -148,6 +148,21 @@ final class SubscriptionQuotaService {
     private var cached: (quota: OAuthUsage, at: Date)?
     private let lock = NSLock()
 
+    // Serial work queue: ALL credential load / token refresh / usage-fetch logic runs
+    // here, so two refreshes can never race on the same refresh token (the loser's
+    // whole-blob write-back could clobber the winner's rotated refresh token — worst
+    // case logging Claude Code itself out). Also keeps keychain/file I/O off main.
+    private let workQueue = DispatchQueue(label: "com.claude.cc-cost-monitor.quota.work")
+    // Single-flight state — only touched on workQueue.
+    private var fetchInFlight = false
+    private var pendingCompletions: [(QuotaFetchResult) -> Void] = []
+
+    // hasOAuthToken probe cache. NSLock-guarded because SwiftUI reads it synchronously.
+    private var tokenPresenceCache: (value: Bool, at: Date)?
+    private var tokenProbeInFlight = false
+    private let tokenPresenceLock = NSLock()
+    private static let tokenPresenceTTL: TimeInterval = 60
+
     // Keychain item + OAuth refresh endpoint (mirrors Claude Code's own values).
     private static let keychainService = "Claude Code-credentials"
     private static let refreshURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
@@ -185,7 +200,43 @@ final class SubscriptionQuotaService {
     /// True if a subscription OAuth token is present. Uses an attributes-only Keychain
     /// lookup (no `-w`), so merely deciding whether to show the Plan tab never triggers a
     /// password prompt — only the actual quota fetch reads the secret.
+    ///
+    /// SwiftUI reads this from view code, so it must stay synchronous and cheap: the
+    /// probe result is cached for 60s. When stale, the cached value is returned
+    /// immediately (sticky — no Plan-tab flicker) and re-probed on the work queue, so
+    /// the main thread never blocks behind a locked keychain (e.g. right after wake).
+    /// Only the very first call probes synchronously, which in the common case happens
+    /// at cold start before the popover is even open.
     var hasOAuthToken: Bool {
+        tokenPresenceLock.lock()
+        if let cached = tokenPresenceCache {
+            let isFresh = Date().timeIntervalSince(cached.at) < Self.tokenPresenceTTL
+            let shouldProbe = !isFresh && !tokenProbeInFlight
+            if shouldProbe { tokenProbeInFlight = true }
+            tokenPresenceLock.unlock()
+            if shouldProbe {
+                workQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    let value = self.probeTokenPresence()
+                    self.tokenPresenceLock.lock()
+                    self.tokenPresenceCache = (value, Date())
+                    self.tokenProbeInFlight = false
+                    self.tokenPresenceLock.unlock()
+                }
+            }
+            return cached.value
+        }
+        tokenPresenceLock.unlock()
+        // First-ever call: probe synchronously once so the initial value is correct.
+        let value = probeTokenPresence()
+        tokenPresenceLock.lock()
+        tokenPresenceCache = (value, Date())
+        tokenPresenceLock.unlock()
+        return value
+    }
+
+    /// The actual existence check: env → plaintext file → keychain attributes (no `-w`).
+    private func probeTokenPresence() -> Bool {
         if let env = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !env.isEmpty {
             return true
         }
@@ -346,60 +397,105 @@ final class SubscriptionQuotaService {
 
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
             guard let self = self else { completion(nil); return }
-            let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
-            guard (200..<300).contains(status), let data = data,
-                  let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let newAccess = body["access_token"] as? String, !newAccess.isEmpty else {
-                completion(nil)
-                return
+            // Hop back onto the serial work queue before touching/persisting credentials,
+            // so the write-back can never interleave with other credential work.
+            self.workQueue.async {
+                let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                guard (200..<300).contains(status), let data = data,
+                      let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let newAccess = body["access_token"] as? String, !newAccess.isEmpty else {
+                    completion(nil)
+                    return
+                }
+                var updated = creds
+                updated.accessToken = newAccess
+                if let r = body["refresh_token"] as? String, !r.isEmpty { updated.refreshToken = r }
+                if let e = body["expires_in"] as? Double {
+                    updated.expiresAtMs = Date().timeIntervalSince1970 * 1000 + e * 1000
+                }
+                self.saveCredentials(updated)
+                completion(updated)
             }
-            var updated = creds
-            updated.accessToken = newAccess
-            if let r = body["refresh_token"] as? String, !r.isEmpty { updated.refreshToken = r }
-            if let e = body["expires_in"] as? Double {
-                updated.expiresAtMs = Date().timeIntervalSince1970 * 1000 + e * 1000
-            }
-            self.saveCredentials(updated)
-            completion(updated)
         }.resume()
     }
 
     /// Persist (refreshed) credentials back to whichever source they came from.
+    /// Re-reads the source first and merges our refreshed token fields into the FRESHEST
+    /// blob — Claude Code may have rewritten the item (new scopes, …) since we loaded it
+    /// minutes earlier, and a whole-blob write of stale data would clobber that.
     private func saveCredentials(_ creds: OAuthCredentials) {
         var creds = creds
-        creds.syncIntoFullData()
-        guard let json = try? JSONSerialization.data(withJSONObject: creds.fullData) else { return }
         switch creds.source {
         case .env:
-            break  // injected token — nothing to persist
+            return  // injected token — nothing to persist
         case .file(let path):
-            try? json.write(to: URL(fileURLWithPath: path))
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+               let fresh = Self.parseCredentials(data, source: creds.source) {
+                creds.fullData = fresh.fullData
+            }
+            creds.syncIntoFullData()
+            guard let json = try? JSONSerialization.data(withJSONObject: creds.fullData) else { return }
+            try? json.write(to: URL(fileURLWithPath: path), options: .atomic)
+            // Atomic replace swaps in a new inode — restore the credential file's
+            // tight permissions afterwards.
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: path)
         case .keychain(let service):
+            if let data = Self.securityReadBlob(service: service),
+               let fresh = Self.parseCredentials(data, source: creds.source) {
+                creds.fullData = fresh.fullData
+            }
+            creds.syncIntoFullData()
+            guard let json = try? JSONSerialization.data(withJSONObject: creds.fullData) else { return }
             Self.securityWriteBlob(service: service, account: Self.securityAccount(service: service), json: json)
         }
     }
 
     /// Fetch quota. Always returns a `QuotaFetchResult` so callers can differentiate
     /// "no subscription auth" (expected, hide UI) from actual error states (401/429/etc).
+    /// Completion is always delivered on the main queue. Concurrent calls (wake + 30-min
+    /// timer + ⌘R) are single-flighted: late callers join the in-flight request and all
+    /// complete with its result — so performRefresh can never run twice in parallel and
+    /// burn the same refresh token twice.
     func fetch(forceRefresh: Bool = false, completion: @escaping (QuotaFetchResult) -> Void) {
-        lock.lock()
-        if !forceRefresh, let c = cached, Date().timeIntervalSince(c.at) < ttl {
-            let q = c.quota
-            lock.unlock()
-            completion(.success(q))
-            return
-        }
-        lock.unlock()
+        workQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            if !forceRefresh, let c = self.cached, Date().timeIntervalSince(c.at) < self.ttl {
+                let q = c.quota
+                self.lock.unlock()
+                DispatchQueue.main.async { completion(.success(q)) }
+                return
+            }
+            self.lock.unlock()
 
-        guard let creds = loadCredentials() else {
-            completion(.noToken)
-            return
-        }
+            self.pendingCompletions.append(completion)
+            guard !self.fetchInFlight else { return }  // join the in-flight fetch
+            self.fetchInFlight = true
 
-        // Refresh proactively when expired/expiring, then fetch usage. requestUsage also
-        // force-refreshes once on a 401 in case Claude Code rotated the token out from under us.
-        ensureFreshToken(creds) { [weak self] fresh in
-            self?.requestUsage(fresh, allowRefreshRetry: true, completion: completion)
+            guard let creds = self.loadCredentials() else {
+                self.finishFetch(.noToken)
+                return
+            }
+
+            // Refresh proactively when expired/expiring, then fetch usage. requestUsage also
+            // force-refreshes once on a 401 in case Claude Code rotated the token out from under us.
+            self.ensureFreshToken(creds) { fresh in
+                self.requestUsage(fresh, allowRefreshRetry: true) { result in
+                    self.finishFetch(result)
+                }
+            }
+        }
+    }
+
+    /// Complete the in-flight fetch: fire every waiting completion (on main) with the
+    /// same result and let the next fetch start a new flight.
+    private func finishFetch(_ result: QuotaFetchResult) {
+        workQueue.async {
+            let completions = self.pendingCompletions
+            self.pendingCompletions = []
+            self.fetchInFlight = false
+            DispatchQueue.main.async { completions.forEach { $0(result) } }
         }
     }
 
@@ -422,36 +518,40 @@ final class SubscriptionQuotaService {
 
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
             guard let self = self else { return }
-            let http = resp as? HTTPURLResponse
-            let status = http?.statusCode ?? -1
-            switch status {
-            case 200:
-                guard let data = data,
-                      let quota = try? JSONDecoder().decode(OAuthUsage.self, from: data)
-                else {
-                    completion(.decodeFailure)
-                    return
-                }
-                self.lock.lock()
-                self.cached = (quota, Date())
-                self.lock.unlock()
-                completion(.success(quota))
-            case 401, 403:
-                if allowRefreshRetry, creds.refreshToken != nil {
-                    self.performRefresh(creds) { refreshed in
-                        if let r = refreshed {
-                            self.requestUsage(r, allowRefreshRetry: false, completion: completion)
-                        } else {
-                            completion(.unauthorized)
-                        }
+            // Hop back onto the serial work queue: the cache write and the 401 retry
+            // (which re-enters performRefresh) must not race other credential work.
+            self.workQueue.async {
+                let http = resp as? HTTPURLResponse
+                let status = http?.statusCode ?? -1
+                switch status {
+                case 200:
+                    guard let data = data,
+                          let quota = try? JSONDecoder().decode(OAuthUsage.self, from: data)
+                    else {
+                        completion(.decodeFailure)
+                        return
                     }
-                } else {
-                    completion(.unauthorized)
+                    self.lock.lock()
+                    self.cached = (quota, Date())
+                    self.lock.unlock()
+                    completion(.success(quota))
+                case 401, 403:
+                    if allowRefreshRetry, creds.refreshToken != nil {
+                        self.performRefresh(creds) { refreshed in
+                            if let r = refreshed {
+                                self.requestUsage(r, allowRefreshRetry: false, completion: completion)
+                            } else {
+                                completion(.unauthorized)
+                            }
+                        }
+                    } else {
+                        completion(.unauthorized)
+                    }
+                case 429:
+                    completion(.rateLimited)
+                default:
+                    completion(.networkFailure)
                 }
-            case 429:
-                completion(.rateLimited)
-            default:
-                completion(.networkFailure)
             }
         }.resume()
     }
@@ -786,6 +886,16 @@ class UsageStore: ObservableObject {
     private let scriptPath: String
     private let pythonPath: String
 
+    // Serial queue for ALL analyze_usage.py executions: rapid month flipping or
+    // repeated ⌘R must never stack concurrent full Python scans.
+    private let scriptQueue = DispatchQueue(label: "com.claude.cc-cost-monitor.scripts", qos: .utility)
+    // Staleness guard (main thread only): bumped by month navigation and each new
+    // scan, so a slow old scan's result can never paint over a newer view.
+    private var fetchGeneration = 0
+    // Coalescing flag (main thread only): a manual ⌘R while the 30-min auto-refresh
+    // scan is in flight must not queue a second identical scan behind it.
+    private var isRefreshInFlight = false
+
     // Cache directory: ~/.claude/cache/cc-monitor/
     private var cacheDir: String {
         let dir = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/cache/cc-monitor")
@@ -885,6 +995,9 @@ class UsageStore: ObservableObject {
         viewingYear = cal.component(.year, from: date)
         viewingMonth = cal.component(.month, from: date)
 
+        // Invalidate any in-flight scan's view update — it was for the old month.
+        fetchGeneration += 1
+
         if isCurrentMonth {
             refresh()
         } else {
@@ -906,14 +1019,18 @@ class UsageStore: ObservableObject {
         }
         // Fetch from script
         isLoading = true
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        fetchGeneration += 1
+        let generation = fetchGeneration
+        scriptQueue.async { [weak self] in
             guard let self = self else { return }
             let range = self.monthDateRange(year: y, month: m)
             let ym = String(format: "%04d-%02d", y, m)
             let (data, daily) = self.fetchMonthData(range, yearMonth: ym)
             DispatchQueue.main.async {
-                // Guard: user might have navigated away while loading
-                guard self.viewingYear == y && self.viewingMonth == m else { return }
+                // Guard: user might have navigated away — or a newer scan might have
+                // superseded this one — while loading
+                guard generation == self.fetchGeneration,
+                      self.viewingYear == y && self.viewingMonth == m else { return }
                 self.today = nil
                 self.week = nil
                 self.month = data
@@ -947,7 +1064,17 @@ class UsageStore: ObservableObject {
             // and on-disk cache stay fresh regardless of what the user is viewing.
             loadHistoricalMonth()
         }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        // Coalesce: if a current-month scan is already in flight (e.g. auto-refresh),
+        // don't queue a second identical scan behind it — the menu-bar spinner
+        // (isLoading) already reflects the one that's running.
+        guard !isRefreshInFlight else { return }
+        isRefreshInFlight = true
+        // No generation needed here: isRefreshInFlight already serializes current-month
+        // scans, and the result is always current-month data — whether to paint the
+        // popover is fully decided by isCurrentMonth at completion time. (Generation
+        // guarding is only load-bearing in loadHistoricalMonth, where a superseded
+        // scan for a different month must not paint.)
+        scriptQueue.async { [weak self] in
             guard let self = self else { return }
             // Single script call for the whole month
             let cal = Calendar.current
@@ -956,13 +1083,17 @@ class UsageStore: ObservableObject {
             let (m, daily) = self.fetchMonthData("month", yearMonth: ym)
             // If script failed, keep existing cached data visible
             guard m != nil else {
-                DispatchQueue.main.async { self.isLoading = false }
+                DispatchQueue.main.async {
+                    self.isRefreshInFlight = false
+                    self.isLoading = false
+                }
                 return
             }
             // Derive today & week from daily breakdown
             let t = self.deriveToday(daily)
             let w = self.deriveWeek(daily)
             DispatchQueue.main.async {
+                self.isRefreshInFlight = false
                 // Menu-bar total and cache persistence are always about the current month,
                 // so update them regardless of what the user is currently viewing.
                 self.currentMonthData = m
@@ -974,8 +1105,9 @@ class UsageStore: ObservableObject {
                         data: m, daily: daily)
                 }
                 // Popover fields (today/week/month/dailyBreakdown) feed the active view.
-                // If the user navigated to a historical month while this fetch was in
-                // flight, do NOT clobber their view with current-month data.
+                // Only skip painting when the user is viewing a historical month —
+                // this scan's data is current-month by definition, so painting while
+                // viewing the current month is always correct.
                 guard self.isCurrentMonth else {
                     self.isLoading = false
                     return
@@ -1236,9 +1368,25 @@ class UsageStore: ObservableObject {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            // Kill scans that hang (e.g. Python wedged on a dead network mount) so the
+            // serial script queue can't be blocked forever. Scheduled on a global queue
+            // because this thread is about to block reading the pipe. A SIGTERM'd scan
+            // exits nonzero and falls into the existing failure path below.
+            let timeoutItem = DispatchWorkItem {
+                guard process.isRunning else { return }
+                process.terminate()
+                // Escalate: SIGTERM can be ignored/queued by a wedged process, which
+                // would block the serial script queue (and all future refreshes)
+                // forever behind readDataToEndOfFile. SIGKILL is uncatchable.
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) {
+                    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                }
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 120, execute: timeoutItem)
             // Read pipe BEFORE waitUntilExit to avoid deadlock when output > 64KB
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
+            timeoutItem.cancel()
             guard process.terminationStatus == 0 else { return nil }
             return try JSONSerialization.jsonObject(with: data) as? [String: Any]
         } catch { return nil }
