@@ -8,6 +8,10 @@ dist/
 
 # Internal dev notes
 CLAUDE.md
+AUDIT_REPORT.md
+
+# Python bytecode
+__pycache__/
 
 # Unused SPM manifest
 Package.swift

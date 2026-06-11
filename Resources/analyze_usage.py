@@ -27,6 +27,8 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Optional, Dict, List
 
+__version__ = "1.4.2"
+
 # ---------------------------------------------------------------------------
 # Model pricing
 # ---------------------------------------------------------------------------
@@ -805,6 +807,7 @@ def print_by_day(sessions: dict, range_label: str):
 def print_json(sessions: dict, subscription_quota: Optional[dict] = None):
     """Output structured JSON."""
     result = {
+        "script_version": __version__,
         "pricing_source": _PRICING_SOURCE,
         "model_pricing": {mc: p for mc, p in MODEL_PRICING.items()},
         "sessions": [],
@@ -1014,6 +1017,7 @@ def main():
         # can parse stdout unconditionally. Prose-only output breaks JSONSerialization.
         if args.json:
             empty = {
+                "script_version": __version__,
                 "pricing_source": _PRICING_SOURCE,
                 "model_pricing": {mc: p for mc, p in MODEL_PRICING.items()},
                 "sessions": [],

@@ -8,6 +8,10 @@ import Security
 // ║  Reads Claude Code session data, shows cost in menu bar     ║
 // ╚══════════════════════════════════════════════════════════════╝
 
+/// App version, single-sourced from Info.plist (CFBundleShortVersionString).
+/// When run as a bare binary in dev (no bundle plist), falls back to "0.0".
+fileprivate let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0"
+
 // MARK: - Data Models
 
 struct ModelUsage: Identifiable, Codable {
@@ -332,7 +336,7 @@ final class SubscriptionQuotaService {
         req.httpMethod = "POST"
         req.timeoutInterval = 15
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("CCCostMonitor/1.3.5", forHTTPHeaderField: "User-Agent")
+        req.setValue("CCCostMonitor/\(appVersion)", forHTTPHeaderField: "User-Agent")
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
             "grant_type": "refresh_token",
             "refresh_token": refresh,
@@ -414,7 +418,7 @@ final class SubscriptionQuotaService {
         req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("CCCostMonitor/1.3.5", forHTTPHeaderField: "User-Agent")
+        req.setValue("CCCostMonitor/\(appVersion)", forHTTPHeaderField: "User-Agent")
 
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
             guard let self = self else { return }
