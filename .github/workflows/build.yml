@@ -1,0 +1,32 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Info.plist
+        run: plutil -lint Info.plist
+
+      - name: Syntax-check analyze_usage.py
+        run: python3 -m py_compile Resources/analyze_usage.py
+
+      - name: Build app + DMG
+        run: bash build.sh
+
+      - name: Verify code signature
+        run: codesign --verify --deep --strict build/CCCostMonitor.app
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CCCostMonitor-dmg
+          path: dist/CCCostMonitor.dmg
+          if-no-files-found: error

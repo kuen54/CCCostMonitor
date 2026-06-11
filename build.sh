@@ -7,8 +7,17 @@ BUILD_DIR="$SCRIPT_DIR/build"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 DIST_DIR="$SCRIPT_DIR/dist"
 DMG_NAME="$APP_NAME.dmg"
+VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$SCRIPT_DIR/Info.plist")
 
-echo "🔨 Building $APP_NAME..."
+# Flags
+ALLOW_DRIFT=0
+for arg in "$@"; do
+    if [ "$arg" = "--allow-drift" ]; then
+        ALLOW_DRIFT=1
+    fi
+done
+
+echo "🔨 Building $APP_NAME v$VERSION..."
 
 # ── Step 1: Compile Swift (Universal Binary: arm64 + x86_64) ──
 echo "  [1/4] Compiling Swift (universal binary)..."
@@ -56,14 +65,43 @@ cp "$BUILD_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
 
 # Bundle the analysis script
 ANALYSIS_SCRIPT="$HOME/.claude/skills/local-cc-cost/scripts/analyze_usage.py"
+REPO_SCRIPT="$SCRIPT_DIR/Resources/analyze_usage.py"
+SELECTED_SCRIPT=""
+if [ -f "$ANALYSIS_SCRIPT" ] && [ -f "$REPO_SCRIPT" ]; then
+    if ! cmp -s "$ANALYSIS_SCRIPT" "$REPO_SCRIPT"; then
+        if [ "$ALLOW_DRIFT" = "1" ]; then
+            echo "  ⚠️  WARNING: analyze_usage.py copies differ (--allow-drift set, continuing with skill copy)"
+            echo "       skill: $ANALYSIS_SCRIPT"
+            echo "       repo:  $REPO_SCRIPT"
+        else
+            echo "  ❌ ERROR: analyze_usage.py copies have drifted!"
+            echo "       skill: $ANALYSIS_SCRIPT"
+            echo "       repo:  $REPO_SCRIPT"
+            echo "     They must be byte-identical. Sync them (cp) or pass --allow-drift to override."
+            exit 1
+        fi
+    fi
+fi
 if [ -f "$ANALYSIS_SCRIPT" ]; then
+    SELECTED_SCRIPT="$ANALYSIS_SCRIPT"
     cp "$ANALYSIS_SCRIPT" "$APP_BUNDLE/Contents/Resources/"
     echo "  ✅ Bundled analyze_usage.py"
-elif [ -f "$SCRIPT_DIR/Resources/analyze_usage.py" ]; then
-    cp "$SCRIPT_DIR/Resources/analyze_usage.py" "$APP_BUNDLE/Contents/Resources/"
+elif [ -f "$REPO_SCRIPT" ]; then
+    SELECTED_SCRIPT="$REPO_SCRIPT"
+    cp "$REPO_SCRIPT" "$APP_BUNDLE/Contents/Resources/"
     echo "  ✅ Bundled analyze_usage.py (from Resources/)"
 else
     echo "  ⚠️  analyze_usage.py not found — app will look for it at runtime"
+fi
+
+# Syntax-check the bundled script so a broken edit fails the build, not the user
+if [ -n "$SELECTED_SCRIPT" ]; then
+    if python3 -m py_compile "$SELECTED_SCRIPT"; then
+        echo "  ✅ analyze_usage.py syntax OK (py_compile)"
+    else
+        echo "  ❌ ERROR: analyze_usage.py failed py_compile: $SELECTED_SCRIPT"
+        exit 1
+    fi
 fi
 
 # Code sign. Prefer a stable self-signed identity so every rebuild keeps a CONSTANT
@@ -96,8 +134,8 @@ cp -R "$APP_BUNDLE" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
 
 # Create README
-cat > "$STAGING/README.txt" << 'EOF'
-CC Cost Monitor v1.0
+cat > "$STAGING/README.txt" << EOF
+CC Cost Monitor v$VERSION
 ====================
 
 Monitor your Claude Code token usage & cost from the macOS menu bar.
