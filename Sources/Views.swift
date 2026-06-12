@@ -5,17 +5,22 @@ import AppKit
 //
 // Color/icon stay in the UI layer (SwiftUI Color must not enter the pure core,
 // see Core_ModelClass.swift). Raw-string cases match ModelClass.rawValue.
-extension ModelUsage {
-    var color: Color {
-        switch id {
-        case "fable":  return Color(red: 0.92, green: 0.55, blue: 0.20) // orange — top tier above Opus
-        case "opus":   return Color(red: 0.56, green: 0.27, blue: 0.96) // purple
-        case "sonnet": return Color(red: 0.24, green: 0.52, blue: 0.98) // blue
-        case "haiku":  return Color(red: 0.20, green: 0.78, blue: 0.45) // green
-        case "other":  return Color(red: 0.65, green: 0.65, blue: 0.65) // gray — non-Claude (Kimi/Qwen/etc.)
-        default:       return .gray
-        }
+
+/// Single source of truth for the model-class palette: usage bars/chips
+/// (ModelUsage.color) and the Time tab's interval capsules share it.
+/// nil / unknown ids fall back to the non-Claude gray.
+func modelClassColor(_ id: String?) -> Color {
+    switch id {
+    case "fable":  return Color(red: 0.92, green: 0.55, blue: 0.20) // orange — top tier above Opus
+    case "opus":   return Color(red: 0.56, green: 0.27, blue: 0.96) // purple
+    case "sonnet": return Color(red: 0.24, green: 0.52, blue: 0.98) // blue
+    case "haiku":  return Color(red: 0.20, green: 0.78, blue: 0.45) // green
+    default:       return Color(red: 0.65, green: 0.65, blue: 0.65) // gray — non-Claude (Kimi/Qwen/etc.) / untagged
     }
+}
+
+extension ModelUsage {
+    var color: Color { modelClassColor(id) }
 
     var icon: String {
         switch id {
@@ -45,14 +50,6 @@ extension EnvironmentValues {
         get { self[LocalizerKey.self] }
         set { self[LocalizerKey.self] = newValue }
     }
-}
-
-// MARK: - Brand colors
-
-/// Claude brand orange (#D97757) — same hue as the header logo. Every Time-tab
-/// chart draws activity in this color so the tab reads as one consistent hue.
-enum Brand {
-    static let orange = Color(red: 0.851, green: 0.467, blue: 0.341)
 }
 
 // MARK: - SwiftUI Views
@@ -908,7 +905,7 @@ struct WeekTimeChart: View {
         let capWidth = max(2, w * CGFloat(max(interval.durationSeconds, 120)) / 86400.0)
         let x = min(max(0, w * CGFloat(interval.startSec) / 86400.0), w - capWidth)
         return Capsule()
-            .fill(Brand.orange.opacity(0.85))
+            .fill(modelClassColor(interval.model).opacity(0.85))
             .frame(width: capWidth, height: 8)
             .offset(x: x)
             .onHover { h in
@@ -1153,7 +1150,7 @@ struct MonthTimeChart: View {
         let x = dayWidth * CGFloat(dayIndex)
             + min(max(0, dayWidth * CGFloat(interval.startSec) / 86400.0), dayWidth - capWidth)
         return Capsule()
-            .fill(Brand.orange.opacity(0.85))
+            .fill(modelClassColor(interval.model).opacity(0.85))
             .frame(width: capWidth, height: 8)
             .offset(x: x)
             .onHover { h in
@@ -1166,6 +1163,7 @@ struct MonthTimeChart: View {
 struct YearHeatmap: View {
     @ObservedObject var store: UsageStore
     @Environment(\.localizer) private var loc
+    @Environment(\.colorScheme) private var colorScheme
 
     @State private var hoveredKey: String? = nil
 
@@ -1174,15 +1172,26 @@ struct YearHeatmap: View {
 
     private var currentYear: Int { AppDate.gregorian.component(.year, from: Date()) }
 
-    /// 5 fixed heat levels: 0 → faint neutral, 1–4 → brand-orange ramp.
-    static func levelColor(_ level: Int) -> Color {
-        switch level {
-        case 0:  return Color.primary.opacity(0.06)
-        case 1:  return Brand.orange.opacity(0.25)
-        case 2:  return Brand.orange.opacity(0.45)
-        case 3:  return Brand.orange.opacity(0.70)
-        default: return Brand.orange
-        }
+    /// GitHub contribution-graph greens, levels 1–4. Hand-picked per scheme
+    /// (GitHub does the same — the light ramp is illegible on dark backgrounds)
+    /// rather than opacity-derived, hence the explicit ramps.
+    private static let lightRamp: [Color] = [
+        Color(red: 0.608, green: 0.914, blue: 0.659), // #9be9a8
+        Color(red: 0.251, green: 0.769, blue: 0.388), // #40c463
+        Color(red: 0.188, green: 0.631, blue: 0.306), // #30a14e
+        Color(red: 0.129, green: 0.431, blue: 0.224), // #216e39
+    ]
+    private static let darkRamp: [Color] = [
+        Color(red: 0.055, green: 0.267, blue: 0.161), // #0e4429
+        Color(red: 0.000, green: 0.427, blue: 0.196), // #006d32
+        Color(red: 0.149, green: 0.651, blue: 0.255), // #26a641
+        Color(red: 0.224, green: 0.827, blue: 0.325), // #39d353
+    ]
+
+    /// 5 fixed heat levels: 0 → faint neutral, 1–4 → GitHub-green ramp.
+    static func levelColor(_ level: Int, dark: Bool) -> Color {
+        guard (1...4).contains(level) else { return Color.primary.opacity(0.06) }
+        return (dark ? darkRamp : lightRamp)[level - 1]
     }
 
     var body: some View {
@@ -1296,7 +1305,8 @@ struct YearHeatmap: View {
         }
         if let key = key, key.hasPrefix(yearPrefix) {
             RoundedRectangle(cornerRadius: 1.5)
-                .fill(Self.levelColor(TimeLogic.heatLevel(days[key] ?? 0)))
+                .fill(Self.levelColor(TimeLogic.heatLevel(days[key] ?? 0),
+                                      dark: colorScheme == .dark))
                 .frame(width: cellSize, height: cellSize)
                 .onHover { h in hoveredKey = h ? key : nil }
         } else {
@@ -1315,7 +1325,7 @@ struct YearHeatmap: View {
                 .foregroundColor(.secondary)
             ForEach(0..<5, id: \.self) { level in
                 RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Self.levelColor(level))
+                    .fill(Self.levelColor(level, dark: colorScheme == .dark))
                     .frame(width: cellSize, height: cellSize)
             }
             Text(loc("timeMore"))
@@ -1370,7 +1380,7 @@ struct PopoverView: View {
             HStack {
                 HStack(spacing: 6) {
                     ClaudeLogoShape()
-                        .fill(Brand.orange)
+                        .fill(Color(red: 0.851, green: 0.467, blue: 0.341)) // Claude brand orange (#D97757)
                         .frame(width: 14, height: 14)
                     Text(loc("title"))
                         .font(.system(size: 13, weight: .bold))

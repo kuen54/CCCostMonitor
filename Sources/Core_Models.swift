@@ -68,7 +68,35 @@ struct MonthlySnapshot: Codable {
 struct ActiveInterval: Codable, Equatable {
     let startSec: Int
     let endSec: Int
+    /// Dominant model class for the interval ("fable"/"opus"/"sonnet"/"haiku"/
+    /// "other"). nil = no model-tagged event in the interval (user-only) or a
+    /// pre-attribution payload. Cosmetic only — never affects durations.
+    let model: String?
     var durationSeconds: Int { endSec - startSec }
+
+    init(startSec: Int, endSec: Int, model: String? = nil) {
+        self.startSec = startSec
+        self.endSec = endSec
+        self.model = model
+    }
+
+    // Codable form mirrors the script's compact array [start, end, model|null]
+    // so the snapshot cache and the wire JSON stay one shape. A 2-element
+    // array decodes as model = nil — robustness against a stale bundled
+    // script still emitting the pre-attribution pairs.
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        startSec = try container.decode(Int.self)
+        endSec = try container.decode(Int.self)
+        model = container.isAtEnd ? nil : try container.decodeIfPresent(String.self)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.unkeyedContainer()
+        try container.encode(startSec)
+        try container.encode(endSec)
+        try container.encode(model)
+    }
 }
 
 struct DayTimeUsage: Codable, Equatable {

@@ -146,10 +146,12 @@ import Testing
           "time": {
             "gap_minutes": 10,
             "days": {
-              "2026-04-01": {"intervals": [[3600, 7200], [40000, 40000]], "total_seconds": 3600},
+              "2026-04-01": {"intervals": [[3600, 7200, "opus"], [40000, 40000, null]], "total_seconds": 3600},
               "2026-04-02": {"intervals": [], "total_seconds": 0},
               "2026-04-03": "garbage-not-a-dict",
-              "2026-04-04": {"intervals": [[100, 50], [-1, 5], [0, 99999], [200, 300]], "total_seconds": 100}
+              "2026-04-04": {"intervals": [[100, 50, "opus"], [-1, 5], [0, 99999, "haiku"],
+                                           [200, 300], [400, 500, 42],
+                                           [600, 700, "fable", "extra"]], "total_seconds": 100}
             }
           }
         }
@@ -160,15 +162,19 @@ import Testing
 
         let day1 = try #require(time.days["2026-04-01"])
         #expect(day1.totalSeconds == 3600)
-        #expect(day1.intervals == [ActiveInterval(startSec: 3600, endSec: 7200),
-                                   ActiveInterval(startSec: 40000, endSec: 40000)])  // zero-duration kept
+        #expect(day1.intervals == [ActiveInterval(startSec: 3600, endSec: 7200, model: "opus"),
+                                   // zero-duration kept; null model → nil
+                                   ActiveInterval(startSec: 40000, endSec: 40000, model: nil)])
 
         #expect(time.days["2026-04-02"]?.intervals.isEmpty == true)
         #expect(time.days["2026-04-03"] == nil)
 
-        // Invalid pairs (reversed, negative, >86400) skipped; valid pair survives
+        // Invalid entries (reversed, negative, >86400, 4-element) skipped;
+        // legacy 2-element pair survives as model = nil; a non-string model
+        // degrades to nil without dropping the interval (duration is truth).
         let day4 = try #require(time.days["2026-04-04"])
-        #expect(day4.intervals == [ActiveInterval(startSec: 200, endSec: 300)])
+        #expect(day4.intervals == [ActiveInterval(startSec: 200, endSec: 300, model: nil),
+                                   ActiveInterval(startSec: 400, endSec: 500, model: nil)])
     }
 
     @Test func parseTimeSectionAbsentOrMalformedReturnsNil() {
@@ -224,6 +230,35 @@ import Testing
         #expect(UsageParser.mergeTimeData(base: nil, override: nil) == nil)
     }
 
+    // MARK: ActiveInterval codec (compact-array wire/cache form)
+
+    @Test func activeIntervalDecodesArrayForms() throws {
+        let decoder = JSONDecoder()
+        let tagged = try decoder.decode(ActiveInterval.self, from: Data(#"[3600, 7200, "opus"]"#.utf8))
+        #expect(tagged == ActiveInterval(startSec: 3600, endSec: 7200, model: "opus"))
+
+        let nullModel = try decoder.decode(ActiveInterval.self, from: Data("[3600, 7200, null]".utf8))
+        #expect(nullModel == ActiveInterval(startSec: 3600, endSec: 7200, model: nil))
+
+        // Legacy 2-element pair (stale bundled script / pre-attribution cache)
+        // ACCEPTED as model = nil — duration is truth, the model is cosmetic.
+        let legacy = try decoder.decode(ActiveInterval.self, from: Data("[3600, 7200]".utf8))
+        #expect(legacy == ActiveInterval(startSec: 3600, endSec: 7200, model: nil))
+
+        // The pre-restyle keyed shape no longer decodes (unreleased dev caches
+        // only) — decodeSnapshot returns nil and the store rescans.
+        let keyed = Data(#"{"startSec": 3600, "endSec": 7200}"#.utf8)
+        #expect((try? decoder.decode(ActiveInterval.self, from: keyed)) == nil)
+    }
+
+    @Test func activeIntervalEncodesCompactArray() throws {
+        let tagged = try JSONEncoder().encode(ActiveInterval(startSec: 60, endSec: 120, model: "fable"))
+        #expect(String(decoding: tagged, as: UTF8.self) == #"[60,120,"fable"]"#)
+
+        let untagged = try JSONEncoder().encode(ActiveInterval(startSec: 60, endSec: 120))
+        #expect(String(decoding: untagged, as: UTF8.self) == "[60,120,null]")
+    }
+
     // MARK: snapshot codec
 
     @Test func snapshotEncodeDecodeRoundTrip() throws {
@@ -239,7 +274,7 @@ import Testing
             weekStart: "2026-04-27",
             time: TimeData(gapMinutes: 10, days: [
                 "2026-04-01": DayTimeUsage(
-                    intervals: [ActiveInterval(startSec: 3600, endSec: 7200),
+                    intervals: [ActiveInterval(startSec: 3600, endSec: 7200, model: "opus"),
                                 ActiveInterval(startSec: 86000, endSec: 86400)],
                     totalSeconds: 4000),
             ])

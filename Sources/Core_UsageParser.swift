@@ -112,12 +112,14 @@ enum UsageParser {
     // MARK: Active time ("time" section / --time-year output)
 
     /// Parse the ADDITIVE top-level `"time"` section of a month/range scan:
-    ///   {"gap_minutes": G, "days": {"yyyy-MM-dd": {"intervals": [[s,e],...],
+    ///   {"gap_minutes": G, "days": {"yyyy-MM-dd": {"intervals": [[s,e,model|null],...],
     ///                                              "total_seconds": N}, ...}}
     /// Returns nil when the section is absent (old script / old cached JSON —
     /// the UI shows an empty state) or its top-level shape is wrong. Malformed
-    /// individual days/pairs are skipped, matching parseDailyBreakdown's
-    /// lenient per-entry policy.
+    /// individual days/entries are skipped, matching parseDailyBreakdown's
+    /// lenient per-entry policy. A 2-element entry (stale bundled script) is
+    /// accepted as model = nil; a non-string third element degrades to nil
+    /// too — model is cosmetic, the duration is the truth worth keeping.
     static func parseTimeSection(_ json: [String: Any]) -> TimeData? {
         guard let section = json["time"] as? [String: Any],
               let gap = section["gap_minutes"] as? Int,
@@ -125,13 +127,15 @@ enum UsageParser {
         var days: [String: DayTimeUsage] = [:]
         for (dayKey, value) in daysRaw {
             guard let dayDict = value as? [String: Any],
-                  let pairsRaw = dayDict["intervals"] as? [Any],
+                  let entriesRaw = dayDict["intervals"] as? [Any],
                   let total = dayDict["total_seconds"] as? Int else { continue }
             var intervals: [ActiveInterval] = []
-            for pairAny in pairsRaw {
-                guard let pair = pairAny as? [Int], pair.count == 2,
-                      pair[0] >= 0, pair[0] <= pair[1], pair[1] <= 86400 else { continue }
-                intervals.append(ActiveInterval(startSec: pair[0], endSec: pair[1]))
+            for entryAny in entriesRaw {
+                guard let entry = entryAny as? [Any], (2...3).contains(entry.count),
+                      let s = entry[0] as? Int, let e = entry[1] as? Int,
+                      s >= 0, s <= e, e <= 86400 else { continue }
+                let model = entry.count == 3 ? entry[2] as? String : nil
+                intervals.append(ActiveInterval(startSec: s, endSec: e, model: model))
             }
             days[dayKey] = DayTimeUsage(intervals: intervals, totalSeconds: total)
         }

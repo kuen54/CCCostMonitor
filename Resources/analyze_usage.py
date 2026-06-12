@@ -149,13 +149,16 @@ _SCAN_STATS = {
 # always-available ground truth for verifying the cache.
 SCAN_CACHE_PATH = Path.home() / ".claude" / "cache" / "cc-monitor" / "scan-cache.json"
 # v2: entries gain active-time interval lists ("time": absolute UTC epoch
-# second pairs, gap-merged per file at _GAP_MINUTES — NOT split into local
-# days, so the DST fall-back fold stays disambiguated; see parse_file's
-# entry-shape docstring) + "time_event_lines"; cache header gains
-# "gap_minutes" (a mismatch at load time → silent full rescan, same degrade
-# path as a format/script-version mismatch). All v1 caches silently rebuild
-# once. v2 never shipped before this schema, so no day-keyed v2 caches exist
-# in the wild (and the validator rejects that shape anyway).
+# second triples [start, end, counts], gap-merged per file at _GAP_MINUTES —
+# NOT split into local days, so the DST fall-back fold stays disambiguated;
+# counts = per-model-class tallies of the assistant model-tagged events
+# inside the interval; see parse_file's entry-shape docstring) +
+# "time_event_lines"; cache header gains "gap_minutes" (a mismatch at load
+# time → silent full rescan, same degrade path as a format/script-version
+# mismatch). All v1 caches silently rebuild once. v2 never shipped, so its
+# earlier development shapes (day-keyed; 2-element [start, end] pairs) exist
+# at most on dev machines — the validator rejects both, degrading to one
+# silent full rescan.
 SCAN_CACHE_FORMAT_VERSION = 2
 
 # Whether the current scan actually used the cache (False under --no-cache or
@@ -212,21 +215,28 @@ def _valid_cache_entry(e) -> bool:
         for k in ("skipped_lines", "prefiltered_lines", "null_ts_lines", "time_event_lines"):
             if not isinstance(e.get(k), int):
                 return False
-        # Active-time intervals: [[start_epoch, end_epoch], ...] — int UTC
-        # epoch second pairs, s <= e, within the same bounds the extractor
+        # Active-time intervals: [[start_epoch, end_epoch, counts], ...] —
+        # int UTC epoch seconds, s <= e, within the same bounds the extractor
         # enforces (so a self-written entry ALWAYS revalidates — a stricter
         # check here would silently force a full rescan on every run) and
-        # fromtimestamp()/astimezone()-safe at query time. Anything else
-        # (forged floats, reversed pairs, out-of-range epochs, the old v2
-        # day-keyed shape) → silent full rescan.
+        # fromtimestamp()/astimezone()-safe at query time. counts is a
+        # possibly-empty {model_class: positive int} dict — parse_file only
+        # ever increments, so 0 never appears in a self-written entry.
+        # Anything else (forged floats, reversed pairs, out-of-range epochs,
+        # unknown class keys, the earlier v2 dev shapes: day-keyed or
+        # 2-element pairs) → silent full rescan.
         tm = e.get("time")
         if not isinstance(tm, list):
             return False
-        for pair in tm:
-            if not (isinstance(pair, list) and len(pair) == 2
-                    and all(isinstance(x, int) for x in pair)
-                    and _TIME_EPOCH_MIN <= pair[0] <= pair[1] < _TIME_EPOCH_MAX):
+        for iv in tm:
+            if not (isinstance(iv, list) and len(iv) == 3
+                    and isinstance(iv[0], int) and isinstance(iv[1], int)
+                    and _TIME_EPOCH_MIN <= iv[0] <= iv[1] < _TIME_EPOCH_MAX
+                    and isinstance(iv[2], dict)):
                 return False
+            for cls, n in iv[2].items():
+                if cls not in MODEL_CLASSES or not isinstance(n, int) or n < 1:
+                    return False
         return True
     except Exception:
         return False
@@ -616,6 +626,21 @@ def _gap_merge(pairs_sorted: list, gap) -> list:
     return [(a, b) for a, b in merged]
 
 
+def _dominant_model(counts: dict) -> Optional[str]:
+    """Dominant model class of one interval's model-tagged event counts.
+
+    Highest count wins; ties break by the fixed MODEL_CLASSES order
+    (fable > opus > sonnet > haiku > other). Empty counts (interval held no
+    model-tagged assistant events — e.g. user/system lines only) → None.
+    Keys are guaranteed members of MODEL_CLASSES: classify_model only emits
+    those, and _valid_cache_entry rejects anything else.
+    """
+    if not counts:
+        return None
+    return max(counts.items(),
+               key=lambda kv: (kv[1], -MODEL_CLASSES.index(kv[0])))[0]
+
+
 def _first_offset_change(lo: datetime, hi: datetime) -> datetime:
     """First instant in (lo, hi] whose local UTC offset differs from lo's.
 
@@ -966,9 +991,14 @@ def parse_file(path: Path, is_sub: bool):
                   each counted line's local day.
       skipped_lines / prefiltered_lines / null_ts_lines: plain scalars
                   (incremented before/independent of the range check).
-      time:       [[start_epoch, end_epoch], ...] — active-time intervals
-                  from ALL line types' timestamps (int UTC epoch seconds),
-                  gap-merged at _GAP_MINUTES per file, sorted, disjoint.
+      time:       [[start_epoch, end_epoch, counts], ...] — active-time
+                  intervals from ALL line types' timestamps (int UTC epoch
+                  seconds), gap-merged at _GAP_MINUTES per file, sorted,
+                  disjoint. counts = {model_class: positive int}, possibly
+                  empty — tallies of the model-tagged events (assistant
+                  lines with a timestamp AND a model string) inside the
+                  interval; query time sums them across merging files and
+                  picks the dominant class per merged interval.
                   Deliberately ABSOLUTE and NOT split into local days: the
                   cache must disambiguate the DST fall-back fold (two real
                   instants share one wall-clock second), which
@@ -994,6 +1024,9 @@ def parse_file(path: Path, is_sub: bool):
     }
     # Active-time event epochs (every line type), gap-merged after the loop.
     events: list = []
+    # (epoch, model_class) for assistant lines carrying a model string —
+    # a subset of `events` (same epochs), tallied per interval after the merge.
+    model_events: list = []
     # Per-file dedup: Anthropic message.id is unique per API call, but Claude
     # Code writes one JSONL line per content block (thinking / text / tool_use…),
     # each carrying the same `message.usage`. Without dedup, a response with N
@@ -1107,6 +1140,24 @@ def parse_file(path: Path, is_sub: bool):
                         if not isinstance(m, dict):
                             entry["skipped_lines"] += 1
                             continue
+                        # Model-tagged active-time event: ts_ev is the exact
+                        # epoch _extract_line_ts already recorded for this
+                        # line, so the tag lands inside the interval that
+                        # event built. Only assistant lines reach here — the
+                        # prefilter and non-assistant parsing are untouched.
+                        # Streamed repeat lines tag too (pre-dedup): per-line
+                        # weight is what "dominant inside an interval" wants.
+                        # Lines without a model string stay untagged (no
+                        # classify_model default-to-sonnet guessing here).
+                        # "<synthetic>" is a Claude Code placeholder on locally
+                        # fabricated lines (API error/interrupt, zero usage —
+                        # no model streamed); classify_model would bucket it
+                        # sonnet, so angle-bracket placeholders stay untagged.
+                        if ts_ev is not None:
+                            _mstr = m.get("model")
+                            if (isinstance(_mstr, str) and _mstr
+                                    and not _mstr.startswith("<")):
+                                model_events.append((ts_ev, classify_model(_mstr)))
                         usage_raw = m.get("usage") or {}
                         if not isinstance(usage_raw, dict):
                             entry["skipped_lines"] += 1
@@ -1214,14 +1265,23 @@ def parse_file(path: Path, is_sub: bool):
         ok = False
     entry["first_ts"] = first_ts_dt.isoformat() if first_ts_dt else None
     # Active-time intervals: sort event epochs, gap-merge zero-width (t, t)
-    # points, store as absolute [start_epoch, end_epoch] pairs (no local-day
-    # split here — see the entry-shape docstring). Zero-duration intervals
-    # (isolated events) are kept truthful (start == end); the renderer pads
-    # to a visible width.
+    # points, store as absolute [start_epoch, end_epoch, counts] triples (no
+    # local-day split here — see the entry-shape docstring). Zero-duration
+    # intervals (isolated events) are kept truthful (start == end); the
+    # renderer pads to a visible width. Every model-tagged epoch is also in
+    # `events`, so it falls inside exactly ONE merged interval — assigned by
+    # a two-pointer walk over the sorted tag list.
     if events:
         events.sort()
-        entry["time"] = [[a, b] for a, b in
-                         _gap_merge([(t, t) for t in events], _GAP_MINUTES * 60)]
+        merged = _gap_merge([(t, t) for t in events], _GAP_MINUTES * 60)
+        counts: list = [{} for _ in merged]
+        model_events.sort()
+        mi = 0
+        for ep, cls in model_events:
+            while merged[mi][1] < ep:
+                mi += 1
+            counts[mi][cls] = counts[mi].get(cls, 0) + 1
+        entry["time"] = [[a, b, counts[i]] for i, (a, b) in enumerate(merged)]
     return entry, ok
 
 
@@ -1437,7 +1497,9 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime,
     # Parse (or serve from cache) and merge, in collection order — preserves
     # the JSON sessions array order and first_msg first-wins semantics.
     sessions: dict[str, dict] = {}
-    time_pairs: list = []  # absolute (start_epoch, end_epoch) across all files
+    # Absolute (start_epoch, end_epoch, counts) across all files. counts may
+    # be a cache-owned dict — _build_time_days copies before mutating.
+    time_triples: list = []
     for finfo in all_files:
         entry = finfo["cache_entry"]
         if entry is not None:
@@ -1459,8 +1521,8 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime,
         # Active-time intervals participate under the same pruning rules as
         # usage (a pruned file contributes nothing); range filtering happens
         # after the cross-file merge so midnight-bridging gaps survive.
-        for s, e in entry["time"]:
-            time_pairs.append((s, e))
+        for s, e, c in entry["time"]:
+            time_triples.append((s, e, c))
 
     if use_cache:
         # Prune entries whose file disappeared, then persist if anything changed.
@@ -1473,7 +1535,7 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime,
         if cache_dirty:
             _write_scan_cache(cache_files)
 
-    time_days = _build_time_days(time_pairs, start_str, end_str)
+    time_days = _build_time_days(time_triples, start_str, end_str)
 
     # Drop sessions with no usage
     filtered_sessions = {sid: s for sid, s in sessions.items() if any(
@@ -1482,26 +1544,33 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime,
     return filtered_sessions, time_days
 
 
-def _build_time_days(time_pairs: list, start_str: str, end_str: str) -> dict:
+def _build_time_days(time_triples: list, start_str: str, end_str: str) -> dict:
     """Cross-file union merge of per-file active-time intervals.
 
     Works in the ABSOLUTE UTC-epoch domain (the cache's storage domain):
-    globally sort and gap-merge the (start_epoch, end_epoch) pairs, then
-    split each merged interval at local midnights and DST transitions via
+    globally sort and gap-merge the (start_epoch, end_epoch, counts) triples
+    — counts SUM when intervals merge, so per merged interval they equal the
+    global tally of its model-tagged events — then split each merged
+    interval at local midnights and DST transitions via
     _split_interval_by_local_day. Equivalent to gap-merging the global event
     set, because every stored endpoint is a real event — and immune to the
     DST fall-back fold, where wall-clock seconds are non-monotonic in real
     time (a wall-domain merge fabricated active time across the repeated
     hour and missed real <=G gaps straddling it). Gaps spanning local
     midnight merge correctly (per-day merging would lose a 23:58→00:05
-    bridge). Per day, the wall pieces are union-merged (sort, merge
-    overlap/touch): a no-op on normal days (distinct merged intervals are
-    > G apart and the wall mapping is monotonic) but required on fall-back
-    days, where pieces from both sides of the fold may overlap on the wall
-    axis. Output invariants: intervals sorted, disjoint, 0 <= s <= e <= 86400,
-    sum == total_seconds. Returns {day_key: {"intervals": [[s, e], ...],
-    "total_seconds": N}} covering EVERY day of [start_str, end_str) — empty
-    days included.
+    bridge). The dominant model is resolved per MERGED interval; every day
+    piece split from it carries that whole-interval dominant (counts are
+    never split at midnight). Per day, the wall pieces are union-merged
+    (sort, merge overlap/touch): a no-op on normal days (distinct merged
+    intervals are > G apart and the wall mapping is monotonic) but required
+    on fall-back days, where pieces from both sides of the fold may overlap
+    on the wall axis — there the earlier piece's model wins (a None upgrades
+    to the later piece's model), keeping durations exact at the cost of one
+    label on a <=1h/year edge. Output invariants: intervals sorted, disjoint,
+    0 <= s <= e <= 86400, sum == total_seconds. Returns {day_key:
+    {"intervals": [[s, e, model], ...], "total_seconds": N}} — model is a
+    MODEL_CLASSES member or None — covering EVERY day of
+    [start_str, end_str); empty days included.
     """
     days: dict = {}
     cur = datetime.strptime(start_str, "%Y-%m-%d")
@@ -1509,27 +1578,43 @@ def _build_time_days(time_pairs: list, start_str: str, end_str: str) -> dict:
     while cur < end:
         days[cur.strftime("%Y-%m-%d")] = {"intervals": [], "total_seconds": 0}
         cur += timedelta(days=1)
-    if time_pairs:
-        merged = _gap_merge(sorted(time_pairs), _GAP_MINUTES * 60)
+    if time_triples:
+        # Counted variant of _gap_merge, same inclusive condition and epoch
+        # domain. Sort key excludes counts (dicts don't order); counts are
+        # copied before mutation — warm entries own theirs and a hit file's
+        # dict is also what _write_scan_cache would re-serialize.
+        gap = _GAP_MINUTES * 60
+        merged: list = []
+        for a, b, c in sorted(time_triples, key=lambda t: (t[0], t[1])):
+            if merged and a - merged[-1][1] <= gap:
+                if b > merged[-1][1]:
+                    merged[-1][1] = b
+                for cls, n in c.items():
+                    merged[-1][2][cls] = merged[-1][2].get(cls, 0) + n
+            else:
+                merged.append([a, b, dict(c)])
         day_pieces: dict = {}
-        for s_ep, e_ep in merged:
+        for s_ep, e_ep, cnt in merged:
+            model = _dominant_model(cnt)
             a = datetime.fromtimestamp(s_ep, timezone.utc)
             b = datetime.fromtimestamp(e_ep, timezone.utc)
             for day_key, s, e in _split_interval_by_local_day(a, b):
                 if day_key in days:  # day-filter to the queried range
-                    day_pieces.setdefault(day_key, []).append([s, e])
+                    day_pieces.setdefault(day_key, []).append([s, e, model])
         for day_key, pieces in day_pieces.items():
-            pieces.sort()
+            pieces.sort(key=lambda p: (p[0], p[1]))
             union: list = []
-            for s, e in pieces:
+            for s, e, mdl in pieces:
                 if union and s <= union[-1][1]:
                     if e > union[-1][1]:
                         union[-1][1] = e
+                    if union[-1][2] is None:
+                        union[-1][2] = mdl
                 else:
-                    union.append([s, e])
+                    union.append([s, e, mdl])
             rec = days[day_key]
             rec["intervals"] = union
-            rec["total_seconds"] = sum(e - s for s, e in union)
+            rec["total_seconds"] = sum(e - s for s, e, _ in union)
     return days
 
 
@@ -1709,8 +1794,9 @@ def print_json(sessions: dict, subscription_quota: Optional[dict] = None,
 
     time_days (additive top-level "time" section; JSON-only — the text output
     modes do not surface active time) is the scan's per-day active-time dict:
-    {day_key: {"intervals": [[s, e], ...], "total_seconds": N}} with intervals
-    sorted, disjoint and 0 <= s <= e <= 86400 always (DST-transition days are
+    {day_key: {"intervals": [[s, e, model], ...], "total_seconds": N}} with
+    model the interval's dominant model class (or null) and intervals sorted,
+    disjoint and 0 <= s <= e <= 86400 always (DST-transition days are
     split/clamped to wall-clock pieces — see _split_interval_by_local_day).
     """
     result = {
