@@ -15,6 +15,7 @@ Options:
     --by-day             Group results by day
     --json               Output JSON instead of table
     --no-sessions        With --json: omit the per-session array (smaller payload)
+    --no-cache           Bypass the incremental scan cache (read AND write)
 """
 
 import json
@@ -70,8 +71,169 @@ _SCAN_STATS = {
     "skipped_lines": 0,         # malformed lines skipped (bad JSON / unexpected types) — file keeps scanning
     "files_failed": 0,          # files skipped entirely due to I/O errors (open/read)
     "null_ts_lines": 0,         # usage lines without a parseable timestamp (bypass the range filter)
-    "prefiltered_lines": 0,     # non-assistant lines skipped before json.loads (substring prefilter)
+    # prefiltered_lines — non-assistant lines skipped before json.loads
+    # (substring prefilter). DEFINITION CHANGE with the incremental cache
+    # (1.5.0 cache batch): the prefilter gate is now per-FILE (armed by the
+    # file's own first_msg/first_ts, compared against the file-local min ts)
+    # instead of per-session-shared-across-files. Required so cached per-file
+    # counts are deterministic (independent of sibling-file scan order). The
+    # per-file gate arms later and against a higher threshold, so the count
+    # is slightly LOWER than pre-cache builds (~0.1–0.3% on the real corpus).
+    # Informational only: the prefilter is conservative, so tokens, costs,
+    # sessions, daily buckets and every other counter are bit-identical.
+    "prefiltered_lines": 0,
+    "cache_hit_files": 0,       # files served from the incremental scan cache (no re-parse)
+    "cache_miss_files": 0,      # files parsed this run (cache absent/stale); 0 when cache bypassed
+    "cache_pruned_files": 0,    # cache entries dropped because their file disappeared
 }
+
+# ---------------------------------------------------------------------------
+# Incremental per-file scan cache
+# ---------------------------------------------------------------------------
+# Each entry describes the WHOLE file (range-agnostic): per-(local day, exact
+# model string) sums of FINAL per-message usage (after streaming max/delta
+# upgrades) plus day-bucketed diagnostic counters. Range filtering happens at
+# merge time by comparing day-key strings — exact for midnight-aligned ranges
+# (lexicographic order on %Y-%m-%d equals date order, and both range bounds
+# are local midnights). Costs are NOT stored: they are recomputed per bucket
+# at query time, which equals the per-message sum because per-message
+# cw >= cw_1h always holds (cw = max(top, cw_5m+cw_1h)), making the pricing
+# formula linear over a bucket that shares one model_str.
+# The OAuth token NEVER touches this file: entries hold only usage aggregates
+# and the first-50-chars first_msg snippet.
+#
+# Equivalence contract vs pre-cache builds: every data field (tokens, costs,
+# sessions, daily_breakdown, totals) and every diagnostics counter is exactly
+# preserved, with TWO documented exceptions:
+#   1. prefiltered_lines — gating became per-file (see its comment in
+#      _SCAN_STATS); informational only, never affects data fields.
+#   2. Cross-midnight streamed messages at a range boundary — a message whose
+#      streamed lines straddle a local midnight that coincides with the query
+#      range edge. This build attributes the WHOLE message (with all streaming
+#      max/delta upgrades applied) to its FIRST line's local day; pre-cache
+#      builds instant-filtered each line BEFORE dedup, so a day1-only query
+#      saw only the partial first-line usage while a day2-only query counted
+#      the message again in full — the two adjacent single-day queries
+#      double-counted (their sum exceeded the true total). This build
+#      conserves: the message appears exactly once, under its first day.
+#      Zero such messages exist in the real corpus today (0 of 23,650 span
+#      more than one local day); divergence is theoretical and only at exact
+#      midnight-boundary range cuts.
+# Cold, warm and --no-cache runs of THIS script are always mutually identical
+# (modulo the additive cache_hit/miss/pruned counters); --no-cache is the
+# always-available ground truth for verifying the cache.
+SCAN_CACHE_PATH = Path.home() / ".claude" / "cache" / "cc-monitor" / "scan-cache.json"
+SCAN_CACHE_FORMAT_VERSION = 1
+
+# Whether the current scan actually used the cache (False under --no-cache or
+# a non-midnight-aligned range). Drives diagnostics_line() segment suppression.
+_CACHE_ACTIVE = False
+
+
+def _tz_stamp() -> list:
+    """Static system-timezone fingerprint stamped into the cache header.
+
+    Cached day keys are baked with the zone active at parse time; a zone
+    change makes them stale vs a fresh cold scan, so the whole cache is
+    discarded on mismatch. Deliberately composed of *static* zone properties:
+    a DST flip inside one zone does NOT invalidate (day keys for past instants
+    are per-datetime astimezone results, unaffected by the current DST state).
+    """
+    return [time.tzname[0], time.tzname[1], time.timezone, time.altzone, time.daylight]
+
+
+def _valid_cache_entry(e) -> bool:
+    """Strict structural validation of one cache entry (never partial use)."""
+    try:
+        if not isinstance(e, dict):
+            return False
+        if not isinstance(e.get("mtime_ns"), int) or not isinstance(e.get("size"), int):
+            return False
+        for k in ("peek_ts", "first_ts"):
+            v = e.get(k)
+            if v is not None and not isinstance(v, str):
+                return False
+        if not isinstance(e.get("first_msg"), str):
+            return False
+        for aggk in ("agg", "agg_no_ts"):
+            agg = e.get(aggk)
+            if not isinstance(agg, dict):
+                return False
+            for day, models in agg.items():
+                if not isinstance(day, str) or not isinstance(models, dict):
+                    return False
+                for ms, sums in models.items():
+                    if not isinstance(ms, str):
+                        return False
+                    if not (isinstance(sums, list) and len(sums) == 6
+                            and all(isinstance(x, int) for x in sums)):
+                        return False
+        cbd = e.get("counters_by_day")
+        if not isinstance(cbd, dict):
+            return False
+        for day, c in list(cbd.items()) + [("", e.get("counters_no_ts"))]:
+            if not isinstance(day, str):
+                return False
+            if not (isinstance(c, list) and len(c) == 4 and all(isinstance(x, int) for x in c)):
+                return False
+        for k in ("skipped_lines", "prefiltered_lines", "null_ts_lines"):
+            if not isinstance(e.get(k), int):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _load_scan_cache() -> dict:
+    """Load the per-file scan cache; ANY anomaly degrades to an empty cache.
+
+    Missing file, corrupt JSON, wrong types, format/script-version mismatch,
+    or timezone change all silently return {} → full rescan. Cache problems
+    must never crash or skew results.
+    """
+    try:
+        with open(SCAN_CACHE_PATH, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        if data.get("format_version") != SCAN_CACHE_FORMAT_VERSION:
+            return {}
+        if data.get("script_version") != __version__:
+            return {}
+        if data.get("tz") != _tz_stamp():
+            return {}
+        files = data.get("files")
+        if not isinstance(files, dict):
+            return {}
+        for path, entry in files.items():
+            if not isinstance(path, str) or not _valid_cache_entry(entry):
+                return {}
+        return files
+    except Exception:
+        return {}
+
+
+def _write_scan_cache(files: dict) -> None:
+    """Atomic write (tmp in same dir + os.replace); failures are best-effort."""
+    tmp_path = None
+    try:
+        SCAN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = SCAN_CACHE_PATH.with_name(SCAN_CACHE_PATH.name + f".tmp{os.getpid()}")
+        doc = {
+            "format_version": SCAN_CACHE_FORMAT_VERSION,
+            "script_version": __version__,
+            "tz": _tz_stamp(),
+            "files": files,
+        }
+        with open(tmp_path, "w") as f:
+            json.dump(doc, f)
+        os.replace(tmp_path, SCAN_CACHE_PATH)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _fetch_litellm_pricing() -> Optional[dict]:
@@ -462,6 +624,9 @@ def scan_diagnostics() -> dict:
         "files_failed": _SCAN_STATS["files_failed"],
         "null_ts_lines": _SCAN_STATS["null_ts_lines"],
         "prefiltered_lines": _SCAN_STATS["prefiltered_lines"],
+        "cache_hit_files": _SCAN_STATS["cache_hit_files"],
+        "cache_miss_files": _SCAN_STATS["cache_miss_files"],
+        "cache_pruned_files": _SCAN_STATS["cache_pruned_files"],
         "inflation_factor": round(raw / uniq, 3) if uniq else None,
     }
 
@@ -482,7 +647,9 @@ def diagnostics_line() -> str:
     failed = f"  files_failed={d['files_failed']}" if d["files_failed"] else ""
     null_ts = f"  null_ts={d['null_ts_lines']}" if d["null_ts_lines"] else ""
     prefiltered = f"  prefiltered={d['prefiltered_lines']}" if d["prefiltered_lines"] else ""
-    return f"🔬 扫描自检: 原始行={d['raw_usage_lines']}  去重后={d['unique_messages']}  inflation={f}x{nulls}{upgraded}{skipped}{failed}{null_ts}{prefiltered}{flag}"
+    cache_seg = (f"  cache=hit:{d['cache_hit_files']}/miss:{d['cache_miss_files']}"
+                 f"/pruned:{d['cache_pruned_files']}") if _CACHE_ACTIVE else ""
+    return f"🔬 扫描自检: 原始行={d['raw_usage_lines']}  去重后={d['unique_messages']}  inflation={f}x{nulls}{upgraded}{skipped}{failed}{null_ts}{prefiltered}{cache_seg}{flag}"
 
 
 def friendly_project(raw: str) -> str:
@@ -499,13 +666,27 @@ def friendly_project(raw: str) -> str:
 # Time range parsing
 # ---------------------------------------------------------------------------
 def _parse_range_date(s: str) -> datetime:
-    """Parse one --range date bound; exit(2) with a clear error on bad input."""
+    """Parse one --range date bound; exit(2) with a clear error on bad input.
+
+    Bounds must be plain local dates (= local midnight), matching the
+    documented grammar (YYYY-MM-DD). datetime.fromisoformat would also accept
+    sub-day forms that survive the ':' split (e.g. '2026-06-10T12') or an
+    explicit UTC offset ('2026-06-10+08:00'); those are rejected explicitly:
+    range filtering is day-granular (local day keys), so a sub-day or
+    offset-shifted bound cannot be honored exactly — an explicit exit(2)
+    instead of silently wrong numbers.
+    """
     try:
-        return datetime.fromisoformat(s)
+        d = datetime.fromisoformat(s)
     except ValueError:
         print(f"Error: invalid --range date '{s}' (expected today, week, month, "
               f"YYYY-MM-DD, or YYYY-MM-DD:YYYY-MM-DD)", file=sys.stderr)
         sys.exit(2)
+    if d.tzinfo is not None or d.time() != datetime.min.time():
+        print(f"Error: --range date '{s}' must be a plain date (YYYY-MM-DD), "
+              f"without a time component or UTC offset", file=sys.stderr)
+        sys.exit(2)
+    return d
 
 
 def resolve_range(spec: str):
@@ -539,8 +720,365 @@ def resolve_range(spec: str):
 # ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
-def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, project_filter: Optional[str]):
-    """Scan all JSONL files and return structured session data."""
+def parse_file(path: Path, is_sub: bool):
+    """Parse one whole JSONL file into a range-agnostic cache entry.
+
+    Returns (entry, ok). ok=False means an OSError interrupted the read
+    (open failure or mid-file I/O error); the partial entry is still merged
+    (matching the pre-cache behavior, where lines counted before the error
+    stayed counted) but must NOT be stored in the cache.
+
+    Single parse path for cold AND warm runs: both flows go entry → merge,
+    so cache equivalence is structural, not coincidental. NO range filtering
+    here — that happens at merge time via day-key comparison.
+
+    Dedup is PER FILE (`seen` local). Assumption (empirically verified:
+    0 collisions across 23k+ message.ids on the real corpus): a message.id
+    (or `req:<requestId>`) never repeats across files. If session
+    resume/copy ever breaks this, cross-file duplicates inflate
+    raw_usage_lines AND unique_messages together — detection: a sudden
+    unique_messages jump vs subscription-quota reality, or warm-vs-cold
+    drift caught by rerunning with --no-cache (always-available ground
+    truth).
+
+    Entry shape (JSON-serializable):
+      peek_ts:    ISO ts of the first physical line (None if unparseable) —
+                  replaces the upper-prune peek for cached files.
+      first_msg:  first user message snippet (main files only; "" otherwise).
+      first_ts:   ISO of the min top-level timestamp across all lines.
+      agg:        {day_key: {model_str: [inp, out, cw, cw_1h, cr, msgs]}} —
+                  FINAL per-message usage after streaming max/delta upgrades.
+      agg_no_ts:  same shape, for usage lines with no parseable timestamp,
+                  keyed by the file-local fallback day (always merged,
+                  regardless of range — matching the cold range-filter bypass).
+      counters_by_day / counters_no_ts: [raw, unique, null_id, upgraded] —
+                  the four range-dependent diagnostic counters, bucketed by
+                  each counted line's local day.
+      skipped_lines / prefiltered_lines / null_ts_lines: plain scalars
+                  (incremented before/independent of the range check).
+    """
+    entry = {
+        "peek_ts": None,
+        "first_msg": "",
+        "first_ts": None,
+        "agg": {},
+        "agg_no_ts": {},
+        "counters_by_day": {},
+        "counters_no_ts": [0, 0, 0, 0],
+        "skipped_lines": 0,
+        "prefiltered_lines": 0,
+        "null_ts_lines": 0,
+    }
+    # Per-file dedup: Anthropic message.id is unique per API call, but Claude
+    # Code writes one JSONL line per content block (thinking / text / tool_use…),
+    # each carrying the same `message.usage`. Without dedup, a response with N
+    # blocks is counted N times — inflating tokens and cost by ~1.5–3x.
+    # The usage is NOT identical across those lines though: output_tokens grows
+    # with streaming progress (first line often 1, last line the real value), so
+    # each id keeps its counted usage + the sums list it landed in, letting
+    # later lines back-fill the delta.
+    seen: dict[str, dict] = {}
+    first_ts_dt: Optional[datetime] = None
+    line_no = 0
+    ok = True
+    # File-level fallback is deliberately narrow (I/O errors only): one malformed
+    # *line* must not discard the rest of the file's usage. Per-line problems are
+    # counted in skipped_lines and the file keeps scanning.
+    # errors="replace": invalid UTF-8 bytes become U+FFFD instead of raising
+    # UnicodeDecodeError mid-iteration (which would escape the per-line handler
+    # and crash the whole scan); the mangled line then fails json.loads and is
+    # counted in skipped_lines while the rest of the file survives.
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                line_no += 1
+                if not line.strip():
+                    continue
+                # Assistant-line prefilter: ~57% of lines (74% of bytes) are
+                # non-assistant, and the only things non-assistant lines
+                # contribute are file metadata: first_msg (user lines,
+                # main-session files only) and first_ts (min over all
+                # lines' top-level timestamps). The gate is data-driven,
+                # not order-lucky: every line is fully parsed until
+                # first_msg is captured (subagent files never contribute
+                # it) and first_ts is set; after that a non-assistant line
+                # is skipped only if _line_may_lower_first_ts proves its
+                # timestamp cannot lower the running min (Claude Code
+                # writes the first burst of lines with ~200ms out-of-order
+                # jitter, so "metadata already captured" alone is not
+                # sufficient — measured on real data).
+                # State is per-FILE (not per-session): required for cache
+                # independence — a cached count must not depend on sibling-file
+                # scan order. Only prefiltered_lines can differ vs the old
+                # session-shared gate; tokens/costs/counts are unaffected
+                # (assistant lines are never prefiltered).
+                # Invariant: Claude Code writes compact JSON where
+                # '"type":"assistant"' appears verbatim in assistant lines;
+                # the spaced variant covers a non-compact encoder. If the
+                # format ever drifts so assistant lines fail this substring
+                # test, raw_usage_lines/unique_messages collapse toward 0
+                # and inflation_factor toward None — visible in diagnostics —
+                # while prefiltered_lines (counted here) shows the skip
+                # volume.
+                if ((is_sub or entry["first_msg"])
+                        and first_ts_dt is not None
+                        and '"type":"assistant"' not in line
+                        and '"type": "assistant"' not in line
+                        and not _line_may_lower_first_ts(line, first_ts_dt)):
+                    entry["prefiltered_lines"] += 1
+                    continue
+                try:
+                    data = json.loads(line)
+                    if not isinstance(data, dict):
+                        entry["skipped_lines"] += 1
+                        continue
+
+                    # First physical line's top-level timestamp — stands in for
+                    # the upper-prune peek on cache hits (validators guarantee
+                    # the file is unchanged since parse time). Mirrors the peek
+                    # semantics: blank/malformed/non-dict first line → None.
+                    if line_no == 1:
+                        _pts = parse_iso_ts(data.get("timestamp"))
+                        entry["peek_ts"] = _pts.isoformat() if _pts else None
+
+                    # Capture first user message (main session files only)
+                    if not is_sub and not entry["first_msg"]:
+                        if data.get("type") == "user" and "message" in data:
+                            msg = data["message"]
+                            if isinstance(msg, dict):
+                                content = msg.get("content", "")
+                                if isinstance(content, list):
+                                    for part in content:
+                                        if isinstance(part, dict) and part.get("type") == "text":
+                                            entry["first_msg"] = part.get("text", "")[:50]
+                                            break
+                                elif isinstance(content, str):
+                                    entry["first_msg"] = content[:50]
+                            elif isinstance(msg, str):
+                                entry["first_msg"] = msg[:50]
+
+                    # Timestamp (running min over all lines of THIS file)
+                    ts = parse_iso_ts(data.get("timestamp"))
+                    if ts and (first_ts_dt is None or ts < first_ts_dt):
+                        first_ts_dt = ts
+
+                    # Usage from assistant messages
+                    if data.get("type") == "assistant" and "message" in data:
+                        m = data["message"]
+                        if not isinstance(m, dict):
+                            entry["skipped_lines"] += 1
+                            continue
+                        usage_raw = m.get("usage") or {}
+                        if not isinstance(usage_raw, dict):
+                            entry["skipped_lines"] += 1
+                            continue
+                        inp = int(usage_raw.get("input_tokens") or 0)
+                        out = int(usage_raw.get("output_tokens") or 0)
+                        if not inp and not out:
+                            continue
+                        # Day bucket from the message's own local date
+                        # (astimezone() resolves the local zone per datetime →
+                        # DST-safe). No-ts lines go to the always-merged
+                        # fallback bucket (they bypass the range filter).
+                        # A streamed message crossing local midnight buckets
+                        # wholly under its FIRST line's day (sanctioned
+                        # exception #2 in the cache comment block).
+                        if ts:
+                            no_ts = False
+                            day_key = ts.astimezone().strftime("%Y-%m-%d")
+                        else:
+                            # No parseable timestamp — keep the line (excluding it
+                            # would under-count) but track it for diagnostics.
+                            no_ts = True
+                            entry["null_ts_lines"] += 1
+                        if no_ts:
+                            counters = entry["counters_no_ts"]
+                        else:
+                            counters = entry["counters_by_day"].setdefault(day_key, [0, 0, 0, 0])
+                        counters[0] += 1  # raw_usage_lines
+                        cw = int(usage_raw.get("cache_creation_input_tokens") or 0)
+                        cr = int(usage_raw.get("cache_read_input_tokens") or 0)
+                        # 1-hour cache tier (priced higher than 5m). Newer Claude Code +
+                        # Opus 4.8 put most cache creation here; needed for correct cost.
+                        cc_detail = usage_raw.get("cache_creation") or {}
+                        if not isinstance(cc_detail, dict):
+                            cc_detail = {}
+                        cw_1h = int(cc_detail.get("ephemeral_1h_input_tokens") or 0)
+                        cw_5m = int(cc_detail.get("ephemeral_5m_input_tokens") or 0)
+                        # Top-level field is occasionally 0 while the detail breakdown is
+                        # populated; trust whichever is larger. (Also guarantees the
+                        # cw >= cw_1h invariant that makes bucket costs linear.)
+                        cw = max(cw, cw_5m + cw_1h)
+                        # Dedup by message.id. Fallback: lines missing message.id
+                        # but carrying a requestId dedup on that instead (same
+                        # max/delta mechanics).
+                        msg_id = m.get("id")
+                        if not msg_id and data.get("requestId"):
+                            msg_id = "req:" + str(data["requestId"])
+                        if msg_id and msg_id in seen:
+                            # Same message.id seen again: output_tokens grows as the
+                            # response streams (later lines carry the larger, truer
+                            # value). Take the per-field max and back-fill the delta
+                            # into the sums this message was originally counted in.
+                            rec = seen[msg_id]
+                            u = rec["usage"]
+                            new_u = {
+                                "input_tokens": max(u["input_tokens"], inp),
+                                "output_tokens": max(u["output_tokens"], out),
+                                "cache_write": max(u["cache_write"], cw),
+                                "cache_write_1h": max(u["cache_write_1h"], cw_1h),
+                                "cache_read": max(u["cache_read"], cr),
+                            }
+                            if new_u != u:
+                                sums = rec["sums"]
+                                for i, field in enumerate((
+                                        "input_tokens", "output_tokens", "cache_write",
+                                        "cache_write_1h", "cache_read")):
+                                    sums[i] += new_u[field] - u[field]
+                                rec["usage"] = new_u
+                                counters[3] += 1  # usage_upgraded_lines
+                            continue
+                        if not msg_id:
+                            counters[2] += 1  # null_msg_id_lines
+                        counters[1] += 1      # unique_messages
+                        model_str = m.get("model", "") or ""
+                        if no_ts:
+                            # Fallback day key for null-ts lines: the file-local
+                            # running first_ts's local date, else "unknown".
+                            if first_ts_dt:
+                                fday = first_ts_dt.astimezone().strftime("%Y-%m-%d")
+                            else:
+                                fday = "unknown"
+                            bucket = entry["agg_no_ts"].setdefault(fday, {})
+                        else:
+                            bucket = entry["agg"].setdefault(day_key, {})
+                        sums = bucket.setdefault(model_str, [0, 0, 0, 0, 0, 0])
+                        sums[0] += inp
+                        sums[1] += out
+                        sums[2] += cw
+                        sums[3] += cw_1h
+                        sums[4] += cr
+                        sums[5] += 1  # messages
+                        if msg_id:
+                            seen[msg_id] = {
+                                "usage": {"input_tokens": inp, "output_tokens": out,
+                                          "cache_write": cw, "cache_write_1h": cw_1h,
+                                          "cache_read": cr},
+                                "sums": sums,
+                            }
+                except Exception:
+                    # Malformed line (bad JSON / unexpected types) — count it and
+                    # keep scanning the rest of the file.
+                    entry["skipped_lines"] += 1
+                    continue
+    except OSError:
+        ok = False
+    entry["first_ts"] = first_ts_dt.isoformat() if first_ts_dt else None
+    return entry, ok
+
+
+def _merge_entry(sessions: dict, finfo: dict, entry: dict, start_str: str, end_str: str):
+    """Merge one file entry into the sessions dict, day-filtering by key.
+
+    `start_str <= day_key < end_str` (lexicographic on %Y-%m-%d) equals the
+    per-message instant filter for midnight-aligned local ranges, because day
+    keys were computed with per-datetime astimezone at parse time —
+    identically to the cold path — with ONE sanctioned exception: a streamed
+    message whose lines cross a local midnight that coincides with the range
+    edge is attributed wholly (post-upgrade) to its FIRST line's day, whereas
+    pre-cache builds instant-filtered each line pre-dedup and double-counted
+    such a message across the two adjacent single-day queries (see exception
+    #2 in the cache comment block; 0 occurrences in the real corpus). Costs
+    are recomputed per (day, model_str) bucket from the summed integers
+    (linear; see cache comment block).
+    """
+    sid = finfo["session_id"]
+    if sid not in sessions:
+        sessions[sid] = {
+            "project_raw": finfo["project_raw"],
+            "project": friendly_project(finfo["project_raw"]),
+            "first_msg": "",
+            "first_ts": None,
+            "models": defaultdict(empty_usage),
+            "daily_models": defaultdict(lambda: defaultdict(empty_usage)),
+        }
+    sdata = sessions[sid]
+
+    # first_msg comes only from the (single) main session file
+    if not finfo["is_subagent"] and not sdata["first_msg"] and entry["first_msg"]:
+        sdata["first_msg"] = entry["first_msg"]
+
+    # Session first_ts = min over its files' per-file mins
+    if entry["first_ts"]:
+        try:
+            etd = datetime.fromisoformat(entry["first_ts"])
+            if sdata["first_ts"] is None or etd < sdata["first_ts"]:
+                sdata["first_ts"] = etd
+        except Exception:
+            pass  # naive/aware mix or malformed — keep current (theoretical)
+
+    def _add_day(day_key: str, models: dict):
+        daily = sdata["daily_models"][day_key]
+        for model_str, s in models.items():
+            cls = classify_model(model_str)
+            # Per-bucket cost using the exact model string (preferred over
+            # class-level pricing — avoids mis-pricing Opus 4.7 as Opus 4).
+            # cache_write_1h (s[3]) feeds ONLY the cost computation — the
+            # usage buckets never stored it, same as the cold path.
+            cost = cost_for_message({
+                "input_tokens": s[0], "output_tokens": s[1], "cache_write": s[2],
+                "cache_write_1h": s[3], "cache_read": s[4],
+            }, model_str)
+            for tgt in (sdata["models"][cls], daily[cls]):
+                tgt["input_tokens"] += s[0]
+                tgt["output_tokens"] += s[1]
+                tgt["cache_write"] += s[2]
+                tgt["cache_read"] += s[4]
+                tgt["messages"] += s[5]
+                tgt["cost"] += cost
+
+    for day_key, models in entry["agg"].items():
+        if start_str <= day_key < end_str:
+            _add_day(day_key, models)
+    # Null-ts usage bypassed the range filter in the cold path → always merge,
+    # even if the fallback day lies outside the range (today's cold scan
+    # emits an out-of-range day in daily_breakdown in that case; preserved).
+    for day_key, models in entry["agg_no_ts"].items():
+        _add_day(day_key, models)
+
+    # Range-dependent diagnostic counters: day-filtered + always the no-ts part
+    for day_key, c in entry["counters_by_day"].items():
+        if start_str <= day_key < end_str:
+            _SCAN_STATS["raw_usage_lines"] += c[0]
+            _SCAN_STATS["unique_messages"] += c[1]
+            _SCAN_STATS["null_msg_id_lines"] += c[2]
+            _SCAN_STATS["usage_upgraded_lines"] += c[3]
+    c = entry["counters_no_ts"]
+    _SCAN_STATS["raw_usage_lines"] += c[0]
+    _SCAN_STATS["unique_messages"] += c[1]
+    _SCAN_STATS["null_msg_id_lines"] += c[2]
+    _SCAN_STATS["usage_upgraded_lines"] += c[3]
+    # Range-independent scalars
+    _SCAN_STATS["skipped_lines"] += entry["skipped_lines"]
+    _SCAN_STATS["prefiltered_lines"] += entry["prefiltered_lines"]
+    _SCAN_STATS["null_ts_lines"] += entry["null_ts_lines"]
+
+
+def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime,
+                  project_filter: Optional[str], use_cache: bool = True):
+    """Scan all JSONL files and return structured session data.
+
+    With use_cache=True (default), unchanged files (exact st_mtime_ns +
+    st_size match) are served from ~/.claude/cache/cc-monitor/scan-cache.json
+    instead of being re-parsed. The cache is range-agnostic: an entry always
+    describes the whole file; range filtering happens at merge time. Pruning
+    (mtime/peek) decides only whether a file participates in this query at
+    all — a pruned file contributes nothing, not even its no-ts bucket,
+    exactly matching the pre-cache behavior where a pruned file was never
+    opened. use_cache=False (--no-cache) bypasses the cache entirely (no
+    read, no write) — the always-available ground truth.
+    """
+    global _CACHE_ACTIVE
     start_epoch = start_dt.timestamp()
     end_epoch = end_dt.timestamp()
 
@@ -548,11 +1086,31 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
     for _k in _SCAN_STATS:
         _SCAN_STATS[_k] = 0
 
+    # Day-level range filtering (merge-time day-key comparison) is only exact
+    # when both range bounds are naive local MIDNIGHTS. The CLI guarantees
+    # this: resolve_range produces midnights and _parse_range_date rejects
+    # bounds carrying a time component or UTC offset with exit(2). The check
+    # below is defense-in-depth for non-CLI callers: a non-midnight bound
+    # would be day-filtered the same way regardless of the cache, so we only
+    # disable cache PERSISTENCE here (don't pollute the cache from an
+    # unexpected call shape) — it does NOT make sub-day bounds exact.
+    _midnight = datetime.min.time()
+    use_cache = (use_cache and start_dt.tzinfo is None and end_dt.tzinfo is None
+                 and start_dt.time() == _midnight and end_dt.time() == _midnight)
+    _CACHE_ACTIVE = use_cache
+
+    # Day-key bounds for merge-time filtering (end exclusive; lexicographic
+    # comparison on %Y-%m-%d equals date comparison — see _merge_entry).
+    start_str = start_dt.strftime("%Y-%m-%d")
+    end_str = end_dt.strftime("%Y-%m-%d")
+
+    cache_files: dict = _load_scan_cache() if use_cache else {}
+    cache_dirty = False
+
     # Convert local-time range boundaries to UTC for comparing with message timestamps.
     # astimezone() on a naive datetime attaches the system local zone *per datetime*,
     # so DST transitions inside/across the range resolve correctly (a frozen
     # "current offset" would shift boundaries by an hour across DST changes).
-    start_utc = start_dt.astimezone(timezone.utc)
     end_utc = end_dt.astimezone(timezone.utc)
 
     # Collect JSONL files that might contain in-range messages.
@@ -561,14 +1119,23 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
     # cross-day sessions may have mtime beyond the range but still contain
     # in-range messages.
     all_files: list[dict] = []
+    seen_paths: set = set()  # every existing jsonl path — cache prune keeps only these
     for p in projects_dir.rglob("*.jsonl"):
         try:
             st = p.stat()
         except OSError:
             # Deleted mid-scan or dangling symlink — skip, don't kill the scan
             continue
+        path_str = str(p)
+        seen_paths.add(path_str)
         if st.st_mtime < start_epoch:
             continue
+        # Validated cache entry for this exact file state (or None)
+        cache_entry = None
+        if use_cache:
+            _ce = cache_files.get(path_str)
+            if _ce is not None and _ce["mtime_ns"] == st.st_mtime_ns and _ce["size"] == st.st_size:
+                cache_entry = _ce
         # Upper bound: peek the first line's timestamp — content is authoritative.
         # st_birthtime is only a cheap pre-filter to decide whether the peek is
         # worth doing: rsync/cp/migration resets birthtime to the copy date, so a
@@ -577,14 +1144,25 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
         # never runs. Conservative: when in doubt, scan the file.
         birthtime = getattr(st, "st_birthtime", None)
         if birthtime is None or birthtime > end_epoch:
-            try:
-                with open(p, "r") as _f:
-                    _first = json.loads(_f.readline())
-                _first_ts = parse_iso_ts(_first.get("timestamp")) if isinstance(_first, dict) else None
-                if _first_ts and _first_ts >= end_utc:
-                    continue
-            except Exception:
-                pass  # unreadable/odd first line — scan the file anyway
+            if cache_entry is not None:
+                # Validators guarantee the file is byte-identical to parse time,
+                # so the stored peek_ts exactly replaces the physical peek.
+                try:
+                    if cache_entry["peek_ts"]:
+                        _first_ts = datetime.fromisoformat(cache_entry["peek_ts"])
+                        if _first_ts >= end_utc:
+                            continue
+                except Exception:
+                    pass  # unparseable/naive — scan the file anyway, as today
+            else:
+                try:
+                    with open(p, "r") as _f:
+                        _first = json.loads(_f.readline())
+                    _first_ts = parse_iso_ts(_first.get("timestamp")) if isinstance(_first, dict) else None
+                    if _first_ts and _first_ts >= end_utc:
+                        continue
+                except Exception:
+                    pass  # unreadable/odd first line — scan the file anyway
         # Subagent transcripts live at <session-id>/subagents/agent-*.jsonl. Match the
         # path *component*, not a substring — a project dir literally named
         # "my-subagents-tool" must not false-positive.
@@ -598,213 +1176,43 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime, proj
             "is_subagent": is_sub,
             "session_id": parent_session,
             "project_raw": project_raw,
+            "mtime_ns": st.st_mtime_ns,
+            "size": st.st_size,
+            "cache_entry": cache_entry,
         })
 
-    # Aggregate per session → per model
+    # Parse (or serve from cache) and merge, in collection order — preserves
+    # the JSON sessions array order and first_msg first-wins semantics.
     sessions: dict[str, dict] = {}
-    # Global dedup: Anthropic message.id is unique per API call, but Claude Code
-    # writes one JSONL line per content block (thinking / text / tool_use …), each
-    # carrying the same `message.usage`. Without dedup, a response with N blocks
-    # is counted N times — inflating tokens and cost by ~1.5–3x.
-    # The usage is NOT identical across those lines though: output_tokens grows
-    # with streaming progress (first line often 1, last line the real value), so
-    # each id keeps its counted usage + the aggregation buckets it landed in,
-    # letting later lines back-fill the delta.
-    seen_msgs: dict[str, dict] = {}
     for finfo in all_files:
-        sid = finfo["session_id"]
-        if sid not in sessions:
-            sessions[sid] = {
-                "project_raw": finfo["project_raw"],
-                "project": friendly_project(finfo["project_raw"]),
-                "first_msg": "",
-                "first_ts": None,
-                "models": defaultdict(empty_usage),
-                "daily_models": defaultdict(lambda: defaultdict(empty_usage)),
-            }
+        entry = finfo["cache_entry"]
+        if entry is not None:
+            _SCAN_STATS["cache_hit_files"] += 1
+        else:
+            entry, parse_ok = parse_file(finfo["path"], finfo["is_subagent"])
+            if use_cache:
+                _SCAN_STATS["cache_miss_files"] += 1
+            if not parse_ok:
+                # I/O error: keep the partial counts (as the pre-cache scan
+                # did) but never cache a partial entry.
+                _SCAN_STATS["files_failed"] += 1
+            elif use_cache:
+                entry["mtime_ns"] = finfo["mtime_ns"]
+                entry["size"] = finfo["size"]
+                cache_files[str(finfo["path"])] = entry
+                cache_dirty = True
+        _merge_entry(sessions, finfo, entry, start_str, end_str)
 
-        # File-level fallback is deliberately narrow (I/O errors only): one malformed
-        # *line* must not discard the rest of the file's usage. Per-line problems are
-        # counted in skipped_lines below and the file keeps scanning.
-        # errors="replace": invalid UTF-8 bytes become U+FFFD instead of raising
-        # UnicodeDecodeError mid-iteration (which would escape the per-line handler
-        # and crash the whole scan); the mangled line then fails json.loads and is
-        # counted in skipped_lines while the rest of the file survives.
-        try:
-            sdata = sessions[sid]
-            is_sub = finfo["is_subagent"]
-            with open(finfo["path"], "r", errors="replace") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    # Assistant-line prefilter: ~57% of lines (74% of bytes) are
-                    # non-assistant, and the only things non-assistant lines
-                    # contribute are session metadata: first_msg (user lines,
-                    # main-session files only) and first_ts (min over all
-                    # lines' top-level timestamps). The gate is data-driven,
-                    # not order-lucky: every line is fully parsed until
-                    # first_msg is captured (subagent files never contribute
-                    # it) and first_ts is set; after that a non-assistant line
-                    # is skipped only if _line_may_lower_first_ts proves its
-                    # timestamp cannot lower the running min (Claude Code
-                    # writes the first burst of lines with ~200ms out-of-order
-                    # jitter, so "metadata already captured" alone is not
-                    # sufficient — measured on real data).
-                    # Invariant: Claude Code writes compact JSON where
-                    # '"type":"assistant"' appears verbatim in assistant lines;
-                    # the spaced variant covers a non-compact encoder. If the
-                    # format ever drifts so assistant lines fail this substring
-                    # test, raw_usage_lines/unique_messages collapse toward 0
-                    # and inflation_factor toward None — visible in diagnostics —
-                    # while prefiltered_lines (counted here) shows the skip
-                    # volume.
-                    if ((is_sub or sdata["first_msg"])
-                            and sdata["first_ts"] is not None
-                            and '"type":"assistant"' not in line
-                            and '"type": "assistant"' not in line
-                            and not _line_may_lower_first_ts(line, sdata["first_ts"])):
-                        _SCAN_STATS["prefiltered_lines"] += 1
-                        continue
-                    try:
-                        data = json.loads(line)
-                        if not isinstance(data, dict):
-                            _SCAN_STATS["skipped_lines"] += 1
-                            continue
-
-                        # Capture first user message (main session only)
-                        if not finfo["is_subagent"] and not sessions[sid]["first_msg"]:
-                            if data.get("type") == "user" and "message" in data:
-                                msg = data["message"]
-                                if isinstance(msg, dict):
-                                    content = msg.get("content", "")
-                                    if isinstance(content, list):
-                                        for part in content:
-                                            if isinstance(part, dict) and part.get("type") == "text":
-                                                sessions[sid]["first_msg"] = part.get("text", "")[:50]
-                                                break
-                                    elif isinstance(content, str):
-                                        sessions[sid]["first_msg"] = content[:50]
-                                elif isinstance(msg, str):
-                                    sessions[sid]["first_msg"] = msg[:50]
-
-                        # Timestamp
-                        ts = parse_iso_ts(data.get("timestamp"))
-                        if ts and (sessions[sid]["first_ts"] is None or ts < sessions[sid]["first_ts"]):
-                            sessions[sid]["first_ts"] = ts
-
-                        # Usage from assistant messages
-                        if data.get("type") == "assistant" and "message" in data:
-                            m = data["message"]
-                            if not isinstance(m, dict):
-                                _SCAN_STATS["skipped_lines"] += 1
-                                continue
-                            usage_raw = m.get("usage") or {}
-                            if not isinstance(usage_raw, dict):
-                                _SCAN_STATS["skipped_lines"] += 1
-                                continue
-                            inp = int(usage_raw.get("input_tokens") or 0)
-                            out = int(usage_raw.get("output_tokens") or 0)
-                            if not inp and not out:
-                                continue
-                            # Filter: only count messages whose timestamp falls within the requested range
-                            if ts:
-                                if ts < start_utc or ts >= end_utc:
-                                    continue
-                            else:
-                                # No parseable timestamp — keep the line (excluding it
-                                # would under-count) but track it for diagnostics.
-                                _SCAN_STATS["null_ts_lines"] += 1
-                            _SCAN_STATS["raw_usage_lines"] += 1
-                            cw = int(usage_raw.get("cache_creation_input_tokens") or 0)
-                            cr = int(usage_raw.get("cache_read_input_tokens") or 0)
-                            # 1-hour cache tier (priced higher than 5m). Newer Claude Code +
-                            # Opus 4.8 put most cache creation here; needed for correct cost.
-                            cc_detail = usage_raw.get("cache_creation") or {}
-                            if not isinstance(cc_detail, dict):
-                                cc_detail = {}
-                            cw_1h = int(cc_detail.get("ephemeral_1h_input_tokens") or 0)
-                            cw_5m = int(cc_detail.get("ephemeral_5m_input_tokens") or 0)
-                            # Top-level field is occasionally 0 while the detail breakdown is
-                            # populated; trust whichever is larger.
-                            cw = max(cw, cw_5m + cw_1h)
-                            # Dedup by message.id (see comment at top of this function).
-                            # Fallback: lines missing message.id but carrying a requestId
-                            # dedup on that instead (same max/delta mechanics).
-                            msg_id = m.get("id")
-                            if not msg_id and data.get("requestId"):
-                                msg_id = "req:" + str(data["requestId"])
-                            if msg_id and msg_id in seen_msgs:
-                                # Same message.id seen again: output_tokens grows as the
-                                # response streams (later lines carry the larger, truer value).
-                                # Take the per-field max and back-fill the delta into the
-                                # buckets this message was originally counted in.
-                                rec = seen_msgs[msg_id]
-                                u = rec["usage"]
-                                new_u = {
-                                    "input_tokens": max(u["input_tokens"], inp),
-                                    "output_tokens": max(u["output_tokens"], out),
-                                    "cache_write": max(u["cache_write"], cw),
-                                    "cache_write_1h": max(u["cache_write_1h"], cw_1h),
-                                    "cache_read": max(u["cache_read"], cr),
-                                }
-                                if new_u != u:
-                                    for field in ("input_tokens", "output_tokens", "cache_write", "cache_read"):
-                                        delta = new_u[field] - u[field]
-                                        rec["mu"][field] += delta
-                                        rec["dmu"][field] += delta
-                                    new_cost = cost_for_message(new_u, rec["model_str"])
-                                    rec["mu"]["cost"] += new_cost - rec["cost"]
-                                    rec["dmu"]["cost"] += new_cost - rec["cost"]
-                                    rec["usage"] = new_u
-                                    rec["cost"] = new_cost
-                                    _SCAN_STATS["usage_upgraded_lines"] += 1
-                                continue
-                            if not msg_id:
-                                _SCAN_STATS["null_msg_id_lines"] += 1
-                            _SCAN_STATS["unique_messages"] += 1
-                            model_str = m.get("model", "") or ""
-                            model_cls = classify_model(model_str)
-                            # Per-message cost using the exact model string (preferred over
-                            # class-level pricing — avoids mis-pricing Opus 4.7 as Opus 4).
-                            single = {"input_tokens": inp, "output_tokens": out, "cache_write": cw,
-                                      "cache_write_1h": cw_1h, "cache_read": cr}
-                            msg_cost = cost_for_message(single, model_str)
-                            # Session-level aggregation
-                            mu = sessions[sid]["models"][model_cls]
-                            mu["messages"] += 1
-                            mu["input_tokens"] += inp
-                            mu["output_tokens"] += out
-                            mu["cache_write"] += cw
-                            mu["cache_read"] += cr
-                            mu["cost"] += msg_cost
-                            # Per-day aggregation (using message's own local date;
-                            # astimezone() resolves the local zone per datetime → DST-safe)
-                            if ts:
-                                day_key = ts.astimezone().strftime("%Y-%m-%d")
-                            elif sessions[sid]["first_ts"]:
-                                day_key = sessions[sid]["first_ts"].astimezone().strftime("%Y-%m-%d")
-                            else:
-                                day_key = "unknown"
-                            dmu = sessions[sid]["daily_models"][day_key][model_cls]
-                            dmu["messages"] += 1
-                            dmu["input_tokens"] += inp
-                            dmu["output_tokens"] += out
-                            dmu["cache_write"] += cw
-                            dmu["cache_read"] += cr
-                            dmu["cost"] += msg_cost
-                            if msg_id:
-                                seen_msgs[msg_id] = {
-                                    "usage": single, "cost": msg_cost, "model_str": model_str,
-                                    "mu": mu, "dmu": dmu,
-                                }
-                    except Exception:
-                        # Malformed line (bad JSON / unexpected types) — count it and
-                        # keep scanning the rest of the file.
-                        _SCAN_STATS["skipped_lines"] += 1
-                        continue
-        except OSError:
-            _SCAN_STATS["files_failed"] += 1
-            continue
+    if use_cache:
+        # Prune entries whose file disappeared, then persist if anything changed.
+        stale = [k for k in cache_files if k not in seen_paths]
+        for k in stale:
+            del cache_files[k]
+        if stale:
+            _SCAN_STATS["cache_pruned_files"] = len(stale)
+            cache_dirty = True
+        if cache_dirty:
+            _write_scan_cache(cache_files)
 
     # Drop sessions with no usage
     return {sid: s for sid, s in sessions.items() if any(
@@ -1208,6 +1616,9 @@ def main():
     parser.add_argument("--no-sessions", action="store_true",
                         help="With --json: omit the per-session array from the output "
                              "(totals, daily breakdown and diagnostics are unaffected)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Bypass the incremental scan cache entirely (no read, no write); "
+                             "every file is re-parsed. Ground truth for debugging/verification.")
     parser.add_argument("--include-quota", action="store_true",
                         help="Also fetch Anthropic's OAuth subscription quota (5h + 7d). "
                              "Only works for Pro/Max users who used `claude login`. "
@@ -1228,7 +1639,8 @@ def main():
     start_dt, end_dt = resolve_range(args.range)
     range_label = f"{start_dt.strftime('%Y/%m/%d')} ~ {(end_dt - timedelta(days=1)).strftime('%Y/%m/%d')}"
 
-    sessions = scan_sessions(projects_dir, start_dt, end_dt, args.project)
+    sessions = scan_sessions(projects_dir, start_dt, end_dt, args.project,
+                             use_cache=not args.no_cache)
 
     if not sessions:
         # Emit a well-formed empty result in JSON mode so callers (e.g. the Swift UI)
