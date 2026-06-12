@@ -683,8 +683,9 @@ struct SubscriptionView: View {
 // MARK: - Time tab (active usage time)
 
 /// Inner Week / Month / Year switcher + the three time charts.
-/// - Week always shows the CURRENT week (currentTimeData — cross-week merged,
-///   unaffected by month navigation).
+/// - Week follows the EXISTING top month navigator (viewingTimeData) and owns
+///   a ◀▶ week nav among the weeks overlapping the viewed month; the selected
+///   week lives in the store (survives tab switches, reset by month nav).
 /// - Month follows the EXISTING top month navigator (viewingTimeData); no
 ///   second navigator inside the tab.
 /// - Year owns its ◀▶ year nav and lazy-loads via --time-year.
@@ -704,8 +705,8 @@ struct TimeTabView: View {
 
             switch store.timeRange {
             case .week:
-                if let data = store.currentTimeData {
-                    WeekTimeChart(timeData: data)
+                if let data = store.viewingTimeData {
+                    WeekTimeChart(store: store, timeData: data)
                 } else {
                     timeStateView
                 }
@@ -757,7 +758,13 @@ private func mondayFirstWeekdaySymbols(_ loc: Localizer) -> [String] {
 }
 
 // ── Week view: Apple-Health-sleep-style timeline, 7 rows Mon–Sun ──
+// Shows the store's selected week within the VIEWED month (viewingTimeData):
+// own ◀▶ nav among the weeks overlapping that month; out-of-month days render
+// dimmed (the month view's idiom), their intervals drawn only when the payload
+// happens to carry them (current week's prev-month tail from the cross-week
+// merge) — never fabricated.
 struct WeekTimeChart: View {
+    @ObservedObject var store: UsageStore
     let timeData: TimeData
     @Environment(\.localizer) private var loc
 
@@ -772,23 +779,46 @@ struct WeekTimeChart: View {
     private let totalWidth: CGFloat = 40
     private let gridHours = [0, 6, 12, 18, 24]
 
+    private var monthPrefix: String {
+        String(format: "%04d-%02d-", store.viewingYear, store.viewingMonth)
+    }
+    /// Monday-aligned weeks overlapping the viewed month — the ◀▶ nav range
+    /// (same list the month view's rows derive from).
+    private var weeks: [Date] {
+        TimeLogic.weeksOfMonth(year: store.viewingYear, month: store.viewingMonth)
+    }
+    private var selectedWeekIndex: Int? {
+        store.resolvedWeekMonday.flatMap { TimeLogic.weekIndex(of: $0, in: weeks) }
+    }
     private var dayKeys: [String] {
-        AppDate.mondayOfWeek(containing: Date()).map(TimeLogic.weekDayKeys) ?? []
+        store.resolvedWeekMonday.map(TimeLogic.weekDayKeys) ?? []
+    }
+    /// Stats/render scope: in-month days always; out-of-month days only when
+    /// the payload actually carries them (no fabricated zeros).
+    private var renderedDayKeys: [String] {
+        dayKeys.filter { $0.hasPrefix(monthPrefix) || timeData.days[$0] != nil }
     }
     private var todayKey: String { AppDate.dayKey(Date()) }
     private var weekTotal: Int {
-        TimeLogic.totalSeconds(in: timeData.days, dayKeys: dayKeys)
+        TimeLogic.totalSeconds(in: timeData.days, dayKeys: renderedDayKeys)
     }
-    /// Days elapsed this week (Mon..today inclusive) — the daily-avg divisor,
-    /// so a Tuesday isn't averaged over 7 days.
-    private var elapsedDays: Int {
-        max(1, min(7, (dayKeys.firstIndex(of: todayKey) ?? 6) + 1))
+    /// Daily-avg divisor: the week containing today averages over elapsed days
+    /// Mon..today (a Tuesday isn't averaged over 7 days); a fully past week
+    /// over the days that rendered data (min 1); a future week renders 0s.
+    private var avgDivisor: Int {
+        if let todayIndex = dayKeys.firstIndex(of: todayKey) {
+            return todayIndex + 1
+        }
+        // "yyyy-MM-dd" keys compare chronologically as strings.
+        guard let first = dayKeys.first, first <= todayKey else { return 1 }
+        return max(1, renderedDayKeys.count)
     }
     /// Monday-first row labels (shared with the month view's column headers).
     private var weekdaySymbols: [String] { mondayFirstWeekdaySymbols(loc) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            weekNav
             summaryHeader
             hoverStrip
             VStack(spacing: 2) {
@@ -806,13 +836,51 @@ struct WeekTimeChart: View {
         )
     }
 
+    // ◀ 6/1 – 6/7 ▶ — week navigation within the viewed month (the year nav's
+    // disabled idiom at both ends; months change via the top month navigator).
+    private var weekNav: some View {
+        let index = selectedWeekIndex
+        let atFirst = (index ?? 0) <= 0
+        let atLast = index.map { $0 >= weeks.count - 1 } ?? true
+        return HStack {
+            Button(action: { store.navigateTimeWeek(offset: -1) }) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 22, height: 20, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .disabled(atFirst)
+            .opacity(atFirst ? 0.3 : 1)
+
+            Spacer()
+
+            // Numeric M/d span — locale-neutral by design, no i18n key needed.
+            Text("\(shortDate(dayKeys.first ?? "")) – \(shortDate(dayKeys.last ?? ""))")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.primary)
+
+            Spacer()
+
+            Button(action: { store.navigateTimeWeek(offset: 1) }) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 22, height: 20, alignment: .trailing)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .disabled(atLast)
+            .opacity(atLast ? 0.3 : 1)
+        }
+    }
+
     // Header summary: week total / daily avg / longest session.
     private var summaryHeader: some View {
         HStack(spacing: 18) {
             stat(loc("timeWeekTotal"), TimeLogic.formatDurationShort(weekTotal))
-            stat(loc("timeDailyAvg"), TimeLogic.formatDurationShort(weekTotal / elapsedDays))
+            stat(loc("timeDailyAvg"), TimeLogic.formatDurationShort(weekTotal / avgDivisor))
             stat(loc("timeLongest"), TimeLogic.formatDurationShort(
-                TimeLogic.longestIntervalSeconds(in: timeData.days, dayKeys: dayKeys)))
+                TimeLogic.longestIntervalSeconds(in: timeData.days, dayKeys: renderedDayKeys)))
             Spacer()
         }
     }
@@ -856,17 +924,22 @@ struct WeekTimeChart: View {
     }
 
     private func weekRow(index: Int, dayKey: String) -> some View {
+        let inMonth = dayKey.hasPrefix(monthPrefix)
         let day = timeData.days[dayKey]
         let total = day?.totalSeconds ?? 0
+        // Today-row highlight is implicitly scoped to the selected week: the
+        // todayKey only appears in dayKeys when that week contains today.
         let isToday = dayKey == todayKey
         return HStack(spacing: 6) {
             Text(weekdaySymbols.indices.contains(index) ? weekdaySymbols[index] : "")
                 .font(.system(size: 9, weight: isToday ? .semibold : .regular))
                 .foregroundColor(isToday ? .primary : .secondary)
                 .frame(width: labelWidth, alignment: .leading)
-            timeline(day: day, dayKey: dayKey)
+            timeline(day: day, dayKey: dayKey, dimmed: !inMonth)
                 .frame(height: rowHeight)
-            Text(TimeLogic.formatDurationShort(total))
+            // Out-of-month days without payload show no total — a "0m" there
+            // would fabricate data the payload never carried.
+            Text(inMonth || day != nil ? TimeLogic.formatDurationShort(total) : "")
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundColor(total > 0 ? .primary : .secondary.opacity(0.6))
                 .frame(width: totalWidth, alignment: .trailing)
@@ -879,11 +952,19 @@ struct WeekTimeChart: View {
         )
     }
 
-    // 0–24h timeline: gridlines + one capsule per gap-merged interval.
-    private func timeline(day: DayTimeUsage?, dayKey: String) -> some View {
+    // 0–24h timeline: gridlines + one capsule per gap-merged interval. Dimmed
+    // rows (out-of-month days) get the month view's neutral cell wash; their
+    // capsules still draw when the payload carries the day.
+    private func timeline(day: DayTimeUsage?, dayKey: String, dimmed: Bool) -> some View {
         GeometryReader { geo in
             let w = geo.size.width
             ZStack(alignment: .leading) {
+                if dimmed {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.primary.opacity(0.025))
+                        .frame(width: max(0, w - 2), height: rowHeight - 2)
+                        .offset(x: 1)
+                }
                 ForEach(gridHours, id: \.self) { h in
                     Rectangle()
                         .fill(Color.primary.opacity(0.07))
@@ -962,22 +1043,9 @@ struct MonthTimeChart: View {
     /// first/last rows may reach into neighbor months; those cells render
     /// dimmed (see timeline) because next-month head days aren't even in this
     /// month's payload — drawing only prev-month tails would be lopsided.
+    /// Same week list the Week sub-view navigates (TimeLogic.weeksOfMonth).
     private var weeks: [[String]] {
-        let cal = AppDate.gregorian
-        var comps = DateComponents()
-        comps.year = year
-        comps.month = month
-        comps.day = 1
-        guard let first = cal.date(from: comps),
-              let nextMonth = cal.date(byAdding: .month, value: 1, to: first),
-              var monday = AppDate.mondayOfWeek(containing: first) else { return [] }
-        var rows: [[String]] = []
-        while monday < nextMonth {
-            rows.append(TimeLogic.weekDayKeys(monday: monday))
-            guard let next = cal.date(byAdding: .day, value: 7, to: monday) else { break }
-            monday = next
-        }
-        return rows
+        TimeLogic.weeksOfMonth(year: year, month: month).map(TimeLogic.weekDayKeys)
     }
 
     /// In-month day keys only — the stats/render scope. The payload may carry

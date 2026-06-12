@@ -70,6 +70,73 @@ import Testing
                          "2027-01-01", "2027-01-02", "2027-01-03"])
     }
 
+    // MARK: weeksOfMonth
+
+    @Test func weeksOfMonthStartingMonday() {
+        // 2026-06-01 is a Monday → the first week starts exactly on day 1.
+        let mondays = TimeLogic.weeksOfMonth(year: 2026, month: 6).map(AppDate.dayKey)
+        #expect(mondays == ["2026-06-01", "2026-06-08", "2026-06-15",
+                            "2026-06-22", "2026-06-29"])
+    }
+
+    @Test func weeksOfMonthStartingSunday() {
+        // 2026-02-01 is a Sunday → the first week's Monday is 2026-01-26
+        // (previous month); the last week (2026-02-23) holds Feb 28, and the
+        // Monday landing exactly on Mar 1's month is excluded.
+        let mondays = TimeLogic.weeksOfMonth(year: 2026, month: 2).map(AppDate.dayKey)
+        #expect(mondays == ["2026-01-26", "2026-02-02", "2026-02-09",
+                            "2026-02-16", "2026-02-23"])
+    }
+
+    @Test func weeksOfMonthSpanningYearBoundary() {
+        // December 2026: first week's Monday is 2026-11-30; the last week
+        // (2026-12-28) runs through 2027-01-03 — included, since it overlaps
+        // the month.
+        let mondays = TimeLogic.weeksOfMonth(year: 2026, month: 12).map(AppDate.dayKey)
+        #expect(mondays == ["2026-11-30", "2026-12-07", "2026-12-14",
+                            "2026-12-21", "2026-12-28"])
+    }
+
+    // MARK: defaultWeekMonday
+
+    @Test func defaultWeekMondayInCurrentMonth() throws {
+        // Viewing the month containing today → the week containing today.
+        let today = makeDate(2026, 6, 11)  // Thursday of the 2026-06-08 week
+        let monday = try #require(TimeLogic.defaultWeekMonday(year: 2026, month: 6, today: today))
+        #expect(AppDate.dayKey(monday) == "2026-06-08")
+    }
+
+    @Test func defaultWeekMondayInOtherMonth() throws {
+        // Any other viewed month → its FIRST week, even when that Monday lives
+        // in the previous month (Feb 2026 starts on a Sunday).
+        let today = makeDate(2026, 6, 11)
+        let feb = try #require(TimeLogic.defaultWeekMonday(year: 2026, month: 2, today: today))
+        #expect(AppDate.dayKey(feb) == "2026-01-26")
+        // Month starting exactly on a Monday → day 1 itself.
+        let june = try #require(TimeLogic.defaultWeekMonday(
+            year: 2026, month: 6, today: makeDate(2026, 7, 15)))
+        #expect(AppDate.dayKey(june) == "2026-06-01")
+    }
+
+    @Test func defaultWeekMondayMatchesYearAndMonth() throws {
+        // Same month number in a DIFFERENT year is not "the current month".
+        let today = makeDate(2025, 6, 15)
+        let monday = try #require(TimeLogic.defaultWeekMonday(year: 2026, month: 6, today: today))
+        #expect(AppDate.dayKey(monday) == "2026-06-01")
+    }
+
+    // MARK: weekIndex
+
+    @Test func weekIndexMatchesByDayKey() {
+        let weeks = TimeLogic.weeksOfMonth(year: 2026, month: 6)
+        // Matched by day key, so a non-midnight Date for the same Monday hits.
+        #expect(TimeLogic.weekIndex(of: makeDate(2026, 6, 8, hour: 15), in: weeks) == 1)
+        #expect(TimeLogic.weekIndex(of: makeDate(2026, 6, 29), in: weeks) == 4)
+        // A Monday outside the month's week list (stale selection) → nil.
+        #expect(TimeLogic.weekIndex(of: makeDate(2026, 5, 25), in: weeks) == nil)
+        #expect(TimeLogic.weekIndex(of: makeDate(2026, 6, 8), in: []) == nil)
+    }
+
     // MARK: week summary helpers
 
     @Test func totalAndLongestOverWeek() {
