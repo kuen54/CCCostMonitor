@@ -19,6 +19,46 @@ class UsageStore: ObservableObject {
     @Published var currentMonthData: PeriodUsage?
     @Published var dailyBreakdown: [DailyUsage]?
 
+    // MARK: Active time ("Time" tab)
+
+    // Current month's active-time data, cross-week merged (days from the extra
+    // Monday..today scan replace month-scan days when the week spans a month
+    // boundary). Feeds the menu-bar title and the Week sub-view; unaffected by
+    // month navigation — mirrors currentMonthData. nil = old script / old cache
+    // without the "time" section → empty/loading state in the UI.
+    @Published var currentTimeData: TimeData?
+    // Follows month navigation (equals currentTimeData when viewing the
+    // current month) — feeds the Month sub-view, mirrors `month`/`dailyBreakdown`.
+    @Published var viewingTimeData: TimeData?
+    // Today's active total, derived from currentTimeData + today's dayKey.
+    // Day rollover repaints via the 30-min timer: the fingerprint includes the
+    // dayKey, so the rollover tick runs a real scan and republishes.
+    @Published var timeTodaySeconds: Int = 0
+    // Inner Week / Month / Year switcher. Switching to Year lazily loads that
+    // year's data (no-op when the in-memory cache already has it).
+    @Published var timeRange: TimeRange = .week {
+        didSet {
+            guard timeRange == .year, oldValue != .year else { return }
+            // Async: the didSet fires inside a SwiftUI binding write — mutating
+            // other @Published fields synchronously here would publish during
+            // view updates.
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.loadYearTime(self.viewingTimeYear)
+            }
+        }
+    }
+    // Year shown by the Year sub-view (own ◀▶ nav, independent of month nav).
+    @Published var viewingTimeYear: Int
+    // Visible year's per-day totals ("yyyy-MM-dd" → seconds). nil = loading,
+    // empty dict = fetch failed (retry via nav / ⌘R; failures aren't cached).
+    @Published var yearTimeDays: [String: Int]?
+    // In-memory per-year cache (main thread only). ⌘R clears it.
+    private var yearTimeCache: [Int: [String: Int]] = [:]
+    // Staleness guard for year fetches (main thread only), same pattern as
+    // fetchGeneration for historical months.
+    private var yearFetchGeneration = 0
+
     // Localization
     @Published var language: AppLanguage
 
@@ -86,6 +126,7 @@ class UsageStore: ObservableObject {
         let week: PeriodUsage
         let month: PeriodUsage
         let daily: [DailyUsage]?
+        let time: TimeData?
     }
 
     // Cache directory: ~/.claude/cache/cc-monitor/
@@ -101,6 +142,7 @@ class UsageStore: ObservableObject {
         let now = Date()
         viewingYear = cal.component(.year, from: now)
         viewingMonth = cal.component(.month, from: now)
+        viewingTimeYear = cal.component(.year, from: now)
 
         // Language: restore from UserDefaults or detect system language
         if let saved = UserDefaults.standard.string(forKey: "appLanguage"),
@@ -185,13 +227,18 @@ class UsageStore: ObservableObject {
 
     func loadHistoricalMonth() {
         let y = viewingYear, m = viewingMonth
-        // Try cache first (must have daily data, otherwise re-fetch)
+        // Try cache first. Must have daily data AND a time section, otherwise
+        // re-fetch: caches written before the Time tab existed have no `time`,
+        // and accepting them would leave the Time month view permanently empty.
+        // The re-fetch re-caches with `time` — one extra scan per old month,
+        // self-healing.
         if let snapshot = loadCacheSnapshot(year: y, month: m),
-           snapshot.dailyBreakdown != nil {
+           snapshot.dailyBreakdown != nil, snapshot.time != nil {
             self.today = nil
             self.week = nil
             self.month = snapshot.data
             self.dailyBreakdown = snapshot.dailyBreakdown
+            self.viewingTimeData = snapshot.time
             self.isLoading = false
             return
         }
@@ -203,7 +250,7 @@ class UsageStore: ObservableObject {
             guard let self = self else { return }
             let range = AppDate.monthDateRange(year: y, month: m)
             let ym = String(format: "%04d-%02d", y, m)
-            let (data, daily) = self.fetchMonthData(range, yearMonth: ym)
+            let (data, daily, time) = self.fetchMonthData(range, yearMonth: ym)
             DispatchQueue.main.async {
                 // Guard: user might have navigated away — or a newer scan might have
                 // superseded this one — while loading
@@ -213,9 +260,10 @@ class UsageStore: ObservableObject {
                 self.week = nil
                 self.month = data
                 self.dailyBreakdown = daily
+                self.viewingTimeData = time
                 self.isLoading = false
                 if let data = data {
-                    self.saveCache(year: y, month: m, data: data, daily: daily)
+                    self.saveCache(year: y, month: m, data: data, daily: daily, time: time)
                 }
             }
         }
@@ -230,6 +278,15 @@ class UsageStore: ObservableObject {
         // It keeps its own independent 5-minute cache — unaffected by the
         // JSONL fingerprint below.
         refreshQuota()
+
+        // ⌘R also invalidates the per-year time cache; refetch only the year
+        // the user is actually looking at (other years reload lazily on nav).
+        if force {
+            yearTimeCache.removeAll()
+            if selectedTab == .time && timeRange == .year {
+                loadYearTime(viewingTimeYear, force: true)
+            }
+        }
 
         if isCurrentMonth {
             // Restore cached today/week/month synchronously so UI doesn't flash
@@ -289,6 +346,8 @@ class UsageStore: ObservableObject {
                 DispatchQueue.main.async {
                     self.isRefreshInFlight = false
                     self.currentMonthData = cached.month
+                    self.currentTimeData = cached.time
+                    self.recomputeTimeToday()
                     self.lastUpdate = Date()
                     guard self.isCurrentMonth else {
                         self.isLoading = false
@@ -298,12 +357,13 @@ class UsageStore: ObservableObject {
                     self.week = cached.week
                     self.month = cached.month
                     self.dailyBreakdown = cached.daily
+                    self.viewingTimeData = cached.time
                     self.isLoading = false
                 }
                 return
             }
 
-            let (m, daily) = self.fetchMonthData("month", yearMonth: ym)
+            let (m, daily, monthTime) = self.fetchMonthData("month", yearMonth: ym)
             // If script failed, keep existing cached data visible
             guard m != nil else {
                 // A failed scan must never be short-circuited over: drop the
@@ -319,6 +379,7 @@ class UsageStore: ObservableObject {
             // Derive today & week from daily breakdown
             let t = AppDate.deriveToday(daily)
             var w = AppDate.deriveWeek(daily)
+            var crossWeekTime: TimeData? = nil
             var weekStartKey: String? = nil
             if let monday = AppDate.mondayOfWeek(containing: now) {
                 weekStartKey = AppDate.dayKey(monday)
@@ -332,39 +393,52 @@ class UsageStore: ObservableObject {
                     // week totals. The week is a superset of the month-derived
                     // week — never accept a smaller value (failed/partial scan
                     // falls back to the month-derived week, same as before).
+                    // The same JSON carries a "time" section for Monday..today —
+                    // captured only when the scan is accepted, merged below.
                     let range = "\(weekStartKey!):\(AppDate.dayKey(now))"
                     if let json = self.scriptClient.runScript(["--json", "--no-sessions", "--range", range]),
                        let crossWeek = UsageParser.parsePeriod(json),
                        crossWeek.cost >= w.cost {
                         w = crossWeek
+                        crossWeekTime = UsageParser.parseTimeSection(json)
                     } else {
                         // Extra scan failed (timeout/script error): the week card
                         // falls back to the smaller month-derived value. Don't let
                         // the fingerprint freeze that undercount — invalidate it so
-                        // the next refresh retries the extra scan.
+                        // the next refresh retries the extra scan (the time merge
+                        // below likewise falls back to month-scan days only).
                         fingerprint = nil
                     }
                 }
             }
+            // Cross-week days REPLACE month days (the extra scan's file set is a
+            // superset for Monday..today; see UsageParser.mergeTimeData). The
+            // merged dict may contain prev-month day keys — harmless, the month
+            // view filters by yearMonth prefix and the Week view wants them.
+            let mergedTime = UsageParser.mergeTimeData(base: monthTime, override: crossWeekTime)
             // Scan succeeded: remember the PRE-scan fingerprint + parsed results
             // (scriptQueue-only fields) so an unchanged-world refresh can skip
             // the next spawn. `fingerprint` may be nil (enumeration error) — a
             // nil stored value simply never matches, forcing a real scan.
             self.lastScanFingerprint = fingerprint
             if let m = m {
-                self.lastScanResults = ScanResults(today: t, week: w, month: m, daily: daily)
+                self.lastScanResults = ScanResults(today: t, week: w, month: m, daily: daily,
+                                                   time: mergedTime)
             }
             DispatchQueue.main.async {
                 self.isRefreshInFlight = false
                 // Menu-bar total and cache persistence are always about the current month,
                 // so update them regardless of what the user is currently viewing.
                 self.currentMonthData = m
+                self.currentTimeData = mergedTime
+                self.recomputeTimeToday()
                 self.lastUpdate = Date()
                 if let m = m {
                     self.saveCache(
                         year: nowYear, month: nowMonth,
                         data: m, daily: daily,
-                        week: w, weekStart: weekStartKey)
+                        week: w, weekStart: weekStartKey,
+                        time: mergedTime)
                 }
                 // Popover fields (today/week/month/dailyBreakdown) feed the active view.
                 // Only skip painting when the user is viewing a historical month —
@@ -378,6 +452,7 @@ class UsageStore: ObservableObject {
                 self.week = w
                 self.month = m
                 self.dailyBreakdown = daily
+                self.viewingTimeData = mergedTime
                 self.isLoading = false
             }
         }
@@ -391,11 +466,13 @@ class UsageStore: ObservableObject {
     }
 
     private func saveCache(year: Int, month: Int, data: PeriodUsage, daily: [DailyUsage]? = nil,
-                           week: PeriodUsage? = nil, weekStart: String? = nil) {
+                           week: PeriodUsage? = nil, weekStart: String? = nil,
+                           time: TimeData? = nil) {
         var snapshot = MonthlySnapshot(year: year, month: month, data: data, lastUpdated: Date())
         snapshot.dailyBreakdown = daily
         snapshot.week = week
         snapshot.weekStart = weekStart
+        snapshot.time = time
         guard let jsonData = UsageParser.encodeSnapshot(snapshot) else { return }
         try? jsonData.write(to: URL(fileURLWithPath: cachePath(year: year, month: month)))
     }
@@ -424,6 +501,9 @@ class UsageStore: ObservableObject {
             self.week = nil
             self.month = nil
             self.dailyBreakdown = nil
+            self.currentTimeData = nil
+            self.viewingTimeData = nil
+            self.recomputeTimeToday()
             return
         }
         let daily = snapshot.dailyBreakdown
@@ -453,8 +533,60 @@ class UsageStore: ObservableObject {
         self.month = snapshot.data
         self.dailyBreakdown = daily
         self.currentMonthData = snapshot.data
+        // Old (pre-Time-tab) caches have no `time` → nil → the Time tab shows
+        // its empty/loading state until the background refresh fills it in.
+        self.currentTimeData = snapshot.time
+        self.viewingTimeData = snapshot.time
+        self.recomputeTimeToday()
         self.lastUpdate = snapshot.lastUpdated
         self.isLoading = false
+    }
+
+    /// Recompute today's active total from currentTimeData. Main thread only
+    /// (mutates @Published state). Guarded publish to limit menu-bar churn.
+    private func recomputeTimeToday(now: Date = Date()) {
+        let seconds = currentTimeData?.days[AppDate.dayKey(now)]?.totalSeconds ?? 0
+        if timeTodaySeconds != seconds { timeTodaySeconds = seconds }
+    }
+
+    // MARK: - Year time loading (--time-year)
+
+    /// Load per-day totals for `year` into yearTimeDays. Serves the in-memory
+    /// per-year cache unless `force`; otherwise runs `--time-year` on the same
+    /// serial scriptQueue (existing 120s timeout machinery applies). A failed
+    /// fetch publishes an empty dict (empty heatmap, NOT cached) so nav / ⌘R
+    /// retries it. Main thread only.
+    func loadYearTime(_ year: Int, force: Bool = false) {
+        viewingTimeYear = year
+        if !force, let cached = yearTimeCache[year] {
+            yearTimeDays = cached
+            return
+        }
+        yearTimeDays = nil  // loading state
+        yearFetchGeneration += 1
+        let generation = yearFetchGeneration
+        scriptQueue.async { [weak self] in
+            guard let self = self else { return }
+            let json = self.scriptClient.runScript(["--time-year", "\(year)"])
+            let parsed = json.flatMap { UsageParser.parseYearTime($0) }
+            DispatchQueue.main.async {
+                // Guard: user may have navigated to another year (or a newer
+                // fetch superseded this one) while the scan ran.
+                guard generation == self.yearFetchGeneration,
+                      self.viewingTimeYear == year else { return }
+                if let parsed = parsed, parsed.year == year {
+                    self.yearTimeCache[year] = parsed.days
+                    self.yearTimeDays = parsed.days
+                } else {
+                    self.yearTimeDays = [:]
+                }
+            }
+        }
+    }
+
+    /// ◀▶ year navigation for the Year sub-view.
+    func navigateTimeYear(offset: Int) {
+        loadYearTime(viewingTimeYear + offset)
     }
 
     // MARK: - Script execution
@@ -468,13 +600,15 @@ class UsageStore: ObservableObject {
         return UsageParser.parsePeriod(json)
     }
 
-    /// Fetch month data with daily breakdown from a single script call
+    /// Fetch month data with daily breakdown + active-time section from a
+    /// single script call.
     /// yearMonth: "YYYY-MM" string for filtering daily data (e.g. "2026-04")
-    private func fetchMonthData(_ range: String, yearMonth: String) -> (PeriodUsage?, [DailyUsage]?) {
-        guard let json = scriptClient.runScript(["--json", "--no-sessions", "--range", range]) else { return (nil, nil) }
+    private func fetchMonthData(_ range: String, yearMonth: String) -> (PeriodUsage?, [DailyUsage]?, TimeData?) {
+        guard let json = scriptClient.runScript(["--json", "--no-sessions", "--range", range]) else { return (nil, nil, nil) }
         let period = UsageParser.parsePeriod(json)
         let daily = UsageParser.parseDailyBreakdown(json, yearMonth: yearMonth)
-        return (period, daily)
+        let time = UsageParser.parseTimeSection(json)
+        return (period, daily, time)
     }
 
     // MARK: - Scan fingerprint (P1-4a)

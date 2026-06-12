@@ -109,6 +109,64 @@ enum UsageParser {
                            totalTokens: totalTokens)
     }
 
+    // MARK: Active time ("time" section / --time-year output)
+
+    /// Parse the ADDITIVE top-level `"time"` section of a month/range scan:
+    ///   {"gap_minutes": G, "days": {"yyyy-MM-dd": {"intervals": [[s,e],...],
+    ///                                              "total_seconds": N}, ...}}
+    /// Returns nil when the section is absent (old script / old cached JSON —
+    /// the UI shows an empty state) or its top-level shape is wrong. Malformed
+    /// individual days/pairs are skipped, matching parseDailyBreakdown's
+    /// lenient per-entry policy.
+    static func parseTimeSection(_ json: [String: Any]) -> TimeData? {
+        guard let section = json["time"] as? [String: Any],
+              let gap = section["gap_minutes"] as? Int,
+              let daysRaw = section["days"] as? [String: Any] else { return nil }
+        var days: [String: DayTimeUsage] = [:]
+        for (dayKey, value) in daysRaw {
+            guard let dayDict = value as? [String: Any],
+                  let pairsRaw = dayDict["intervals"] as? [Any],
+                  let total = dayDict["total_seconds"] as? Int else { continue }
+            var intervals: [ActiveInterval] = []
+            for pairAny in pairsRaw {
+                guard let pair = pairAny as? [Int], pair.count == 2,
+                      pair[0] >= 0, pair[0] <= pair[1], pair[1] <= 86400 else { continue }
+                intervals.append(ActiveInterval(startSec: pair[0], endSec: pair[1]))
+            }
+            days[dayKey] = DayTimeUsage(intervals: intervals, totalSeconds: total)
+        }
+        return TimeData(gapMinutes: gap, days: days)
+    }
+
+    /// Parse `--time-year YYYY` output:
+    ///   {"year": YYYY, "gap_minutes": G, "days": {"yyyy-MM-dd": total_seconds}}
+    /// Non-Int day values are skipped (lenient per-entry policy).
+    static func parseYearTime(_ json: [String: Any]) -> (year: Int, gapMinutes: Int, days: [String: Int])? {
+        guard let year = json["year"] as? Int,
+              let gap = json["gap_minutes"] as? Int,
+              let daysRaw = json["days"] as? [String: Any] else { return nil }
+        var days: [String: Int] = [:]
+        for (dayKey, value) in daysRaw {
+            guard let seconds = value as? Int else { continue }
+            days[dayKey] = seconds
+        }
+        return (year: year, gapMinutes: gap, days: days)
+    }
+
+    /// Merge the month scan's time days with the cross-week extra scan's:
+    /// override days REPLACE base days. The cross-week scan's file set includes
+    /// prev-month files pruned out of the month scan, so its per-day intervals
+    /// for Monday..today are strictly more complete (a session bridging the
+    /// month-start midnight shows up as a truthful [0, …] interval only there).
+    /// gapMinutes is taken from base (both scans run with the same gap).
+    static func mergeTimeData(base: TimeData?, override: TimeData?) -> TimeData? {
+        guard let base = base else { return override }
+        guard let override = override else { return base }
+        var merged = base
+        merged.days.merge(override.days) { _, overrideDay in overrideDay }
+        return merged
+    }
+
     // MARK: Cache snapshot codec (pure — UsageStore owns the file I/O)
 
     /// Encode a MonthlySnapshot exactly like the on-disk cache format

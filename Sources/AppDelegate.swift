@@ -86,11 +86,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.contentViewController = hostingController
 
         // Observe current month data + tab changes to update menu bar title
-        // Always shows current month regardless of which month is being viewed
+        // Always shows current month regardless of which month is being viewed.
+        // CombineLatest4 is Combine's max arity — the time-tab input is chained
+        // on with an extra combineLatest.
         cancellable = Publishers.CombineLatest4(
             store.$currentMonthData, store.$selectedTab, store.$language, store.$subscriptionQuota)
+            .combineLatest(store.$timeTodaySeconds)
             .receive(on: RunLoop.main)
-            .sink { [weak self] monthData, tab, _, quota in
+            .sink { [weak self] combined, todaySecs in
+                let (monthData, tab, _, quota) = combined
                 guard let self = self, let monthData = monthData else { return }
                 let title: String
                 switch tab {
@@ -105,6 +109,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     } else {
                         title = formatCost(monthData.cost)
                     }
+                case .time:
+                    // Today's active duration: "3.4h" / "32m" / "0m".
+                    title = TimeLogic.formatDurationShort(todaySecs)
                 }
                 let display = " \(title) "
                 self.latestMenuTitle = display

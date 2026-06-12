@@ -53,4 +53,32 @@ struct MonthlySnapshot: Codable {
     var week: PeriodUsage?
     /// "yyyy-MM-dd" Monday of the week `week` covers — staleness check on restore.
     var weekStart: String?
+    /// Active-time intervals for the snapshot's days (additive "time" section of
+    /// the script JSON, plus cross-week extra-scan days when the week spans a
+    /// month boundary). Optional so caches written by older versions still decode.
+    var time: TimeData?
+}
+
+// MARK: - Active time ("Time" tab)
+
+/// One gap-merged active interval within a single local day, stored as
+/// wall-clock seconds-of-day. `endSec` may be 86400 (next-midnight sentinel for
+/// intervals split at a day boundary); `startSec == endSec` is a truthful
+/// zero-duration interval (isolated single event) — the renderer pads it.
+struct ActiveInterval: Codable, Equatable {
+    let startSec: Int
+    let endSec: Int
+    var durationSeconds: Int { endSec - startSec }
+}
+
+struct DayTimeUsage: Codable, Equatable {
+    let intervals: [ActiveInterval]
+    let totalSeconds: Int
+}
+
+/// Decoded `"time"` section of the script's month JSON: per-day gap-merged
+/// active intervals. Keys are "yyyy-MM-dd" local day keys.
+struct TimeData: Codable, Equatable {
+    let gapMinutes: Int
+    var days: [String: DayTimeUsage]
 }

@@ -138,6 +138,92 @@ import Testing
         #expect(merged.models.isEmpty)
     }
 
+    // MARK: parseTimeSection
+
+    @Test func parseTimeSectionHappyPathAndLenientDays() throws {
+        let json = jsonDict("""
+        {
+          "time": {
+            "gap_minutes": 10,
+            "days": {
+              "2026-04-01": {"intervals": [[3600, 7200], [40000, 40000]], "total_seconds": 3600},
+              "2026-04-02": {"intervals": [], "total_seconds": 0},
+              "2026-04-03": "garbage-not-a-dict",
+              "2026-04-04": {"intervals": [[100, 50], [-1, 5], [0, 99999], [200, 300]], "total_seconds": 100}
+            }
+          }
+        }
+        """)
+        let time = try #require(UsageParser.parseTimeSection(json))
+        #expect(time.gapMinutes == 10)
+        #expect(time.days.count == 3)  // malformed day skipped, lenient per-entry
+
+        let day1 = try #require(time.days["2026-04-01"])
+        #expect(day1.totalSeconds == 3600)
+        #expect(day1.intervals == [ActiveInterval(startSec: 3600, endSec: 7200),
+                                   ActiveInterval(startSec: 40000, endSec: 40000)])  // zero-duration kept
+
+        #expect(time.days["2026-04-02"]?.intervals.isEmpty == true)
+        #expect(time.days["2026-04-03"] == nil)
+
+        // Invalid pairs (reversed, negative, >86400) skipped; valid pair survives
+        let day4 = try #require(time.days["2026-04-04"])
+        #expect(day4.intervals == [ActiveInterval(startSec: 200, endSec: 300)])
+    }
+
+    @Test func parseTimeSectionAbsentOrMalformedReturnsNil() {
+        // Pre-feature payloads have no "time" key at all → nil (UI empty state)
+        #expect(UsageParser.parseTimeSection(payload) == nil)
+        #expect(UsageParser.parseTimeSection([:]) == nil)
+        #expect(UsageParser.parseTimeSection(jsonDict(#"{"time": "garbage"}"#)) == nil)
+        #expect(UsageParser.parseTimeSection(jsonDict(#"{"time": {"days": {}}}"#)) == nil)
+        #expect(UsageParser.parseTimeSection(jsonDict(#"{"time": {"gap_minutes": 10}}"#)) == nil)
+    }
+
+    // MARK: parseYearTime
+
+    @Test func parseYearTimeHappyPath() throws {
+        let json = jsonDict("""
+        {"script_version": "0.0.0-test", "year": 2026, "gap_minutes": 10,
+         "days": {"2026-01-01": 0, "2026-06-10": 12240, "2026-06-11": "garbage"}}
+        """)
+        let parsed = try #require(UsageParser.parseYearTime(json))
+        #expect(parsed.year == 2026)
+        #expect(parsed.gapMinutes == 10)
+        #expect(parsed.days == ["2026-01-01": 0, "2026-06-10": 12240])  // non-Int day skipped
+    }
+
+    @Test func parseYearTimeMalformedReturnsNil() {
+        #expect(UsageParser.parseYearTime([:]) == nil)
+        #expect(UsageParser.parseYearTime(jsonDict(#"{"year": 2026, "gap_minutes": 10}"#)) == nil)
+        #expect(UsageParser.parseYearTime(jsonDict(#"{"year": "2026", "gap_minutes": 10, "days": {}}"#)) == nil)
+    }
+
+    // MARK: mergeTimeData
+
+    @Test func mergeTimeDataOverrideWins() throws {
+        let base = TimeData(gapMinutes: 10, days: [
+            "2026-05-31": DayTimeUsage(intervals: [ActiveInterval(startSec: 0, endSec: 100)],
+                                       totalSeconds: 100),
+            "2026-06-01": DayTimeUsage(intervals: [ActiveInterval(startSec: 600, endSec: 700)],
+                                       totalSeconds: 100),
+        ])
+        let override = TimeData(gapMinutes: 10, days: [
+            // Cross-week scan saw the prev-month bridge → day 1 starts at midnight
+            "2026-06-01": DayTimeUsage(intervals: [ActiveInterval(startSec: 0, endSec: 700)],
+                                       totalSeconds: 700),
+        ])
+        let merged = try #require(UsageParser.mergeTimeData(base: base, override: override))
+        #expect(merged.days.count == 2)
+        #expect(merged.days["2026-06-01"]?.totalSeconds == 700)   // override replaced
+        #expect(merged.days["2026-05-31"]?.totalSeconds == 100)   // base kept
+
+        // nil handling: either side nil passes the other through
+        #expect(UsageParser.mergeTimeData(base: nil, override: override)?.days.count == 1)
+        #expect(UsageParser.mergeTimeData(base: base, override: nil)?.days.count == 2)
+        #expect(UsageParser.mergeTimeData(base: nil, override: nil) == nil)
+    }
+
     // MARK: snapshot codec
 
     @Test func snapshotEncodeDecodeRoundTrip() throws {
@@ -150,7 +236,13 @@ import Testing
             dailyBreakdown: [makeDay("2026-04-01", cost: 4.5, totalTokens: 30,
                                      models: [makeModel(.opus, cost: 4.5, messages: 2, input: 10, output: 20)])],
             week: PeriodUsage(cost: 1.0, models: [], totalMessages: 0, totalTokens: 0),
-            weekStart: "2026-04-27"
+            weekStart: "2026-04-27",
+            time: TimeData(gapMinutes: 10, days: [
+                "2026-04-01": DayTimeUsage(
+                    intervals: [ActiveInterval(startSec: 3600, endSec: 7200),
+                                ActiveInterval(startSec: 86000, endSec: 86400)],
+                    totalSeconds: 4000),
+            ])
         )
         let data = try #require(UsageParser.encodeSnapshot(snapshot))
         let decoded = try #require(UsageParser.decodeSnapshot(data))
@@ -160,7 +252,23 @@ import Testing
         #expect(decoded.dailyBreakdown?.first?.dateString == "2026-04-01")
         #expect(approx(decoded.week?.cost ?? -1, 1.0))
         #expect(decoded.weekStart == "2026-04-27")
+        #expect(decoded.time == snapshot.time)
         // ISO-8601 strategy has 1-second granularity; identity within a second
         #expect(abs(decoded.lastUpdated.timeIntervalSince(snapshot.lastUpdated)) < 1.0)
+    }
+
+    @Test func snapshotDecodesLegacyFormatWithoutTime() throws {
+        // A cache file written BEFORE the Time tab existed: no `time` (and no
+        // week/weekStart) — must still decode, with the new field nil.
+        let legacy = """
+        {"year": 2026, "month": 3,
+         "data": {"cost": 1.0, "models": [], "totalMessages": 0, "totalTokens": 0},
+         "lastUpdated": "2026-03-31T12:00:00Z"}
+        """
+        let decoded = try #require(UsageParser.decodeSnapshot(Data(legacy.utf8)))
+        #expect(decoded.year == 2026)
+        #expect(decoded.time == nil)
+        #expect(decoded.week == nil)
+        #expect(decoded.dailyBreakdown == nil)
     }
 }

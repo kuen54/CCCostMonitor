@@ -22,6 +22,7 @@ let package = Package(
                 "Core_ModelClass.swift",
                 "Core_UsageParser.swift",
                 "Core_DateLogic.swift",
+                "Core_TimeLogic.swift",
                 "Core_KeychainCodec.swift",
             ]
         ),
