@@ -749,6 +749,16 @@ struct TimeTabView: View {
     }
 }
 
+/// Monday-first localized short weekday symbols (DateFormatter's
+/// shortWeekdaySymbols is Sunday-first → rotate). Human-facing → locale-aware.
+private func mondayFirstWeekdaySymbols(_ loc: Localizer) -> [String] {
+    let df = DateFormatter()
+    df.locale = Locale(identifier: loc.language.rawValue)
+    let symbols = df.shortWeekdaySymbols ?? []
+    guard symbols.count == 7 else { return Array(repeating: "", count: 7) }
+    return (0..<7).map { symbols[($0 + 1) % 7] }
+}
+
 // ── Week view: Apple-Health-sleep-style timeline, 7 rows Mon–Sun ──
 struct WeekTimeChart: View {
     let timeData: TimeData
@@ -777,15 +787,8 @@ struct WeekTimeChart: View {
     private var elapsedDays: Int {
         max(1, min(7, (dayKeys.firstIndex(of: todayKey) ?? 6) + 1))
     }
-    /// Monday-first row labels. shortWeekdaySymbols is Sunday-first → rotate.
-    /// Human-facing, so locale-aware (house rule).
-    private var weekdaySymbols: [String] {
-        let df = DateFormatter()
-        df.locale = Locale(identifier: loc.language.rawValue)
-        let symbols = df.shortWeekdaySymbols ?? []
-        guard symbols.count == 7 else { return Array(repeating: "", count: 7) }
-        return (0..<7).map { symbols[($0 + 1) % 7] }
-    }
+    /// Monday-first row labels (shared with the month view's column headers).
+    private var weekdaySymbols: [String] { mondayFirstWeekdaySymbols(loc) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -935,7 +938,8 @@ struct WeekTimeChart: View {
     }
 }
 
-// ── Month view: daily active-hours bars (structure mirrors DailyChart) ──
+// ── Month view: week-per-row timeline (the week view's visual language;
+// each row spans Mon 00:00 → Sun 24:00, every day column internally 0–24h) ──
 // Month navigation = the EXISTING top month navigator; this chart only renders
 // whatever month viewingTimeData currently holds.
 struct MonthTimeChart: View {
@@ -944,169 +948,217 @@ struct MonthTimeChart: View {
     let month: Int
     @Environment(\.localizer) private var loc
 
-    @State private var hoveredDay: Int? = nil
+    private struct HoveredInterval {
+        let dayKey: String
+        let interval: ActiveInterval
+    }
+    @State private var hovered: HoveredInterval? = nil
 
-    private var daysInMonth: Int {
+    private let rowHeight: CGFloat = 20
+    private let labelWidth: CGFloat = 34
+    private let totalWidth: CGFloat = 40
+
+    private var monthPrefix: String { String(format: "%04d-%02d-", year, month) }
+    private var todayKey: String { AppDate.dayKey(Date()) }
+
+    /// Monday-aligned weeks covering the month, each entry 7 day keys. The
+    /// first/last rows may reach into neighbor months; those cells render
+    /// dimmed (see timeline) because next-month head days aren't even in this
+    /// month's payload — drawing only prev-month tails would be lopsided.
+    private var weeks: [[String]] {
         let cal = AppDate.gregorian
         var comps = DateComponents()
         comps.year = year
         comps.month = month
         comps.day = 1
-        guard let start = cal.date(from: comps),
-              let next = cal.date(byAdding: .month, value: 1, to: start),
-              let last = cal.date(byAdding: .day, value: -1, to: next) else { return 30 }
-        return cal.component(.day, from: last)
-    }
-
-    /// day-of-month → total active seconds. Filtered to this month's keys:
-    /// the cross-week merge may leave prev-month day keys in the dict.
-    private var dayTotals: [Int: Int] {
-        let prefix = String(format: "%04d-%02d-", year, month)
-        var totals: [Int: Int] = [:]
-        for (key, usage) in timeData.days where key.hasPrefix(prefix) {
-            if let day = Int(key.suffix(2)) { totals[day] = usage.totalSeconds }
+        guard let first = cal.date(from: comps),
+              let nextMonth = cal.date(byAdding: .month, value: 1, to: first),
+              var monday = AppDate.mondayOfWeek(containing: first) else { return [] }
+        var rows: [[String]] = []
+        while monday < nextMonth {
+            rows.append(TimeLogic.weekDayKeys(monday: monday))
+            guard let next = cal.date(byAdding: .day, value: 7, to: monday) else { break }
+            monday = next
         }
-        return totals
+        return rows
     }
 
-    private var maxSeconds: Int { max(dayTotals.values.max() ?? 0, 1) }
-
-    /// Mean over ACTIVE days only — the dashed reference line. Zero-usage days
-    /// would drag the line down to noise on sparse months.
-    private var avgSeconds: Int {
-        let nonzero = dayTotals.values.filter { $0 > 0 }
-        guard !nonzero.isEmpty else { return 0 }
-        return nonzero.reduce(0, +) / nonzero.count
+    /// In-month day keys only — the stats/render scope. The payload may carry
+    /// prev-month tail keys from the cross-week merge; they must not leak in.
+    private var monthDayKeys: [String] {
+        timeData.days.keys.filter { $0.hasPrefix(monthPrefix) }
     }
 
-    private var todayDay: Int? {
-        let cal = AppDate.gregorian
-        let now = Date()
-        guard cal.component(.year, from: now) == year,
-              cal.component(.month, from: now) == month else { return nil }
-        return cal.component(.day, from: now)
+    private var monthTotal: Int {
+        TimeLogic.totalSeconds(in: timeData.days, dayKeys: monthDayKeys)
     }
 
-    private var labelDays: Set<Int> {
-        let total = daysInMonth
-        var labels: Set<Int> = [1]
-        for d in stride(from: 5, through: total - 3, by: 5) { labels.insert(d) }
-        labels.insert(total)
-        return labels
+    /// Mean over ACTIVE days only — same semantics as the bar chart's old
+    /// average line: zero-usage days would drag the figure down to noise.
+    private var activeDays: Int {
+        monthDayKeys.filter { (timeData.days[$0]?.totalSeconds ?? 0) > 0 }.count
     }
-
-    private let chartHeight: CGFloat = 72
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            // Title + hover readout (date + active duration)
-            HStack(spacing: 4) {
-                Text(loc("daily"))
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(.secondary)
-                if let day = hoveredDay {
-                    Text("·")
-                        .foregroundColor(.secondary.opacity(0.5))
-                    Text(String(format: "%d/%d", month, day))
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.primary.opacity(0.8))
-                    if let secs = dayTotals[day], secs > 0 {
-                        Text(TimeLogic.formatDurationShort(secs))
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(.primary)
-                    } else {
-                        Text(loc("noData"))
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                    }
-                }
-                Spacer()
-            }
-            .frame(height: 14)
-
-            // Bars + dashed average line
-            GeometryReader { geo in
-                let totalDays = CGFloat(daysInMonth)
-                let spacing: CGFloat = 1
-                let barWidth = max(2, (geo.size.width - spacing * (totalDays - 1)) / totalDays)
-                let ch = geo.size.height
-
-                ZStack(alignment: .topLeading) {
-                    HStack(alignment: .bottom, spacing: spacing) {
-                        ForEach(1...daysInMonth, id: \.self) { day in
-                            barView(day: day, barWidth: barWidth, chartHeight: ch)
-                        }
-                    }
-                    if avgSeconds > 0 {
-                        let y = ch * (1 - CGFloat(avgSeconds) / CGFloat(maxSeconds))
-                        Path { p in
-                            p.move(to: CGPoint(x: 0, y: y))
-                            p.addLine(to: CGPoint(x: geo.size.width, y: y))
-                        }
-                        .stroke(Color.secondary.opacity(0.5),
-                                style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                    }
+        VStack(alignment: .leading, spacing: 6) {
+            summaryHeader
+            hoverStrip
+            weekdayHeader
+            VStack(spacing: 2) {
+                ForEach(Array(weeks.enumerated()), id: \.offset) { _, dayKeys in
+                    weekRow(dayKeys: dayKeys)
                 }
             }
-            .frame(height: chartHeight)
-
-            // X-axis labels (same layout math as DailyChart)
-            GeometryReader { geo in
-                let totalDays = CGFloat(daysInMonth)
-                let spacing: CGFloat = 1
-                let barWidth = (geo.size.width - spacing * (totalDays - 1)) / totalDays
-                let step = barWidth + spacing
-
-                ZStack(alignment: .leading) {
-                    ForEach(Array(labelDays.sorted()), id: \.self) { day in
-                        Text("\(day)")
-                            .font(.system(size: 8))
-                            .foregroundColor(.secondary.opacity(0.7))
-                            .position(
-                                x: step * CGFloat(day - 1) + barWidth / 2,
-                                y: 5
-                            )
-                    }
-                }
-            }
-            .frame(height: 12)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, 10)
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color.primary.opacity(0.03))
         )
     }
 
-    @ViewBuilder
-    private func barView(day: Int, barWidth: CGFloat, chartHeight: CGFloat) -> some View {
-        let seconds = dayTotals[day] ?? 0
-        let isToday = day == todayDay
-        VStack(spacing: 0) {
-            Spacer(minLength: 0)
-            if seconds > 0 {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(isToday ? Brand.orange : Brand.orange.opacity(0.8))
-                    .frame(width: barWidth,
-                           height: max(2, CGFloat(seconds) / CGFloat(maxSeconds) * chartHeight))
-                    .overlay(
-                        // Today is always outlined; hover adds the same stroke
-                        // to any bar (DailyChart's hover-stroke idiom).
-                        (isToday || hoveredDay == day)
-                            ? RoundedRectangle(cornerRadius: 2)
-                                .stroke(Color.primary.opacity(0.3), lineWidth: 1)
-                            : nil
-                    )
-            } else {
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(Color.primary.opacity(0.04))
-                    .frame(width: barWidth, height: 1)
+    // Header summary: month total / daily avg (active days) / longest session.
+    private var summaryHeader: some View {
+        HStack(spacing: 18) {
+            stat(loc("timeMonthTotal"), TimeLogic.formatDurationShort(monthTotal))
+            stat(loc("timeDailyAvg"),
+                 TimeLogic.formatDurationShort(activeDays > 0 ? monthTotal / activeDays : 0))
+            stat(loc("timeLongest"), TimeLogic.formatDurationShort(
+                TimeLogic.longestIntervalSeconds(in: timeData.days, dayKeys: monthDayKeys)))
+            Spacer()
+        }
+    }
+
+    private func stat(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label)
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundColor(.primary)
+        }
+    }
+
+    // Fixed-height hover readout (the week view's idiom): interval date +
+    // start–end + duration, no layout shift on hover.
+    private var hoverStrip: some View {
+        HStack(spacing: 4) {
+            if let h = hovered {
+                Text(shortDate(h.dayKey))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.primary.opacity(0.8))
+                Text("\(TimeLogic.formatClock(h.interval.startSec))–\(TimeLogic.formatClock(h.interval.endSec))")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundColor(.primary)
+                Text(TimeLogic.formatDurationShort(h.interval.durationSeconds))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+        .frame(height: 12)
+    }
+
+    /// "M/d" from a day key — same compact style as the week view.
+    private func shortDate(_ dayKey: String) -> String {
+        guard let date = TimeLogic.date(fromDayKey: dayKey) else { return dayKey }
+        let cal = AppDate.gregorian
+        return "\(cal.component(.month, from: date))/\(cal.component(.day, from: date))"
+    }
+
+    /// Localized Mon-first column headers, centered over each day column.
+    private var weekdayHeader: some View {
+        let symbols = mondayFirstWeekdaySymbols(loc)
+        return HStack(spacing: 6) {
+            Color.clear.frame(width: labelWidth, height: 1)
+            GeometryReader { geo in
+                let dayW = geo.size.width / 7
+                ZStack(alignment: .leading) {
+                    ForEach(0..<7, id: \.self) { i in
+                        Text(symbols[i])
+                            .font(.system(size: 8))
+                            .foregroundColor(.secondary.opacity(0.7))
+                            .position(x: dayW * (CGFloat(i) + 0.5), y: 5)
+                    }
+                }
+            }
+            .frame(height: 10)
+            Color.clear.frame(width: totalWidth, height: 1)
+        }
+    }
+
+    private func weekRow(dayKeys: [String]) -> some View {
+        let inMonthKeys = dayKeys.filter { $0.hasPrefix(monthPrefix) }
+        let total = TimeLogic.totalSeconds(in: timeData.days, dayKeys: inMonthKeys)
+        return HStack(spacing: 6) {
+            Text(shortDate(dayKeys.first ?? ""))
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
+                .frame(width: labelWidth, alignment: .leading)
+            timeline(dayKeys: dayKeys)
+                .frame(height: rowHeight)
+            Text(TimeLogic.formatDurationShort(total))
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundColor(total > 0 ? .primary : .secondary.opacity(0.6))
+                .frame(width: totalWidth, alignment: .trailing)
+        }
+        .padding(.vertical, 1)
+    }
+
+    // Mon 00:00 → Sun 24:00 timeline: day-boundary gridlines, dimmed
+    // out-of-month cells, today's cell highlighted, one capsule per interval.
+    private func timeline(dayKeys: [String]) -> some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let dayW = w / 7
+            ZStack(alignment: .leading) {
+                ForEach(Array(dayKeys.enumerated()), id: \.offset) { i, key in
+                    if !key.hasPrefix(monthPrefix) {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.primary.opacity(0.025))
+                            .frame(width: max(0, dayW - 2), height: rowHeight - 2)
+                            .offset(x: dayW * CGFloat(i) + 1)
+                    } else if key == todayKey {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.primary.opacity(0.045))
+                            .frame(width: max(0, dayW - 2), height: rowHeight - 2)
+                            .offset(x: dayW * CGFloat(i) + 1)
+                    }
+                }
+                ForEach(0...7, id: \.self) { i in
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.07))
+                        .frame(width: 1)
+                        .offset(x: min(w - 1, dayW * CGFloat(i)))
+                }
+                ForEach(Array(dayKeys.enumerated()), id: \.offset) { i, key in
+                    if key.hasPrefix(monthPrefix), let day = timeData.days[key] {
+                        ForEach(Array(day.intervals.enumerated()), id: \.offset) { _, interval in
+                            intervalCapsule(interval, dayKey: key, dayIndex: i, dayWidth: dayW)
+                        }
+                    }
+                }
             }
         }
-        .frame(width: barWidth)
-        .contentShape(Rectangle())
-        .onHover { h in hoveredDay = h ? day : nil }
+    }
+
+    private func intervalCapsule(_ interval: ActiveInterval, dayKey: String,
+                                 dayIndex: Int, dayWidth: CGFloat) -> some View {
+        // Week-view min-width padding scaled to a 1/7-width day cell: 2 min of
+        // one day is sub-point here, so the 1.5pt floor carries the hover
+        // hit-target.
+        let capWidth = max(1.5, dayWidth * CGFloat(max(interval.durationSeconds, 120)) / 86400.0)
+        let x = dayWidth * CGFloat(dayIndex)
+            + min(max(0, dayWidth * CGFloat(interval.startSec) / 86400.0), dayWidth - capWidth)
+        return Capsule()
+            .fill(Brand.orange.opacity(0.85))
+            .frame(width: capWidth, height: 8)
+            .offset(x: x)
+            .onHover { h in
+                hovered = h ? HoveredInterval(dayKey: dayKey, interval: interval) : nil
+            }
     }
 }
 
