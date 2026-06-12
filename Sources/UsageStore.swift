@@ -50,6 +50,12 @@ class UsageStore: ObservableObject {
     }
     // Year shown by the Year sub-view (own ◀▶ nav, independent of month nav).
     @Published var viewingTimeYear: Int
+    // Week sub-view selection: the Monday of the selected week, nil = "use the
+    // default rule" (viewing the current month → the week containing today;
+    // any other month → that month's first week). Month navigation resets it
+    // to nil; ⌘R / refresh leaves it alone. Stored as nil-means-default so day
+    // rollover self-corrects instead of freezing a stale computed default.
+    @Published var selectedWeekMonday: Date?
     // Visible year's per-day totals ("yyyy-MM-dd" → seconds). nil = loading,
     // empty dict = fetch failed (retry via nav / ⌘R; failures aren't cached).
     @Published var yearTimeDays: [String: Int]?
@@ -214,6 +220,10 @@ class UsageStore: ObservableObject {
         let cal = AppDate.gregorian
         viewingYear = cal.component(.year, from: date)
         viewingMonth = cal.component(.month, from: date)
+
+        // Changing months invalidates the Week sub-view's selection: back to
+        // the default rule for the newly viewed month.
+        selectedWeekMonday = nil
 
         // Invalidate any in-flight scan's view update — it was for the old month.
         fetchGeneration += 1
@@ -587,6 +597,27 @@ class UsageStore: ObservableObject {
     /// ◀▶ year navigation for the Year sub-view.
     func navigateTimeYear(offset: Int) {
         loadYearTime(viewingTimeYear + offset)
+    }
+
+    // MARK: - Week sub-view navigation
+
+    /// The Monday the Week sub-view shows right now: the explicit selection if
+    /// any, else the default rule for the viewed month (current month → the
+    /// week containing today; other months → the month's first week).
+    var resolvedWeekMonday: Date? {
+        selectedWeekMonday ?? TimeLogic.defaultWeekMonday(
+            year: viewingYear, month: viewingMonth, today: Date())
+    }
+
+    /// ◀▶ week navigation among the Monday-aligned weeks overlapping the
+    /// viewed month, clamped to that list — cross-month jumps are not a thing
+    /// here, months change via the top month navigator (which resets the
+    /// selection). A stale/absent selection falls back to the first week.
+    func navigateTimeWeek(offset: Int) {
+        let weeks = TimeLogic.weeksOfMonth(year: viewingYear, month: viewingMonth)
+        guard !weeks.isEmpty else { return }
+        let current = resolvedWeekMonday.flatMap { TimeLogic.weekIndex(of: $0, in: weeks) } ?? 0
+        selectedWeekMonday = weeks[min(max(current + offset, 0), weeks.count - 1)]
     }
 
     // MARK: - Script execution

@@ -53,6 +53,53 @@ enum TimeLogic {
         }
     }
 
+    // MARK: Weeks of a month (Monday-aligned)
+
+    /// Local-midnight Mondays of every Monday-aligned week OVERLAPPING the
+    /// given month — the shared week list behind the Month chart's rows and
+    /// the Week view's ◀▶ navigation. The first entry is the Monday on or
+    /// before day 1 (may live in the previous month); the last entry's week
+    /// contains the month's final day (may reach into the next month / year).
+    /// Empty only on calendar arithmetic failure.
+    static func weeksOfMonth(year: Int, month: Int) -> [Date] {
+        let cal = AppDate.gregorian
+        var comps = DateComponents()
+        comps.year = year
+        comps.month = month
+        comps.day = 1
+        guard let first = cal.date(from: comps),
+              let nextMonth = cal.date(byAdding: .month, value: 1, to: first),
+              var monday = AppDate.mondayOfWeek(containing: first) else { return [] }
+        var mondays: [Date] = []
+        while monday < nextMonth {
+            mondays.append(monday)
+            guard let next = cal.date(byAdding: .day, value: 7, to: monday) else { break }
+            monday = next
+        }
+        return mondays
+    }
+
+    /// Default selected week for the Week view when the user hasn't navigated:
+    /// viewing the month containing `today` → the week containing today; any
+    /// other month → the month's FIRST week (the Monday-aligned week holding
+    /// day 1). nil only on calendar arithmetic failure.
+    static func defaultWeekMonday(year: Int, month: Int, today: Date) -> Date? {
+        let cal = AppDate.gregorian
+        if cal.component(.year, from: today) == year,
+           cal.component(.month, from: today) == month {
+            return AppDate.mondayOfWeek(containing: today)
+        }
+        return weeksOfMonth(year: year, month: month).first
+    }
+
+    /// Index of `monday`'s week within `weeks`, matched by day key — Date
+    /// equality is too strict across separately derived values (a stored
+    /// selection vs a freshly computed week list). nil when absent.
+    static func weekIndex(of monday: Date, in weeks: [Date]) -> Int? {
+        let key = AppDate.dayKey(monday)
+        return weeks.firstIndex { AppDate.dayKey($0) == key }
+    }
+
     // MARK: Week summary helpers
 
     /// Sum of totalSeconds over the given day keys (missing days count 0).
