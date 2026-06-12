@@ -156,10 +156,6 @@ class UsageStore: ObservableObject {
         }
     }
 
-    func loc(_ key: String) -> String {
-        i18n[language]?[key] ?? i18n[.en]?[key] ?? key
-    }
-
     func setLanguage(_ lang: AppLanguage) {
         language = lang
         UserDefaults.standard.set(lang.rawValue, forKey: "appLanguage")
@@ -337,7 +333,7 @@ class UsageStore: ObservableObject {
                     // week — never accept a smaller value (failed/partial scan
                     // falls back to the month-derived week, same as before).
                     let range = "\(weekStartKey!):\(AppDate.dayKey(now))"
-                    if let json = self.scriptClient.runScript(["--json", "--range", range]),
+                    if let json = self.scriptClient.runScript(["--json", "--no-sessions", "--range", range]),
                        let crossWeek = UsageParser.parsePeriod(json),
                        crossWeek.cost >= w.cost {
                         w = crossWeek
@@ -468,14 +464,14 @@ class UsageStore: ObservableObject {
     // items only — the queue/coalescing/generation logic above is unchanged.
 
     private func fetchPeriod(_ range: String) -> PeriodUsage? {
-        guard let json = scriptClient.runScript(["--json", "--range", range]) else { return nil }
+        guard let json = scriptClient.runScript(["--json", "--no-sessions", "--range", range]) else { return nil }
         return UsageParser.parsePeriod(json)
     }
 
     /// Fetch month data with daily breakdown from a single script call
     /// yearMonth: "YYYY-MM" string for filtering daily data (e.g. "2026-04")
     private func fetchMonthData(_ range: String, yearMonth: String) -> (PeriodUsage?, [DailyUsage]?) {
-        guard let json = scriptClient.runScript(["--json", "--range", range]) else { return (nil, nil) }
+        guard let json = scriptClient.runScript(["--json", "--no-sessions", "--range", range]) else { return (nil, nil) }
         let period = UsageParser.parsePeriod(json)
         let daily = UsageParser.parseDailyBreakdown(json, yearMonth: yearMonth)
         return (period, daily)

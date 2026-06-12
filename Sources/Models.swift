@@ -62,7 +62,7 @@ enum DisplayTab: Int, CaseIterable {
         case .subscription: return "gauge.with.dots.needle.67percent"
         }
     }
-    func label(_ loc: (String) -> String) -> String {
+    func label(_ loc: Localizer) -> String {
         switch self {
         case .cost:         return loc("cost")
         case .tokens:       return loc("tokens")
