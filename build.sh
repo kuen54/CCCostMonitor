@@ -44,7 +44,7 @@ echo "  ✅ Compiled (universal: arm64 + x86_64)"
 
 # ── Step 1.5: Generate app icon ──
 echo "  [1.5/4] Generating app icon..."
-swiftc "$SCRIPT_DIR/generate_icon.swift" \
+swiftc "$SCRIPT_DIR/generate_icon.swift" "$SCRIPT_DIR/Sources/ClaudeLogo.swift" \
     -framework Cocoa -framework ImageIO \
     -o "$BUILD_DIR/generate_icon"
 # Icon generator only runs once at build time on the build machine — host arch

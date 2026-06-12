@@ -27,6 +27,18 @@ enum AppLanguage: String, CaseIterable, Codable {
     }
 }
 
+/// Value-type localizer. Captures the active language so the value is Equatable —
+/// injected through the SwiftUI environment, a language switch produces a different
+/// value and SwiftUI re-renders every view that reads it. Resolution order matches
+/// the store's lookup exactly: active language → English → raw key.
+struct Localizer: Equatable {
+    var language: AppLanguage
+
+    func callAsFunction(_ key: String) -> String {
+        i18n[language]?[key] ?? i18n[.en]?[key] ?? key
+    }
+}
+
 let i18n: [AppLanguage: [String: String]] = [
     .en: [
         "tkIn":         "in",

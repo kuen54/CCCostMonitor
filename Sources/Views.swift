@@ -28,176 +28,32 @@ extension ModelUsage {
     }
 }
 
+// MARK: - Localizer environment
+//
+// Injected once at the root (PopoverView) from the store's @Published language;
+// every subview reads it via @Environment(\.localizer). Localizer is Equatable
+// (wraps the language), so a language switch produces a new environment value and
+// SwiftUI re-renders all readers. The default is the system-detected language —
+// the same default the app uses on first launch — so there is no silent-English
+// path even if a view were ever hosted without the injection.
+private struct LocalizerKey: EnvironmentKey {
+    static let defaultValue = Localizer(language: AppLanguage.fromSystem())
+}
+
+extension EnvironmentValues {
+    var localizer: Localizer {
+        get { self[LocalizerKey.self] }
+        set { self[LocalizerKey.self] = newValue }
+    }
+}
+
 // MARK: - SwiftUI Views
 
 // ── Claude logo as SwiftUI Shape ──
 struct ClaudeLogoShape: Shape {
     func path(in rect: CGRect) -> SwiftUI.Path {
-        let s = min(rect.width, rect.height) / 24.0
-        var p = SwiftUI.Path()
-        // Official Claude logo SVG path (SimpleIcons, CC0)
-        p.move(to: CGPoint(x: 4.7144*s, y: 15.9555*s))
-        p.addLine(to: CGPoint(x: 9.4318*s, y: 13.3084*s))
-        p.addLine(to: CGPoint(x: 9.5108*s, y: 13.0777*s))
-        p.addLine(to: CGPoint(x: 9.4318*s, y: 12.9502*s))
-        p.addLine(to: CGPoint(x: 9.2011*s, y: 12.9502*s))
-        p.addLine(to: CGPoint(x: 8.4118*s, y: 12.9016*s))
-        p.addLine(to: CGPoint(x: 5.7162*s, y: 12.8287*s))
-        p.addLine(to: CGPoint(x: 3.3787*s, y: 12.7316*s))
-        p.addLine(to: CGPoint(x: 1.1141*s, y: 12.6102*s))
-        p.addLine(to: CGPoint(x: 0.5434*s, y: 12.4887*s))
-        p.addLine(to: CGPoint(x: 0.0091*s, y: 11.7845*s))
-        p.addLine(to: CGPoint(x: 0.0637*s, y: 11.4323*s))
-        p.addLine(to: CGPoint(x: 0.5434*s, y: 11.1105*s))
-        p.addLine(to: CGPoint(x: 1.2294*s, y: 11.1713*s))
-        p.addLine(to: CGPoint(x: 2.7473*s, y: 11.2745*s))
-        p.addLine(to: CGPoint(x: 5.0240*s, y: 11.4323*s))
-        p.addLine(to: CGPoint(x: 6.6754*s, y: 11.5295*s))
-        p.addLine(to: CGPoint(x: 9.1222*s, y: 11.7845*s))
-        p.addLine(to: CGPoint(x: 9.5108*s, y: 11.7845*s))
-        p.addLine(to: CGPoint(x: 9.5654*s, y: 11.6266*s))
-        p.addLine(to: CGPoint(x: 9.4318*s, y: 11.5295*s))
-        p.addLine(to: CGPoint(x: 9.3286*s, y: 11.4323*s))
-        p.addLine(to: CGPoint(x: 6.9730*s, y: 9.8356*s))
-        p.addLine(to: CGPoint(x: 4.4230*s, y: 8.1477*s))
-        p.addLine(to: CGPoint(x: 3.0874*s, y: 7.1763*s))
-        p.addLine(to: CGPoint(x: 2.3649*s, y: 6.6845*s))
-        p.addLine(to: CGPoint(x: 2.0006*s, y: 6.2231*s))
-        p.addLine(to: CGPoint(x: 1.8428*s, y: 5.2153*s))
-        p.addLine(to: CGPoint(x: 2.4985*s, y: 4.4928*s))
-        p.addLine(to: CGPoint(x: 3.3788*s, y: 4.5535*s))
-        p.addLine(to: CGPoint(x: 3.6034*s, y: 4.6142*s))
-        p.addLine(to: CGPoint(x: 4.4959*s, y: 5.3002*s))
-        p.addLine(to: CGPoint(x: 6.4023*s, y: 6.7756*s))
-        p.addLine(to: CGPoint(x: 8.8916*s, y: 8.6092*s))
-        p.addLine(to: CGPoint(x: 9.2559*s, y: 8.9127*s))
-        p.addLine(to: CGPoint(x: 9.4016*s, y: 8.8095*s))
-        p.addLine(to: CGPoint(x: 9.4198*s, y: 8.7367*s))
-        p.addLine(to: CGPoint(x: 9.2558*s, y: 8.4634*s))
-        p.addLine(to: CGPoint(x: 7.9019*s, y: 6.0167*s))
-        p.addLine(to: CGPoint(x: 6.4569*s, y: 3.5274*s))
-        p.addLine(to: CGPoint(x: 5.8134*s, y: 2.4954*s))
-        p.addLine(to: CGPoint(x: 5.6434*s, y: 1.8760*s))
-        p.addCurve(to: CGPoint(x: 5.5402*s, y: 1.1475*s),
-                   control1: CGPoint(x: 5.5827*s, y: 1.6210*s),
-                   control2: CGPoint(x: 5.5402*s, y: 1.4086*s))
-        p.addLine(to: CGPoint(x: 6.2870*s, y: 0.1335*s))
-        p.addLine(to: CGPoint(x: 6.6997*s, y: 0.0*s))
-        p.addLine(to: CGPoint(x: 7.6954*s, y: 0.1336*s))
-        p.addLine(to: CGPoint(x: 8.1144*s, y: 0.4978*s))
-        p.addLine(to: CGPoint(x: 8.7336*s, y: 1.9125*s))
-        p.addLine(to: CGPoint(x: 9.7354*s, y: 4.1407*s))
-        p.addLine(to: CGPoint(x: 11.2897*s, y: 7.1703*s))
-        p.addLine(to: CGPoint(x: 11.7450*s, y: 8.0688*s))
-        p.addLine(to: CGPoint(x: 11.9879*s, y: 8.9006*s))
-        p.addLine(to: CGPoint(x: 12.0789*s, y: 9.1556*s))
-        p.addLine(to: CGPoint(x: 12.2368*s, y: 9.1556*s))
-        p.addLine(to: CGPoint(x: 12.2368*s, y: 9.0099*s))
-        p.addLine(to: CGPoint(x: 12.3643*s, y: 7.3039*s))
-        p.addLine(to: CGPoint(x: 12.6011*s, y: 5.2092*s))
-        p.addLine(to: CGPoint(x: 12.8318*s, y: 2.5135*s))
-        p.addLine(to: CGPoint(x: 12.9107*s, y: 1.7546*s))
-        p.addLine(to: CGPoint(x: 13.2871*s, y: 0.8439*s))
-        p.addLine(to: CGPoint(x: 14.0339*s, y: 0.3521*s))
-        p.addLine(to: CGPoint(x: 14.6167*s, y: 0.6314*s))
-        p.addLine(to: CGPoint(x: 15.0964*s, y: 1.3174*s))
-        p.addLine(to: CGPoint(x: 15.0296*s, y: 1.7607*s))
-        p.addLine(to: CGPoint(x: 14.7443*s, y: 3.6124*s))
-        p.addLine(to: CGPoint(x: 14.1857*s, y: 6.5145*s))
-        p.addLine(to: CGPoint(x: 13.8214*s, y: 8.4574*s))
-        p.addLine(to: CGPoint(x: 14.0339*s, y: 8.4574*s))
-        p.addLine(to: CGPoint(x: 14.2768*s, y: 8.2145*s))
-        p.addLine(to: CGPoint(x: 15.2603*s, y: 6.9092*s))
-        p.addLine(to: CGPoint(x: 16.9117*s, y: 4.8449*s))
-        p.addLine(to: CGPoint(x: 17.6403*s, y: 4.0253*s))
-        p.addLine(to: CGPoint(x: 18.4903*s, y: 3.1207*s))
-        p.addLine(to: CGPoint(x: 19.0367*s, y: 2.6896*s))
-        p.addLine(to: CGPoint(x: 20.0688*s, y: 2.6896*s))
-        p.addLine(to: CGPoint(x: 20.8278*s, y: 3.8189*s))
-        p.addLine(to: CGPoint(x: 20.4878*s, y: 4.9846*s))
-        p.addLine(to: CGPoint(x: 19.4253*s, y: 6.3324*s))
-        p.addLine(to: CGPoint(x: 18.5449*s, y: 7.4738*s))
-        p.addLine(to: CGPoint(x: 17.2821*s, y: 9.1738*s))
-        p.addLine(to: CGPoint(x: 16.4928*s, y: 10.5338*s))
-        p.addLine(to: CGPoint(x: 16.5657*s, y: 10.6431*s))
-        p.addLine(to: CGPoint(x: 16.7539*s, y: 10.6248*s))
-        p.addLine(to: CGPoint(x: 19.6074*s, y: 10.0178*s))
-        p.addLine(to: CGPoint(x: 21.1495*s, y: 9.7384*s))
-        p.addLine(to: CGPoint(x: 22.9891*s, y: 9.4227*s))
-        p.addLine(to: CGPoint(x: 23.8209*s, y: 9.8113*s))
-        p.addLine(to: CGPoint(x: 23.9119*s, y: 10.2059*s))
-        p.addLine(to: CGPoint(x: 23.5841*s, y: 11.0134*s))
-        p.addLine(to: CGPoint(x: 21.6171*s, y: 11.4991*s))
-        p.addLine(to: CGPoint(x: 19.3099*s, y: 11.9605*s))
-        p.addLine(to: CGPoint(x: 15.8735*s, y: 12.7741*s))
-        p.addLine(to: CGPoint(x: 15.8310*s, y: 12.8045*s))
-        p.addLine(to: CGPoint(x: 15.8796*s, y: 12.8652*s))
-        p.addLine(to: CGPoint(x: 17.4278*s, y: 13.0109*s))
-        p.addLine(to: CGPoint(x: 18.0896*s, y: 13.0473*s))
-        p.addLine(to: CGPoint(x: 19.7106*s, y: 13.0473*s))
-        p.addLine(to: CGPoint(x: 22.7281*s, y: 13.2720*s))
-        p.addLine(to: CGPoint(x: 23.5173*s, y: 13.7940*s))
-        p.addLine(to: CGPoint(x: 23.9909*s, y: 14.4316*s))
-        p.addLine(to: CGPoint(x: 23.9119*s, y: 14.9173*s))
-        p.addLine(to: CGPoint(x: 22.6977*s, y: 15.5366*s))
-        p.addLine(to: CGPoint(x: 21.0584*s, y: 15.1480*s))
-        p.addLine(to: CGPoint(x: 17.2334*s, y: 14.2373*s))
-        p.addLine(to: CGPoint(x: 15.9221*s, y: 13.9094*s))
-        p.addLine(to: CGPoint(x: 15.7399*s, y: 13.9094*s))
-        p.addLine(to: CGPoint(x: 15.7399*s, y: 14.0187*s))
-        p.addLine(to: CGPoint(x: 16.8328*s, y: 15.0873*s))
-        p.addLine(to: CGPoint(x: 18.8363*s, y: 16.8965*s))
-        p.addLine(to: CGPoint(x: 21.3438*s, y: 19.2279*s))
-        p.addLine(to: CGPoint(x: 21.4713*s, y: 19.8047*s))
-        p.addLine(to: CGPoint(x: 21.1495*s, y: 20.2601*s))
-        p.addLine(to: CGPoint(x: 20.8095*s, y: 20.2115*s))
-        p.addLine(to: CGPoint(x: 18.6056*s, y: 18.5540*s))
-        p.addLine(to: CGPoint(x: 17.7556*s, y: 17.8072*s))
-        p.addLine(to: CGPoint(x: 15.8310*s, y: 16.1862*s))
-        p.addLine(to: CGPoint(x: 15.7035*s, y: 16.1862*s))
-        p.addLine(to: CGPoint(x: 15.7035*s, y: 16.3562*s))
-        p.addLine(to: CGPoint(x: 16.1467*s, y: 17.0058*s))
-        p.addLine(to: CGPoint(x: 18.4903*s, y: 20.5272*s))
-        p.addLine(to: CGPoint(x: 18.6117*s, y: 21.6079*s))
-        p.addLine(to: CGPoint(x: 18.4417*s, y: 21.9600*s))
-        p.addLine(to: CGPoint(x: 17.8346*s, y: 22.1725*s))
-        p.addLine(to: CGPoint(x: 17.1667*s, y: 22.0511*s))
-        p.addLine(to: CGPoint(x: 15.7946*s, y: 20.1265*s))
-        p.addLine(to: CGPoint(x: 14.3800*s, y: 17.9590*s))
-        p.addLine(to: CGPoint(x: 13.2386*s, y: 16.0162*s))
-        p.addLine(to: CGPoint(x: 13.0989*s, y: 16.0952*s))
-        p.addLine(to: CGPoint(x: 12.4249*s, y: 23.3504*s))
-        p.addLine(to: CGPoint(x: 12.1093*s, y: 23.7207*s))
-        p.addLine(to: CGPoint(x: 11.3807*s, y: 24.0000*s))
-        p.addLine(to: CGPoint(x: 10.7736*s, y: 23.5386*s))
-        p.addLine(to: CGPoint(x: 10.4518*s, y: 22.7918*s))
-        p.addLine(to: CGPoint(x: 10.7736*s, y: 21.3165*s))
-        p.addLine(to: CGPoint(x: 11.1622*s, y: 19.3919*s))
-        p.addLine(to: CGPoint(x: 11.4779*s, y: 17.8619*s))
-        p.addLine(to: CGPoint(x: 11.7632*s, y: 15.9615*s))
-        p.addLine(to: CGPoint(x: 11.9332*s, y: 15.3301*s))
-        p.addLine(to: CGPoint(x: 11.9211*s, y: 15.2876*s))
-        p.addLine(to: CGPoint(x: 11.7814*s, y: 15.3058*s))
-        p.addLine(to: CGPoint(x: 10.3486*s, y: 17.2730*s))
-        p.addLine(to: CGPoint(x: 8.1690*s, y: 20.2176*s))
-        p.addLine(to: CGPoint(x: 6.4447*s, y: 22.0632*s))
-        p.addLine(to: CGPoint(x: 6.0319*s, y: 22.2272*s))
-        p.addLine(to: CGPoint(x: 5.3155*s, y: 21.8568*s))
-        p.addLine(to: CGPoint(x: 5.3822*s, y: 21.1950*s))
-        p.addLine(to: CGPoint(x: 5.7830*s, y: 20.6061*s))
-        p.addLine(to: CGPoint(x: 8.1690*s, y: 17.5704*s))
-        p.addLine(to: CGPoint(x: 9.6079*s, y: 15.6884*s))
-        p.addLine(to: CGPoint(x: 10.5369*s, y: 14.6016*s))
-        p.addLine(to: CGPoint(x: 10.5307*s, y: 14.4437*s))
-        p.addLine(to: CGPoint(x: 10.4761*s, y: 14.4437*s))
-        p.addLine(to: CGPoint(x: 4.1376*s, y: 18.5601*s))
-        p.addLine(to: CGPoint(x: 3.0083*s, y: 18.7058*s))
-        p.addLine(to: CGPoint(x: 2.5226*s, y: 18.2504*s))
-        p.addLine(to: CGPoint(x: 2.5834*s, y: 17.5037*s))
-        p.addLine(to: CGPoint(x: 2.8141*s, y: 17.2608*s))
-        p.addLine(to: CGPoint(x: 4.7205*s, y: 15.9494*s))
-        p.closeSubpath()
-        return p
+        // Official Claude logo SVG path (SimpleIcons, CC0) — data in ClaudeLogo.swift
+        ClaudeLogo.swiftUIPath(scale: min(rect.width, rect.height) / 24.0)
     }
 }
 
@@ -253,7 +109,7 @@ struct TokenBar: View {
 // ── Token type proportion bar (in / out / cache_r / cache_w) ──
 struct TokenTypeBar: View {
     let usage: PeriodUsage
-    var loc: ((String) -> String)? = nil
+    @Environment(\.localizer) private var loc
 
     // in/out use saturated teal & coral; cache_read/cache_write use desaturated tints of same hues
     static let typeEntries: [(String, Color, KeyPath<PeriodUsage, Int>)] = [
@@ -264,7 +120,6 @@ struct TokenTypeBar: View {
     ]
 
     var body: some View {
-        let l = loc ?? { i18n[.en]?[$0] ?? $0 }
         VStack(alignment: .leading, spacing: 4) {
             ProportionBar(segments: Self.typeEntries.map { (_, color, kp) in
                 let val = usage[keyPath: kp]
@@ -278,7 +133,7 @@ struct TokenTypeBar: View {
                     let (key, color, kp) = item
                     HStack(spacing: 3) {
                         Circle().fill(color).frame(width: 5, height: 5)
-                        Text(l(key))
+                        Text(loc(key))
                             .font(.system(size: 9))
                             .foregroundColor(color.opacity(0.9))
                         Text(formatTokensShort(usage[keyPath: kp]))
@@ -297,7 +152,7 @@ struct DailyChart: View {
     let mode: DisplayTab
     let year: Int
     let month: Int
-    let loc: (String) -> String
+    @Environment(\.localizer) private var loc
 
     @State private var hoveredDay: Int? = nil
 
@@ -505,10 +360,9 @@ struct ModelRow: View {
 // ── Single model row (tokens) ──
 struct TokenModelRow: View {
     let model: ModelUsage
-    var loc: ((String) -> String)? = nil
+    @Environment(\.localizer) private var loc
 
     var body: some View {
-        let l = loc ?? { i18n[.en]?[$0] ?? $0 }
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Circle()
@@ -524,10 +378,10 @@ struct TokenModelRow: View {
             }
             // Token breakdown sub-row
             HStack(spacing: 8) {
-                TokenChip(label: l("tkIn"), value: model.inputTokens, color: TokenTypeBar.typeEntries[0].1)
-                TokenChip(label: l("tkOut"), value: model.outputTokens, color: TokenTypeBar.typeEntries[1].1)
-                TokenChip(label: l("tkCR"), value: model.cacheRead, color: TokenTypeBar.typeEntries[2].1)
-                TokenChip(label: l("tkCW"), value: model.cacheWrite, color: TokenTypeBar.typeEntries[3].1)
+                TokenChip(label: loc("tkIn"), value: model.inputTokens, color: TokenTypeBar.typeEntries[0].1)
+                TokenChip(label: loc("tkOut"), value: model.outputTokens, color: TokenTypeBar.typeEntries[1].1)
+                TokenChip(label: loc("tkCR"), value: model.cacheRead, color: TokenTypeBar.typeEntries[2].1)
+                TokenChip(label: loc("tkCW"), value: model.cacheWrite, color: TokenTypeBar.typeEntries[3].1)
             }
             .padding(.leading, 14)
         }
@@ -552,17 +406,18 @@ struct TokenChip: View {
     }
 }
 
-// ── Period card ──
+// ── Period card (shared chrome for both metrics: cost and tokens) ──
 struct PeriodCard: View {
+    let metric: DisplayTab        // .cost or .tokens — picks the displayed metric
     let icon: String
     let title: String
     let usage: PeriodUsage
     var showStats: Bool = false
-    var loc: ((String) -> String)? = nil
+    @Environment(\.localizer) private var loc
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Header: icon + title + cost
+            // Header: icon + title + headline value (cost or total tokens)
             HStack(alignment: .firstTextBaseline) {
                 Image(systemName: icon)
                     .font(.system(size: 12, weight: .medium))
@@ -570,86 +425,51 @@ struct PeriodCard: View {
                 Text(title)
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                Text(formatCost(usage.cost))
+                Text(metric == .cost ? formatCost(usage.cost)
+                                     : formatTokensShort(usage.totalTokens))
                     .font(.system(size: 18, weight: .bold, design: .rounded))
                     .foregroundColor(.primary)
             }
 
-            // Cost proportion bar
-            if !usage.models.isEmpty {
-                CostBar(models: usage.models, total: usage.cost)
-                    .padding(.vertical, 2)
-            }
-
-            // Model breakdown
-            ForEach(usage.models.filter { $0.cost >= 0.005 }) { m in
-                ModelRow(model: m)
-            }
-
-            // Stats footer (month only)
-            if showStats {
-                HStack(spacing: 12) {
-                    Label("\(formatNumber(usage.totalMessages))", systemImage: "message")
-                    Label(formatTokens(usage.totalTokens, loc), systemImage: "number")
+            if metric == .cost {
+                // Cost proportion bar
+                if !usage.models.isEmpty {
+                    CostBar(models: usage.models, total: usage.cost)
+                        .padding(.vertical, 2)
                 }
-                .font(.system(size: 10.5))
-                .foregroundColor(.secondary)
-                .padding(.top, 2)
-            }
-        }
-        .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color.primary.opacity(0.04))
-        )
-    }
-}
 
-// ── Period card (tokens) ──
-struct TokenPeriodCard: View {
-    let icon: String
-    let title: String
-    let usage: PeriodUsage
-    var showStats: Bool = false
-    var loc: ((String) -> String)? = nil
+                // Model breakdown
+                ForEach(usage.models.filter { $0.cost >= 0.005 }) { m in
+                    ModelRow(model: m)
+                }
+            } else {
+                // Token type distribution bar (in / out / cache_r / cache_w)
+                if usage.totalTokens > 0 {
+                    TokenTypeBar(usage: usage)
+                        .padding(.vertical, 2)
+                }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Header: icon + title + total tokens
-            HStack(alignment: .firstTextBaseline) {
-                Image(systemName: icon)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.secondary)
-                Text(title)
-                    .font(.system(size: 13, weight: .semibold))
-                Spacer()
-                Text(formatTokensShort(usage.totalTokens))
-                    .font(.system(size: 18, weight: .bold, design: .rounded))
-                    .foregroundColor(.primary)
+                // Model proportion bar
+                if !usage.models.isEmpty {
+                    TokenBar(models: usage.models, total: usage.totalTokens)
+                        .padding(.bottom, 2)
+                }
+
+                // Model breakdown
+                ForEach(usage.models.filter { $0.totalTokens > 0 }) { m in
+                    TokenModelRow(model: m)
+                }
             }
 
-            // Token type distribution bar (in / out / cache_r / cache_w)
-            if usage.totalTokens > 0 {
-                TokenTypeBar(usage: usage, loc: loc)
-                    .padding(.vertical, 2)
-            }
-
-            // Model proportion bar
-            if !usage.models.isEmpty {
-                TokenBar(models: usage.models, total: usage.totalTokens)
-                    .padding(.bottom, 2)
-            }
-
-            // Model breakdown
-            ForEach(usage.models.filter { $0.totalTokens > 0 }) { m in
-                TokenModelRow(model: m, loc: loc)
-            }
-
-            // Stats footer (month only)
+            // Stats footer (month only) — shows the complementary metric
             if showStats {
                 HStack(spacing: 12) {
                     Label("\(formatNumber(usage.totalMessages))", systemImage: "message")
-                    Label(formatCost(usage.cost), systemImage: "dollarsign.circle")
+                    if metric == .cost {
+                        Label(formatTokens(usage.totalTokens, loc), systemImage: "number")
+                    } else {
+                        Label(formatCost(usage.cost), systemImage: "dollarsign.circle")
+                    }
                 }
                 .font(.system(size: 10.5))
                 .foregroundColor(.secondary)
@@ -719,7 +539,7 @@ struct SubWindowRow: View {
     let label: String
     let usedPercent: Int          // 0-100+ as reported by the API
     let resetAt: Date?
-    let loc: (String) -> String
+    @Environment(\.localizer) private var loc
 
     private var remaining: Int { max(0, 100 - usedPercent) }
     private var remainingFraction: CGFloat { max(0, min(1, CGFloat(remaining) / 100.0)) }
@@ -787,24 +607,24 @@ struct SubWindowRow: View {
 /// Code's own /status uses) rather than estimated from local logs.
 struct SubscriptionView: View {
     @ObservedObject var store: UsageStore
-    let loc: (String) -> String
+    @Environment(\.localizer) private var loc
 
     var body: some View {
         VStack(spacing: 8) {
             if let q = store.subscriptionQuota {
                 SubWindowRow(label: loc("sub5hLabel"),
                              usedPercent: q.five_hour.displayPercent,
-                             resetAt: q.fiveHourResetDate, loc: loc)
+                             resetAt: q.fiveHourResetDate)
                 SubWindowRow(label: loc("sub7dLabel"),
                              usedPercent: q.seven_day.displayPercent,
-                             resetAt: q.sevenDayResetDate, loc: loc)
+                             resetAt: q.sevenDayResetDate)
                 // Max plans expose a separate Sonnet 7-day cap. Show it only when the
                 // API actually returns a bucket with activity or a reset time.
                 if let sonnet = q.seven_day_sonnet,
                    sonnet.displayPercent > 0 || sonnet.resets_at != nil {
                     SubWindowRow(label: loc("sub7dSonnetLabel"),
                                  usedPercent: sonnet.displayPercent,
-                                 resetAt: q.sevenDaySonnetResetDate, loc: loc)
+                                 resetAt: q.sevenDaySonnetResetDate)
                 }
                 if q.extra_usage?.is_enabled == true {
                     HStack(spacing: 6) {
@@ -859,6 +679,11 @@ struct PopoverView: View {
     @ObservedObject var store: UsageStore
     let onQuit: () -> Void
 
+    /// Root of the localizer environment: derived from the store's @Published
+    /// language, so 🌐 switches re-evaluate this body, produce a new (Equatable)
+    /// Localizer, and the .environment injection re-renders every reader live.
+    private var loc: Localizer { Localizer(language: store.language) }
+
     /// Measured height of the content section (cards + chart). Drives the scroll
     /// area's frame so the popover hugs its content when short and caps when tall.
     @State private var contentHeight: CGFloat = 0
@@ -894,7 +719,7 @@ struct PopoverView: View {
                     ClaudeLogoShape()
                         .fill(Color(red: 0.851, green: 0.467, blue: 0.341))
                         .frame(width: 14, height: 14)
-                    Text(store.loc("title"))
+                    Text(loc("title"))
                         .font(.system(size: 13, weight: .bold))
                         .foregroundColor(.primary)
                 }
@@ -945,7 +770,7 @@ struct PopoverView: View {
             // (Bedrock / Vertex / Console) have no 5h/weekly quota to display.
             Picker("", selection: $store.selectedTab) {
                 ForEach(visibleTabs, id: \.self) { tab in
-                    Label(tab.label(store.loc), systemImage: tab.icon).tag(tab)
+                    Label(tab.label(loc), systemImage: tab.icon).tag(tab)
                 }
             }
             .pickerStyle(.segmented)
@@ -976,32 +801,26 @@ struct PopoverView: View {
         // change when selectedTab flips, which ripples up and makes the month-nav row
         // jitter as the popover resizes. nil animation = instant swap, no resize wobble.
         .animation(nil, value: store.selectedTab)
+        // Single injection point: every subview resolves strings via
+        // @Environment(\.localizer) from here on down.
+        .environment(\.localizer, loc)
     }
 
     @ViewBuilder
     private var contentSection: some View {
             if store.selectedTab == .subscription {
-                SubscriptionView(store: store, loc: store.loc)
+                SubscriptionView(store: store)
             } else if store.isCurrentMonth {
                 if let today = store.today, let week = store.week, let month = store.month {
-                    VStack(spacing: 8) {
-                        if store.selectedTab == .cost {
-                            PeriodCard(icon: "calendar", title: store.loc("today"), usage: today)
-                            PeriodCard(icon: "calendar.badge.clock", title: store.loc("thisWeek"), usage: week)
-                            PeriodCard(icon: "chart.bar", title: store.loc("thisMonth"), usage: month, showStats: true, loc: store.loc)
-                        } else {
-                            TokenPeriodCard(icon: "calendar", title: store.loc("today"), usage: today, loc: store.loc)
-                            TokenPeriodCard(icon: "calendar.badge.clock", title: store.loc("thisWeek"), usage: week, loc: store.loc)
-                            TokenPeriodCard(icon: "chart.bar", title: store.loc("thisMonth"), usage: month, showStats: true, loc: store.loc)
-                        }
-                        if let daily = store.dailyBreakdown, !daily.isEmpty {
-                            DailyChart(data: daily, mode: store.selectedTab,
-                                       year: store.viewingYear, month: store.viewingMonth,
-                                       loc: store.loc)
-                        }
+                    cardsWithChart {
+                        PeriodCard(metric: store.selectedTab, icon: "calendar",
+                                   title: loc("today"), usage: today)
+                        PeriodCard(metric: store.selectedTab, icon: "calendar.badge.clock",
+                                   title: loc("thisWeek"), usage: week)
+                        PeriodCard(metric: store.selectedTab, icon: "chart.bar",
+                                   title: loc("thisMonth"), usage: month,
+                                   showStats: true)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 6)
                 } else if store.isLoading {
                     loadingView
                 } else {
@@ -1009,22 +828,11 @@ struct PopoverView: View {
                 }
             } else {
                 if let month = store.month {
-                    VStack(spacing: 8) {
-                        if store.selectedTab == .cost {
-                            PeriodCard(icon: "chart.bar", title: store.loc("monthlyTotal"),
-                                       usage: month, showStats: true, loc: store.loc)
-                        } else {
-                            TokenPeriodCard(icon: "chart.bar", title: store.loc("monthlyTotal"),
-                                            usage: month, showStats: true, loc: store.loc)
-                        }
-                        if let daily = store.dailyBreakdown, !daily.isEmpty {
-                            DailyChart(data: daily, mode: store.selectedTab,
-                                       year: store.viewingYear, month: store.viewingMonth,
-                                       loc: store.loc)
-                        }
+                    cardsWithChart {
+                        PeriodCard(metric: store.selectedTab, icon: "chart.bar",
+                                   title: loc("monthlyTotal"), usage: month,
+                                   showStats: true)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 6)
                 } else if store.isLoading {
                     loadingView
                 } else {
@@ -1033,16 +841,32 @@ struct PopoverView: View {
             }
     }
 
+    /// Shared layout for the current-month and historical-month branches: the
+    /// period cards (cost or tokens per the selected tab) followed by the daily
+    /// chart, with the section's paddings.
+    @ViewBuilder
+    private func cardsWithChart<Cards: View>(@ViewBuilder cards: () -> Cards) -> some View {
+        VStack(spacing: 8) {
+            cards()
+            if let daily = store.dailyBreakdown, !daily.isEmpty {
+                DailyChart(data: daily, mode: store.selectedTab,
+                           year: store.viewingYear, month: store.viewingMonth)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
     // ── Footer ──
     private var footer: some View {
         HStack(spacing: 12) {
                 if let time = store.lastUpdate, store.isCurrentMonth {
-                    Text(String(format: store.loc("updated"),
-                                timeAgo(time, store.loc)))
+                    Text(String(format: loc("updated"),
+                                timeAgo(time, loc)))
                         .font(.system(size: 10.5))
                         .foregroundColor(.secondary)
                 } else if !store.isCurrentMonth {
-                    Text(store.loc("cachedData"))
+                    Text(loc("cachedData"))
                         .font(.system(size: 10.5))
                         .foregroundColor(.secondary)
                 }
@@ -1058,7 +882,7 @@ struct PopoverView: View {
                         .font(.system(size: 11, weight: .medium))
                 }
                 .buttonStyle(.borderless)
-                .help(store.loc("refresh"))
+                .help(loc("refresh"))
                 .keyboardShortcut("r", modifiers: .command)
 
                 Button(action: onQuit) {
@@ -1067,7 +891,7 @@ struct PopoverView: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.borderless)
-                .help(store.loc("quit"))
+                .help(loc("quit"))
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -1076,7 +900,7 @@ struct PopoverView: View {
     private var loadingView: some View {
         VStack(spacing: 12) {
             ProgressView()
-            Text(store.loc("loading"))
+            Text(loc("loading"))
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
         }
@@ -1088,7 +912,7 @@ struct PopoverView: View {
             Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 24))
                 .foregroundColor(.orange)
-            Text(store.loc("loadFailed"))
+            Text(loc("loadFailed"))
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
         }
@@ -1100,7 +924,7 @@ struct PopoverView: View {
             Image(systemName: "tray")
                 .font(.system(size: 24))
                 .foregroundColor(.secondary)
-            Text(store.loc("noMonthData"))
+            Text(loc("noMonthData"))
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
         }

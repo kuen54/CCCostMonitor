@@ -12,9 +12,9 @@ Options:
     --range <spec>       Time range: today, week, month, YYYY-MM-DD, or YYYY-MM-DD:YYYY-MM-DD
     --project <keyword>  Filter sessions by project path keyword
     --by-project         Group results by project
-    --by-model           Group results by model
     --by-day             Group results by day
     --json               Output JSON instead of table
+    --no-sessions        With --json: omit the per-session array (smaller payload)
 """
 
 import json
@@ -387,21 +387,6 @@ def cost_for_message(usage: dict, model_str: str) -> float:
       + usage["output_tokens"] * p["output"]      / 1_000_000
       + cw_5m                  * p["cache_write"] / 1_000_000
       + cw_1h                  * cw_1h_price      / 1_000_000
-      + usage["cache_read"]    * p["cache_read"]  / 1_000_000
-    )
-
-
-def cost_for_usage(usage: dict, model_class: str) -> float:
-    """Backwards-compat helper: compute cost from class-level representative pricing.
-
-    Only used for legacy paths that don't have a per-message model_str. New code
-    should accumulate `usage["cost"]` during scan via cost_for_message.
-    """
-    p = MODEL_PRICING.get(model_class, MODEL_PRICING.get("sonnet", FALLBACK_PRICING["sonnet"]))
-    return (
-        usage["input_tokens"]  * p["input"]       / 1_000_000
-      + usage["output_tokens"] * p["output"]      / 1_000_000
-      + usage["cache_write"]   * p["cache_write"] / 1_000_000
       + usage["cache_read"]    * p["cache_read"]  / 1_000_000
     )
 
@@ -997,7 +982,8 @@ def print_by_day(sessions: dict, range_label: str):
     print(f"{'=' * 100}")
 
 
-def print_json(sessions: dict, subscription_quota: Optional[dict] = None):
+def print_json(sessions: dict, subscription_quota: Optional[dict] = None,
+               include_sessions: bool = True):
     """Output structured JSON."""
     result = {
         "script_version": __version__,
@@ -1010,6 +996,12 @@ def print_json(sessions: dict, subscription_quota: Optional[dict] = None):
     grand_by_model: dict[str, dict] = defaultdict(empty_usage)
 
     for sid, sdata in sessions.items():
+        if not include_sessions:
+            # --no-sessions: skip building the heavy per-session entries, but
+            # still accumulate the per-model totals they would have fed.
+            for mc, mu in sdata["models"].items():
+                add_usage(grand_by_model[mc], mu)
+            continue
         s_entry = {
             "session_id": sid,
             "project": sdata["project"],
@@ -1051,6 +1043,9 @@ def print_json(sessions: dict, subscription_quota: Optional[dict] = None):
         result["daily_breakdown"][day_key] = day_entry
 
     result["diagnostics"] = scan_diagnostics()
+
+    if not include_sessions:
+        del result["sessions"]
 
     if subscription_quota is not None:
         result["subscription_quota"] = subscription_quota
@@ -1206,12 +1201,13 @@ def main():
                         help="Filter by project keyword")
     parser.add_argument("--by-project", action="store_true",
                         help="Group results by project")
-    parser.add_argument("--by-model", action="store_true",
-                        help="Group results by model (default detail view already shows this)")
     parser.add_argument("--by-day", action="store_true",
                         help="Group results by day")
     parser.add_argument("--json", action="store_true",
                         help="Output JSON format")
+    parser.add_argument("--no-sessions", action="store_true",
+                        help="With --json: omit the per-session array from the output "
+                             "(totals, daily breakdown and diagnostics are unaffected)")
     parser.add_argument("--include-quota", action="store_true",
                         help="Also fetch Anthropic's OAuth subscription quota (5h + 7d). "
                              "Only works for Pro/Max users who used `claude login`. "
@@ -1248,6 +1244,8 @@ def main():
                 "daily_breakdown": {},
                 "diagnostics": scan_diagnostics(),
             }
+            if args.no_sessions:
+                del empty["sessions"]
             if subscription_quota is not None:
                 empty["subscription_quota"] = subscription_quota
             print(json.dumps(empty, indent=2, ensure_ascii=False, default=str))
@@ -1258,7 +1256,8 @@ def main():
         sys.exit(0)
 
     if args.json:
-        print_json(sessions, subscription_quota=subscription_quota)
+        print_json(sessions, subscription_quota=subscription_quota,
+                   include_sessions=not args.no_sessions)
     elif args.by_project:
         print_by_project(sessions, range_label)
     elif args.by_day:
