@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Optional, Dict, List
 
-__version__ = "1.4.2"
+__version__ = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # Model pricing
