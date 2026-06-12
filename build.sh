@@ -46,9 +46,9 @@ echo "  ✅ Compiled (universal: arm64 + x86_64)"
 echo "  [1.5/4] Generating app icon..."
 swiftc "$SCRIPT_DIR/generate_icon.swift" \
     -framework Cocoa -framework ImageIO \
-    -o "$BUILD_DIR/generate_icon" \
-    -target arm64-apple-macosx13.0
-# Icon generator only runs at build time on this machine, no need for universal
+    -o "$BUILD_DIR/generate_icon"
+# Icon generator only runs once at build time on the build machine — host arch
+# (swiftc default) is always correct, no -target / universal binary needed.
 "$BUILD_DIR/generate_icon" "$BUILD_DIR/AppIcon.iconset"
 iconutil -c icns "$BUILD_DIR/AppIcon.iconset" -o "$BUILD_DIR/AppIcon.icns"
 echo "  ✅ Icon generated"
@@ -105,18 +105,40 @@ if [ -n "$SELECTED_SCRIPT" ]; then
 fi
 
 # Code sign. Prefer a stable self-signed identity so every rebuild keeps a CONSTANT
-# code identity (cert-based Designated Requirement). That lets the macOS Keychain
-# "Always Allow" grant for the Claude Code OAuth token survive rebuilds — ad-hoc
-# signing changes the cdhash each build and loses the grant. Run setup_signing.sh
-# once to create the identity; falls back to ad-hoc if it's absent (e.g. other machine).
+# code identity (cert-based Designated Requirement). Since v1.3.4 this is a nicety,
+# not a requirement: keychain access goes through spawned /usr/bin/security, so the
+# "Always Allow" grant binds to the Apple system binary and survives rebuilds either
+# way. Run setup_signing.sh once to create the identity; falls back to ad-hoc.
 SIGN_IDENTITY="CCCostMonitor Self-Signed"
-if security find-certificate -c "$SIGN_IDENTITY" >/dev/null 2>&1 \
-   && codesign --force --sign "$SIGN_IDENTITY" "$APP_BUNDLE" 2>/dev/null; then
-    echo "  ✅ Signed with stable identity ($SIGN_IDENTITY)"
-elif codesign --force --sign - "$APP_BUNDLE" 2>/dev/null; then
-    echo "  ✅ Ad-hoc signed (run setup_signing.sh for a stable identity)"
+SIGNED=0
+if security find-certificate -c "$SIGN_IDENTITY" >/dev/null 2>&1; then
+    if SIGN_OUT="$(codesign --force --sign "$SIGN_IDENTITY" "$APP_BUNDLE" 2>&1)"; then
+        echo "  ✅ Signed with stable identity ($SIGN_IDENTITY)"
+        SIGNED=1
+    else
+        echo "  ⚠️  Signing with stable identity failed, falling back to ad-hoc. codesign said:"
+        printf '%s\n' "$SIGN_OUT" | sed 's/^/       /'
+    fi
+fi
+if [ "$SIGNED" = "0" ]; then
+    if SIGN_OUT="$(codesign --force --sign - "$APP_BUNDLE" 2>&1)"; then
+        echo "  ✅ Ad-hoc signed (run setup_signing.sh for a stable identity)"
+        SIGNED=1
+    else
+        echo "  ❌ ERROR: ad-hoc signing failed. codesign said:"
+        printf '%s\n' "$SIGN_OUT" | sed 's/^/       /'
+        exit 1
+    fi
+fi
+# Verify the signature — a broken/partial signature must fail the build, not ship.
+# (Ad-hoc signed apps also pass --verify, so this works on CI where the stable
+# identity is absent.)
+if VERIFY_OUT="$(codesign --verify --deep --strict "$APP_BUNDLE" 2>&1)"; then
+    echo "  ✅ Signature verified (codesign --verify --deep --strict)"
 else
-    echo "  ⚠️  Skipped signing"
+    echo "  ❌ ERROR: code signature verification failed:"
+    printf '%s\n' "$VERIFY_OUT" | sed 's/^/       /'
+    exit 1
 fi
 
 echo "  ✅ Bundle ready: $APP_BUNDLE"
@@ -156,7 +178,7 @@ Features:
   - Daily bar chart with hover details
   - Month navigation with historical data cache
   - Multi-language: English, 简体中文, 繁體中文, 日本語
-  - Auto-refreshes every 30 minutes & on screen wake
+  - Auto-refreshes within seconds of new usage (file watching), on screen wake
   - Manual refresh (⌘R)
   - No Dock icon — lives purely in the menu bar
 

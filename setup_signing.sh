@@ -2,20 +2,19 @@
 # One-time setup: create a STABLE self-signed code-signing identity.
 #
 # Why: build.sh otherwise ad-hoc signs the app, which identifies the binary by its
-# cdhash — a value that changes on every build. macOS Keychain ACLs (e.g. the
-# "Always Allow" grant that lets CCCostMonitor read the Claude Code OAuth token) are
-# tied to the app's code identity, so an ad-hoc app loses the grant on every rebuild
-# and the Plan tab keeps disappearing until you re-authorize.
+# cdhash — a value that changes on every build. A self-signed certificate gives the
+# app a constant Designated Requirement (based on the cert, not the cdhash), so the
+# app's code identity stays stable across rebuilds.
 #
-# A self-signed certificate gives the app a constant Designated Requirement (based on
-# the cert, not the cdhash). Sign every build with the same cert → the Keychain grant
-# is asked once and then persists across all future rebuilds.
+# NOTE (v1.3.4+): this is now OPTIONAL. Keychain access for the Claude Code OAuth
+# token goes through spawned /usr/bin/security, so the "Always Allow" grant binds to
+# the Apple system binary and survives rebuilds even under ad-hoc signing. A stable
+# identity remains a minor nicety (constant app identity), nothing more.
 #
 # Run once per machine:  bash setup_signing.sh
 set -euo pipefail
 
 IDENTITY_NAME="CCCostMonitor Self-Signed"
-LOGIN_KEYCHAIN="$(security default-keychain | tr -d ' "')"
 
 if security find-certificate -c "$IDENTITY_NAME" >/dev/null 2>&1; then
     echo "✅ Signing identity '$IDENTITY_NAME' already exists — nothing to do."
@@ -52,10 +51,12 @@ openssl pkcs12 -export -legacy \
     -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
     -name "$IDENTITY_NAME" -out "$TMP/identity.p12" -passout pass:"$P12_PASS" >/dev/null 2>&1
 
-echo "📥 Importing into the login keychain (pre-authorizing codesign to use the key)..."
-security import "$TMP/identity.p12" -k "$LOGIN_KEYCHAIN" -P "$P12_PASS" -T /usr/bin/codesign >/dev/null 2>&1
+echo "📥 Importing into the default (login) keychain (pre-authorizing codesign to use the key)..."
+# No -k: `security import` targets the user's default keychain implicitly, which
+# avoids fragile parsing of `security default-keychain` output (paths may contain spaces).
+security import "$TMP/identity.p12" -P "$P12_PASS" -T /usr/bin/codesign >/dev/null 2>&1
 
-echo "✅ Done. Identity '$IDENTITY_NAME' installed in $LOGIN_KEYCHAIN"
+echo "✅ Done. Identity '$IDENTITY_NAME' installed in the default (login) keychain."
 echo "   build.sh will now sign with it automatically."
 echo "   On the FIRST build after this, if macOS asks whether codesign may use the"
 echo "   key, click \"Always Allow\" once."
