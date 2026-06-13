@@ -4,17 +4,18 @@
 
 <table>
   <tr>
-    <td align="center"><img src="docs/cost.png" width="260" alt="Cost tab"/><br/><sub><b>Cost</b> — monthly total, per-model split, daily chart</sub></td>
-    <td align="center"><img src="docs/tokens.png" width="260" alt="Tokens tab"/><br/><sub><b>Tokens</b> — by type (in / out / cache) and by model</sub></td>
-    <td align="center"><img src="docs/plan.png" width="260" alt="Plan tab"/><br/><sub><b>Plan</b> — subscription quota left, with resets</sub></td>
+    <td align="center"><img src="docs/cost.png" width="250" alt="Cost tab"/><br/><sub><b>Cost</b> — Today / Week / Month, per-model split, daily chart</sub></td>
+    <td align="center"><img src="docs/tokens.png" width="250" alt="Tokens tab"/><br/><sub><b>Tokens</b> — by type (in / out / cache) and by model</sub></td>
+    <td align="center"><img src="docs/plan.png" width="250" alt="Plan tab"/><br/><sub><b>Plan</b> — subscription quota left, with resets</sub></td>
   </tr>
   <tr>
-    <td align="center" colspan="2"><img src="docs/time-week.png" width="400" alt="Time — week view"/><br/><sub><b>Time · Week</b> — Apple-Health-style timeline, colored by model</sub></td>
-    <td align="center"><img src="docs/time-year.png" width="400" alt="Time — year heatmap"/><br/><sub><b>Time · Year</b> — GitHub-style activity heatmap</sub></td>
+    <td align="center"><img src="docs/time-week.png" width="250" alt="Time — week view"/><br/><sub><b>Time · Week</b> — Apple-Health-style timeline, colored by model</sub></td>
+    <td align="center"><img src="docs/time-month.png" width="250" alt="Time — month view"/><br/><sub><b>Time · Month</b> — one row per week of the month</sub></td>
+    <td align="center"><img src="docs/time-year.png" width="250" alt="Time — year heatmap"/><br/><sub><b>Time · Year</b> — GitHub-style activity heatmap</sub></td>
   </tr>
 </table>
 
-<sub>Screenshots use synthetic demo data.</sub>
+<sub>Screenshots are rendered from the app's real SwiftUI views (<code>docs/render_mockups.swift</code>) with synthetic demo data — no real usage.</sub>
 
 ---
 
@@ -133,13 +134,22 @@ Costs are estimates based on public API pricing. If you're on a subscription pla
 
 Token counts match [ccusage](https://github.com/ryoppippi/ccusage) within ~0.5%.
 
-### A note on historical data
+### A note on historical data ⚠️
 
-This app can only show what's still on disk. Claude Code deletes session transcripts older than **`cleanupPeriodDays`** (default **30 days**) at startup, so months beyond that window will gradually become incomplete or disappear. If you want long-term history, raise the setting in `~/.claude/settings.json`:
+This app can only show what's still on disk, and **Claude Code itself deletes old session files** — so your historical numbers can shrink or disappear over time, through no fault of this app.
+
+Claude Code removes session transcripts (`~/.claude/projects/**/*.jsonl`) older than **`cleanupPeriodDays`** at startup. The default is **30 days**, so anything beyond roughly the last month gradually ages out and the totals for those months will drop. This is documented Claude Code behavior:
+
+> *"How long to retain chat transcripts and session state locally. Default: 30 days."*
+> — [Claude Code settings reference](https://code.claude.com/docs/en/settings) (`cleanupPeriodDays`)
+
+If you want to keep long-term history, raise the setting in `~/.claude/settings.json` **before** old data ages out:
 
 ```json
 { "cleanupPeriodDays": 3650 }
 ```
+
+> Note: deletion happens at the whole-file level. The `/compact` command, by contrast, only summarizes a session's *in-context* history — it appends a summary line and does **not** rewrite or delete the older lines already written to the transcript ([sessions docs](https://code.claude.com/docs/en/sessions)).
 
 ---
 
@@ -256,13 +266,22 @@ Info.plist                  ← LSUIElement=true；版本号的单一来源
 
 Token 计数与 [ccusage](https://github.com/ryoppippi/ccusage) 误差在 ~0.5% 以内。
 
-### 关于历史数据
+### 关于历史数据 ⚠️
 
-应用只能展示磁盘上还存在的数据。Claude Code 会在启动时删除超过 **`cleanupPeriodDays`**（默认 **30 天**）的会话日志，因此更早的月份会逐渐残缺甚至消失。如果你想长期保留历史，在 `~/.claude/settings.json` 里调大这个设置：
+应用只能展示磁盘上还存在的数据，而 **Claude Code 自身会删除旧的会话文件** —— 所以历史数字可能随时间缩水甚至消失，这并非本应用的问题。
+
+Claude Code 在启动时会删除超过 **`cleanupPeriodDays`** 的会话日志（`~/.claude/projects/**/*.jsonl`）。默认 **30 天**，因此大约一个月之前的数据会逐渐被清掉，那些月份的统计也会随之下降。这是 Claude Code 官方记录的行为：
+
+> *"How long to retain chat transcripts and session state locally. Default: 30 days."*
+> —— [Claude Code 设置文档](https://code.claude.com/docs/en/settings)（`cleanupPeriodDays`）
+
+如果你想长期保留历史，**趁旧数据还没被清掉之前**，在 `~/.claude/settings.json` 里调大这个值：
 
 ```json
 { "cleanupPeriodDays": 3650 }
 ```
+
+> 注：删除是整文件级别的。而 `/compact` 命令只是压缩会话的*上下文内*历史 —— 它追加一条摘要行，**不会**重写或删除已经写入 transcript 的旧行（[sessions 文档](https://code.claude.com/docs/en/sessions)）。
 
 ---
 
