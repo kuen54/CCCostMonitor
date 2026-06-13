@@ -12,16 +12,16 @@ import Testing
     // MARK: formatDurationShort
 
     @Test func formatDurationShortBoundaries() {
-        #expect(TimeLogic.formatDurationShort(0) == "0m")
-        #expect(TimeLogic.formatDurationShort(-5) == "0m")
-        // Nonzero seconds under a minute must not collapse to "0m"
-        #expect(TimeLogic.formatDurationShort(59) == "1m")
-        #expect(TimeLogic.formatDurationShort(60) == "1m")
-        #expect(TimeLogic.formatDurationShort(1920) == "32m")
-        #expect(TimeLogic.formatDurationShort(3599) == "59m")
-        #expect(TimeLogic.formatDurationShort(3600) == "1.0h")
-        #expect(TimeLogic.formatDurationShort(5400) == "1.5h")
-        #expect(TimeLogic.formatDurationShort(12240) == "3.4h")
+        #expect(TimeLogic.formatDurationShort(0) == "0min")
+        #expect(TimeLogic.formatDurationShort(-5) == "0min")
+        // Nonzero seconds under a minute must not collapse to "0min"
+        #expect(TimeLogic.formatDurationShort(59) == "1min")
+        #expect(TimeLogic.formatDurationShort(60) == "1min")
+        #expect(TimeLogic.formatDurationShort(1920) == "32min")
+        #expect(TimeLogic.formatDurationShort(3599) == "59min")
+        #expect(TimeLogic.formatDurationShort(3600) == "1.0hr")
+        #expect(TimeLogic.formatDurationShort(5400) == "1.5hr")
+        #expect(TimeLogic.formatDurationShort(12240) == "3.4hr")
     }
 
     // MARK: formatClock

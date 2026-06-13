@@ -11,14 +11,14 @@ enum TimeLogic {
 
     // MARK: Duration / clock formatting
 
-    /// Short duration for the menu bar and per-row totals: "0m" for none,
-    /// "32m" under an hour (floor, but nonzero seconds never round down to
-    /// "0m"), "3.4h" from one hour up. Locale-neutral by design (digits + unit
-    /// letters only) — no i18n keys needed.
+    /// Short duration for the menu bar and per-row totals: "0min" for none,
+    /// "32min" under an hour (floor, but nonzero seconds never round down to
+    /// "0min"), "3.4hr" from one hour up. Locale-neutral by design (digits +
+    /// unit letters only) — no i18n keys needed.
     static func formatDurationShort(_ seconds: Int) -> String {
-        if seconds <= 0 { return "0m" }
-        if seconds < 3600 { return "\(max(1, seconds / 60))m" }
-        return String(format: "%.1fh", Double(seconds) / 3600.0)
+        if seconds <= 0 { return "0min" }
+        if seconds < 3600 { return "\(max(1, seconds / 60))min" }
+        return String(format: "%.1fhr", Double(seconds) / 3600.0)
     }
 
     /// "HH:MM" wall clock from seconds-of-local-day for interval tooltips.
