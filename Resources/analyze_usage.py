@@ -16,6 +16,9 @@ Options:
     --json               Output JSON instead of table
     --no-sessions        With --json: omit the per-session array (smaller payload)
     --no-cache           Bypass the incremental scan cache (read AND write)
+    --gap-minutes N      Active-time sessionization gap (default 10); events closer
+                         than N minutes merge into one active interval
+    --time-year YYYY     Emit per-day active-time totals for a whole year (JSON only)
 """
 
 import json
@@ -29,7 +32,27 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Optional, Dict, List
 
-__version__ = "1.5.1"
+__version__ = "2.0.0"
+
+# ---------------------------------------------------------------------------
+# Active-time tracking
+# ---------------------------------------------------------------------------
+# "Active time" = gap-merged event intervals, where an event is the top-level
+# timestamp of ANY JSONL line (user/assistant/system/attachment/...), not just
+# assistant lines. Events closer than the gap merge into one interval.
+DEFAULT_GAP_MINUTES = 10
+# Set once in main() (from --gap-minutes) BEFORE any cache load or scan; the
+# cache stamps this value and a mismatch degrades to a silent full rescan.
+_GAP_MINUTES = DEFAULT_GAP_MINUTES
+# Accepted event epoch range: [1970-01-01, 9999-01-01) UTC. Events outside are
+# rejected at extraction (hostile/garbage timestamps), so every cached pair is
+# fromtimestamp()+astimezone()-safe at query time. The extractor and
+# _valid_cache_entry MUST agree on these bounds — otherwise the script could
+# write a cache entry its own validator rejects, silently forcing a full
+# rescan on every run.
+_TIME_EPOCH_MIN = 0
+_TIME_EPOCH_MAX = 253370764800  # 9999-01-01T00:00:00Z
+
 
 # ---------------------------------------------------------------------------
 # Model pricing
@@ -85,6 +108,8 @@ _SCAN_STATS = {
     "cache_hit_files": 0,       # files served from the incremental scan cache (no re-parse)
     "cache_miss_files": 0,      # files parsed this run (cache absent/stale); 0 when cache bypassed
     "cache_pruned_files": 0,    # cache entries dropped because their file disappeared
+    "time_event_lines": 0,      # raw lines whose timestamp extraction succeeded (active-time
+                                # events; range-independent scalar, all line types)
 }
 
 # ---------------------------------------------------------------------------
@@ -123,7 +148,18 @@ _SCAN_STATS = {
 # (modulo the additive cache_hit/miss/pruned counters); --no-cache is the
 # always-available ground truth for verifying the cache.
 SCAN_CACHE_PATH = Path.home() / ".claude" / "cache" / "cc-monitor" / "scan-cache.json"
-SCAN_CACHE_FORMAT_VERSION = 1
+# v2: entries gain active-time interval lists ("time": absolute UTC epoch
+# second triples [start, end, counts], gap-merged per file at _GAP_MINUTES —
+# NOT split into local days, so the DST fall-back fold stays disambiguated;
+# counts = per-model-class tallies of the assistant model-tagged events
+# inside the interval; see parse_file's entry-shape docstring) +
+# "time_event_lines"; cache header gains "gap_minutes" (a mismatch at load
+# time → silent full rescan, same degrade path as a format/script-version
+# mismatch). All v1 caches silently rebuild once. v2 never shipped, so its
+# earlier development shapes (day-keyed; 2-element [start, end] pairs) exist
+# at most on dev machines — the validator rejects both, degrading to one
+# silent full rescan.
+SCAN_CACHE_FORMAT_VERSION = 2
 
 # Whether the current scan actually used the cache (False under --no-cache or
 # a non-midnight-aligned range). Drives diagnostics_line() segment suppression.
@@ -176,9 +212,31 @@ def _valid_cache_entry(e) -> bool:
                 return False
             if not (isinstance(c, list) and len(c) == 4 and all(isinstance(x, int) for x in c)):
                 return False
-        for k in ("skipped_lines", "prefiltered_lines", "null_ts_lines"):
+        for k in ("skipped_lines", "prefiltered_lines", "null_ts_lines", "time_event_lines"):
             if not isinstance(e.get(k), int):
                 return False
+        # Active-time intervals: [[start_epoch, end_epoch, counts], ...] —
+        # int UTC epoch seconds, s <= e, within the same bounds the extractor
+        # enforces (so a self-written entry ALWAYS revalidates — a stricter
+        # check here would silently force a full rescan on every run) and
+        # fromtimestamp()/astimezone()-safe at query time. counts is a
+        # possibly-empty {model_class: positive int} dict — parse_file only
+        # ever increments, so 0 never appears in a self-written entry.
+        # Anything else (forged floats, reversed pairs, out-of-range epochs,
+        # unknown class keys, the earlier v2 dev shapes: day-keyed or
+        # 2-element pairs) → silent full rescan.
+        tm = e.get("time")
+        if not isinstance(tm, list):
+            return False
+        for iv in tm:
+            if not (isinstance(iv, list) and len(iv) == 3
+                    and isinstance(iv[0], int) and isinstance(iv[1], int)
+                    and _TIME_EPOCH_MIN <= iv[0] <= iv[1] < _TIME_EPOCH_MAX
+                    and isinstance(iv[2], dict)):
+                return False
+            for cls, n in iv[2].items():
+                if cls not in MODEL_CLASSES or not isinstance(n, int) or n < 1:
+                    return False
         return True
     except Exception:
         return False
@@ -202,6 +260,11 @@ def _load_scan_cache() -> dict:
             return {}
         if data.get("tz") != _tz_stamp():
             return {}
+        # Cached intervals were gap-merged with the gap active at parse time;
+        # a different gap can't be reconstructed from merged intervals →
+        # silent full rescan, same as a format-version mismatch.
+        if data.get("gap_minutes") != _GAP_MINUTES:
+            return {}
         files = data.get("files")
         if not isinstance(files, dict):
             return {}
@@ -223,6 +286,7 @@ def _write_scan_cache(files: dict) -> None:
             "format_version": SCAN_CACHE_FORMAT_VERSION,
             "script_version": __version__,
             "tz": _tz_stamp(),
+            "gap_minutes": _GAP_MINUTES,
             "files": files,
         }
         with open(tmp_path, "w") as f:
@@ -498,6 +562,171 @@ def parse_iso_ts(ts_str) -> Optional[datetime]:
         return None
 
 
+def _extract_line_ts(line: str) -> Optional[int]:
+    """Per-line timestamp extraction for active-time events (top-level key only).
+
+    Returns the event as an int UTC epoch second — the ABSOLUTE domain every
+    merge stage works in (per-file and query-time), immune to DST fold/gap
+    ambiguity; localization happens only at the final day-split.
+
+    Full json.loads per raw line. A substring heuristic (first '"timestamp":"'
+    occurrence, strictly format-validated) was measured against the full parse
+    on the real corpus: 3.13% of lines mismatched (3543/113226) — every one a
+    `file-history-snapshot` line whose only "timestamp" key is NESTED (no
+    top-level key; the nested snapshot time can be stale, so it must not
+    become an activity event). Far above the 0.1% acceptance threshold, so the
+    heuristic was rejected per the design contract in favor of the full parse
+    (measured cold --no-cache month-scan cost on the real corpus, interleaved
+    runs: ~1.5s → ~2.4s; warm runs unaffected — extraction only runs on
+    cache-miss files, and the app's steady state is warm).
+    Offset-less (naive) timestamps are rejected: events must stay mutually
+    comparable and astimezone()-correct. Independent of the usage path — the
+    assistant-line prefilter below is untouched and never sees this result.
+    """
+    try:
+        data = json.loads(line)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    dt = parse_iso_ts(data.get("timestamp"))
+    if dt is None or dt.tzinfo is None:
+        return None
+    # Truncate to whole seconds: storage is int epoch seconds, so EVERY merge
+    # stage (per-file and query-time) must see identical second precision —
+    # mixed precision breaks the per-file ≡ query-time merge equivalence for
+    # gaps within 1s of the threshold (observed on the real corpus: ~600.5s
+    # heartbeat gaps merged after truncation but not before).
+    ep = int(dt.replace(microsecond=0).timestamp())
+    if not (_TIME_EPOCH_MIN <= ep < _TIME_EPOCH_MAX):
+        return None
+    return ep
+
+
+def _gap_merge(pairs_sorted: list, gap) -> list:
+    """Merge sorted (start, end) pairs whose gap is <= `gap`.
+
+    Domain-agnostic: works on int epoch seconds with an int gap (the only
+    domain both merge stages use today) or on datetimes with a timedelta.
+    Inclusive condition (next_start - prev_end <= gap), applied identically
+    per-file and at query time — both in the ABSOLUTE epoch domain — so the
+    two-stage merge equals a single global gap-merge of the event set (every
+    stored interval endpoint is a real event). Merging in the absolute domain
+    is what keeps DST fall-back days correct: local wall-clock seconds are
+    non-monotonic in real time there (the 01:00–02:00 hour repeats), so a
+    wall-clock-domain merge fabricates/loses gaps around the fold.
+    """
+    merged: list = []
+    for a, b in pairs_sorted:
+        if merged and a - merged[-1][1] <= gap:
+            if b > merged[-1][1]:
+                merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def _dominant_model(counts: dict) -> Optional[str]:
+    """Dominant model class of one interval's model-tagged event counts.
+
+    Highest count wins; ties break by the fixed MODEL_CLASSES order
+    (fable > opus > sonnet > haiku > other). Empty counts (interval held no
+    model-tagged assistant events — e.g. user/system lines only) → None.
+    Keys are guaranteed members of MODEL_CLASSES: classify_model only emits
+    those, and _valid_cache_entry rejects anything else.
+    """
+    if not counts:
+        return None
+    return max(counts.items(),
+               key=lambda kv: (kv[1], -MODEL_CLASSES.index(kv[0])))[0]
+
+
+def _first_offset_change(lo: datetime, hi: datetime) -> datetime:
+    """First instant in (lo, hi] whose local UTC offset differs from lo's.
+
+    Precondition: offset(lo) != offset(hi) and the span holds at most one
+    transition (callers pass spans <= one local day; real zones transition at
+    most once per day). Bisection on whole epoch seconds (~17 probes/day).
+    """
+    off = lo.astimezone().utcoffset()
+    lo_e, hi_e = int(lo.timestamp()), int(hi.timestamp())
+    while hi_e - lo_e > 1:
+        mid = (lo_e + hi_e) // 2
+        if datetime.fromtimestamp(mid, timezone.utc).astimezone().utcoffset() == off:
+            lo_e = mid
+        else:
+            hi_e = mid
+    return datetime.fromtimestamp(hi_e, timezone.utc)
+
+
+def _wall_sec(t: datetime, off: timedelta, day) -> int:
+    """Wall-clock second-of-`day` of aware instant t under fixed UTC offset off.
+
+    Clamped to [0, 86400] — the clamp only engages in pathological zones whose
+    DST transition crosses local midnight (the wall projection then leaves the
+    day); invariants stay intact there at the cost of edge-second precision.
+    """
+    wall = t.astimezone(timezone.utc).replace(tzinfo=None) + off
+    delta = (wall - datetime(day.year, day.month, day.day)).total_seconds()
+    return int(min(max(delta, 0), 86400))
+
+
+def _split_interval_by_local_day(a: datetime, b: datetime) -> list:
+    """Split aware interval [a, b] at local midnights AND at DST transitions
+    into (day_key, start_sec, end_sec) wall-clock pieces, 0 <= s <= e <= 86400
+    (86400 = next midnight). Within each piece the UTC offset is constant, so
+    the absolute→wall mapping is monotonic and s <= e holds structurally —
+    including on fall-back days, where the repeated 01:00–02:00 hour would
+    otherwise produce s > e (negative durations).
+
+    Wall-clock semantics on transition days (documented design choice — the
+    0–24h week axis renders wall-clock positions and totals equal the summed
+    piece lengths):
+      * Spring forward: a session bridging the gap is split around the
+        nonexistent hour ([01:50, 02:00] + [03:00, 03:05]); its total equals
+        real elapsed time (the skipped hour is no longer counted as active).
+      * Fall back: a session bridging the fold is split at it ([01:59, 02:00]
+        + [01:00, 01:05]); each wall position counts once, so a session
+        spanning the whole repeated hour shows up to 1h LESS than elapsed
+        (the per-day union in _build_time_days collapses the overlap).
+    Day attribution and midnights are derived per-instant via astimezone()
+    (aware conversions are unambiguous — no naive-fold guessing). An interval
+    ending exactly at local midnight yields no zero-width next-day piece (the
+    previous day's …→86400 piece carries the endpoint); a true zero-duration
+    interval (a == b) is kept truthful as one (s, s) piece.
+    """
+    pieces = []
+    cur = a
+    while True:
+        day = cur.astimezone().date()
+        day_key = day.strftime("%Y-%m-%d")
+        # Absolute instant of the next local midnight (naive→aware attach is
+        # fine here: midnights are virtually never inside a fold; the guard
+        # below keeps pathological zones from stalling the walk).
+        next_mid = (datetime(day.year, day.month, day.day) + timedelta(days=1)).astimezone()
+        if next_mid <= cur:
+            next_mid = cur + timedelta(days=1)
+        seg_end = min(b, next_mid)
+        # Sub-split [cur, seg_end] at the (at most one) DST transition inside.
+        sub = cur
+        while True:
+            off = sub.astimezone().utcoffset()
+            if seg_end.astimezone().utcoffset() == off:
+                nxt = seg_end
+            else:
+                nxt = _first_offset_change(sub, seg_end)
+            s = _wall_sec(sub, off, day)
+            e = _wall_sec(nxt, off, day)
+            pieces.append((day_key, s, e))
+            if nxt >= seg_end:
+                break
+            sub = nxt
+        if seg_end >= b:
+            break
+        cur = seg_end
+    return pieces
+
+
 def _line_may_lower_first_ts(line: str, current_min: datetime) -> bool:
     """Conservative substring check used by the scan prefilter: could this raw
     JSONL line's top-level "timestamp" be earlier than current_min?
@@ -512,6 +741,11 @@ def _line_may_lower_first_ts(line: str, current_min: datetime) -> bool:
     positive costs one json.loads; there are no false negatives, because the
     top-level value is always inspected. Lines with no string-valued
     timestamp return False — the old full-parse path got None for them too.
+    Offset-less (naive) timestamps are skipped, not compared: current_min is
+    always aware (parse_file never tracks naive values), and a naive/aware
+    `<` raises TypeError — one such hostile line must not kill the whole
+    scan. Consistent with the full-parse path, which ignores naive
+    timestamps for first_ts too.
     """
     for key in ('"timestamp":"', '"timestamp": "'):
         start = line.find(key)
@@ -521,7 +755,7 @@ def _line_may_lower_first_ts(line: str, current_min: datetime) -> bool:
             if vend == -1:
                 return True  # truncated/odd line — let the full parser judge
             ts = parse_iso_ts(line[vstart:vend])
-            if ts is not None and ts < current_min:
+            if ts is not None and ts.tzinfo is not None and ts < current_min:
                 return True
             start = line.find(key, vend)
     return False
@@ -627,6 +861,7 @@ def scan_diagnostics() -> dict:
         "cache_hit_files": _SCAN_STATS["cache_hit_files"],
         "cache_miss_files": _SCAN_STATS["cache_miss_files"],
         "cache_pruned_files": _SCAN_STATS["cache_pruned_files"],
+        "time_event_lines": _SCAN_STATS["time_event_lines"],
         "inflation_factor": round(raw / uniq, 3) if uniq else None,
     }
 
@@ -756,6 +991,22 @@ def parse_file(path: Path, is_sub: bool):
                   each counted line's local day.
       skipped_lines / prefiltered_lines / null_ts_lines: plain scalars
                   (incremented before/independent of the range check).
+      time:       [[start_epoch, end_epoch, counts], ...] — active-time
+                  intervals from ALL line types' timestamps (int UTC epoch
+                  seconds), gap-merged at _GAP_MINUTES per file, sorted,
+                  disjoint. counts = {model_class: positive int}, possibly
+                  empty — tallies of the model-tagged events (assistant
+                  lines with a timestamp AND a model string) inside the
+                  interval; query time sums them across merging files and
+                  picks the dominant class per merged interval.
+                  Deliberately ABSOLUTE and NOT split into local days: the
+                  cache must disambiguate the DST fall-back fold (two real
+                  instants share one wall-clock second), which
+                  seconds-of-local-day pairs cannot. Localization (midnight +
+                  DST-transition split) and range filtering happen at query
+                  time in _build_time_days.
+      time_event_lines: count of lines whose timestamp extraction succeeded
+                  (range-independent scalar).
     """
     entry = {
         "peek_ts": None,
@@ -768,7 +1019,14 @@ def parse_file(path: Path, is_sub: bool):
         "skipped_lines": 0,
         "prefiltered_lines": 0,
         "null_ts_lines": 0,
+        "time": [],
+        "time_event_lines": 0,
     }
+    # Active-time event epochs (every line type), gap-merged after the loop.
+    events: list = []
+    # (epoch, model_class) for assistant lines carrying a model string —
+    # a subset of `events` (same epochs), tallied per interval after the merge.
+    model_events: list = []
     # Per-file dedup: Anthropic message.id is unique per API call, but Claude
     # Code writes one JSONL line per content block (thinking / text / tool_use…),
     # each carrying the same `message.usage`. Without dedup, a response with N
@@ -794,6 +1052,14 @@ def parse_file(path: Path, is_sub: bool):
                 line_no += 1
                 if not line.strip():
                     continue
+                # Active-time event: lightweight timestamp extraction on EVERY
+                # raw line (single code path for assistant and non-assistant
+                # lines — cold == warm by construction). Independent of the
+                # usage prefilter/first_ts logic below; never feeds into them.
+                ts_ev = _extract_line_ts(line)
+                if ts_ev is not None:
+                    events.append(ts_ev)
+                    entry["time_event_lines"] += 1
                 # Assistant-line prefilter: ~57% of lines (74% of bytes) are
                 # non-assistant, and the only things non-assistant lines
                 # contribute are file metadata: first_msg (user lines,
@@ -857,9 +1123,15 @@ def parse_file(path: Path, is_sub: bool):
                             elif isinstance(msg, str):
                                 entry["first_msg"] = msg[:50]
 
-                    # Timestamp (running min over all lines of THIS file)
+                    # Timestamp (running min over all lines of THIS file).
+                    # Naive (offset-less) timestamps are ignored: first_ts_dt
+                    # must stay uniformly aware — a naive/aware `<` raises
+                    # TypeError, and one hostile line must not kill the scan
+                    # (here or in _line_may_lower_first_ts, which compares
+                    # against this value).
                     ts = parse_iso_ts(data.get("timestamp"))
-                    if ts and (first_ts_dt is None or ts < first_ts_dt):
+                    if (ts and ts.tzinfo is not None
+                            and (first_ts_dt is None or ts < first_ts_dt)):
                         first_ts_dt = ts
 
                     # Usage from assistant messages
@@ -868,6 +1140,24 @@ def parse_file(path: Path, is_sub: bool):
                         if not isinstance(m, dict):
                             entry["skipped_lines"] += 1
                             continue
+                        # Model-tagged active-time event: ts_ev is the exact
+                        # epoch _extract_line_ts already recorded for this
+                        # line, so the tag lands inside the interval that
+                        # event built. Only assistant lines reach here — the
+                        # prefilter and non-assistant parsing are untouched.
+                        # Streamed repeat lines tag too (pre-dedup): per-line
+                        # weight is what "dominant inside an interval" wants.
+                        # Lines without a model string stay untagged (no
+                        # classify_model default-to-sonnet guessing here).
+                        # "<synthetic>" is a Claude Code placeholder on locally
+                        # fabricated lines (API error/interrupt, zero usage —
+                        # no model streamed); classify_model would bucket it
+                        # sonnet, so angle-bracket placeholders stay untagged.
+                        if ts_ev is not None:
+                            _mstr = m.get("model")
+                            if (isinstance(_mstr, str) and _mstr
+                                    and not _mstr.startswith("<")):
+                                model_events.append((ts_ev, classify_model(_mstr)))
                         usage_raw = m.get("usage") or {}
                         if not isinstance(usage_raw, dict):
                             entry["skipped_lines"] += 1
@@ -974,6 +1264,24 @@ def parse_file(path: Path, is_sub: bool):
     except OSError:
         ok = False
     entry["first_ts"] = first_ts_dt.isoformat() if first_ts_dt else None
+    # Active-time intervals: sort event epochs, gap-merge zero-width (t, t)
+    # points, store as absolute [start_epoch, end_epoch, counts] triples (no
+    # local-day split here — see the entry-shape docstring). Zero-duration
+    # intervals (isolated events) are kept truthful (start == end); the
+    # renderer pads to a visible width. Every model-tagged epoch is also in
+    # `events`, so it falls inside exactly ONE merged interval — assigned by
+    # a two-pointer walk over the sorted tag list.
+    if events:
+        events.sort()
+        merged = _gap_merge([(t, t) for t in events], _GAP_MINUTES * 60)
+        counts: list = [{} for _ in merged]
+        model_events.sort()
+        mi = 0
+        for ep, cls in model_events:
+            while merged[mi][1] < ep:
+                mi += 1
+            counts[mi][cls] = counts[mi].get(cls, 0) + 1
+        entry["time"] = [[a, b, counts[i]] for i, (a, b) in enumerate(merged)]
     return entry, ok
 
 
@@ -1062,11 +1370,16 @@ def _merge_entry(sessions: dict, finfo: dict, entry: dict, start_str: str, end_s
     _SCAN_STATS["skipped_lines"] += entry["skipped_lines"]
     _SCAN_STATS["prefiltered_lines"] += entry["prefiltered_lines"]
     _SCAN_STATS["null_ts_lines"] += entry["null_ts_lines"]
+    _SCAN_STATS["time_event_lines"] += entry["time_event_lines"]
 
 
 def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime,
                   project_filter: Optional[str], use_cache: bool = True):
-    """Scan all JSONL files and return structured session data.
+    """Scan all JSONL files; return (sessions, time_days).
+
+    sessions: structured per-session usage data (sessions with no usage are
+    dropped). time_days: per-day active-time dict covering every day of
+    [start_dt, end_dt) — see _build_time_days.
 
     With use_cache=True (default), unchanged files (exact st_mtime_ns +
     st_size match) are served from ~/.claude/cache/cc-monitor/scan-cache.json
@@ -1184,6 +1497,9 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime,
     # Parse (or serve from cache) and merge, in collection order — preserves
     # the JSON sessions array order and first_msg first-wins semantics.
     sessions: dict[str, dict] = {}
+    # Absolute (start_epoch, end_epoch, counts) across all files. counts may
+    # be a cache-owned dict — _build_time_days copies before mutating.
+    time_triples: list = []
     for finfo in all_files:
         entry = finfo["cache_entry"]
         if entry is not None:
@@ -1202,6 +1518,11 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime,
                 cache_files[str(finfo["path"])] = entry
                 cache_dirty = True
         _merge_entry(sessions, finfo, entry, start_str, end_str)
+        # Active-time intervals participate under the same pruning rules as
+        # usage (a pruned file contributes nothing); range filtering happens
+        # after the cross-file merge so midnight-bridging gaps survive.
+        for s, e, c in entry["time"]:
+            time_triples.append((s, e, c))
 
     if use_cache:
         # Prune entries whose file disappeared, then persist if anything changed.
@@ -1214,10 +1535,87 @@ def scan_sessions(projects_dir: Path, start_dt: datetime, end_dt: datetime,
         if cache_dirty:
             _write_scan_cache(cache_files)
 
+    time_days = _build_time_days(time_triples, start_str, end_str)
+
     # Drop sessions with no usage
-    return {sid: s for sid, s in sessions.items() if any(
+    filtered_sessions = {sid: s for sid, s in sessions.items() if any(
         u["messages"] > 0 for u in s["models"].values()
     )}
+    return filtered_sessions, time_days
+
+
+def _build_time_days(time_triples: list, start_str: str, end_str: str) -> dict:
+    """Cross-file union merge of per-file active-time intervals.
+
+    Works in the ABSOLUTE UTC-epoch domain (the cache's storage domain):
+    globally sort and gap-merge the (start_epoch, end_epoch, counts) triples
+    — counts SUM when intervals merge, so per merged interval they equal the
+    global tally of its model-tagged events — then split each merged
+    interval at local midnights and DST transitions via
+    _split_interval_by_local_day. Equivalent to gap-merging the global event
+    set, because every stored endpoint is a real event — and immune to the
+    DST fall-back fold, where wall-clock seconds are non-monotonic in real
+    time (a wall-domain merge fabricated active time across the repeated
+    hour and missed real <=G gaps straddling it). Gaps spanning local
+    midnight merge correctly (per-day merging would lose a 23:58→00:05
+    bridge). The dominant model is resolved per MERGED interval; every day
+    piece split from it carries that whole-interval dominant (counts are
+    never split at midnight). Per day, the wall pieces are union-merged
+    (sort, merge overlap/touch): a no-op on normal days (distinct merged
+    intervals are > G apart and the wall mapping is monotonic) but required
+    on fall-back days, where pieces from both sides of the fold may overlap
+    on the wall axis — there the earlier piece's model wins (a None upgrades
+    to the later piece's model), keeping durations exact at the cost of one
+    label on a <=1h/year edge. Output invariants: intervals sorted, disjoint,
+    0 <= s <= e <= 86400, sum == total_seconds. Returns {day_key:
+    {"intervals": [[s, e, model], ...], "total_seconds": N}} — model is a
+    MODEL_CLASSES member or None — covering EVERY day of
+    [start_str, end_str); empty days included.
+    """
+    days: dict = {}
+    cur = datetime.strptime(start_str, "%Y-%m-%d")
+    end = datetime.strptime(end_str, "%Y-%m-%d")
+    while cur < end:
+        days[cur.strftime("%Y-%m-%d")] = {"intervals": [], "total_seconds": 0}
+        cur += timedelta(days=1)
+    if time_triples:
+        # Counted variant of _gap_merge, same inclusive condition and epoch
+        # domain. Sort key excludes counts (dicts don't order); counts are
+        # copied before mutation — warm entries own theirs and a hit file's
+        # dict is also what _write_scan_cache would re-serialize.
+        gap = _GAP_MINUTES * 60
+        merged: list = []
+        for a, b, c in sorted(time_triples, key=lambda t: (t[0], t[1])):
+            if merged and a - merged[-1][1] <= gap:
+                if b > merged[-1][1]:
+                    merged[-1][1] = b
+                for cls, n in c.items():
+                    merged[-1][2][cls] = merged[-1][2].get(cls, 0) + n
+            else:
+                merged.append([a, b, dict(c)])
+        day_pieces: dict = {}
+        for s_ep, e_ep, cnt in merged:
+            model = _dominant_model(cnt)
+            a = datetime.fromtimestamp(s_ep, timezone.utc)
+            b = datetime.fromtimestamp(e_ep, timezone.utc)
+            for day_key, s, e in _split_interval_by_local_day(a, b):
+                if day_key in days:  # day-filter to the queried range
+                    day_pieces.setdefault(day_key, []).append([s, e, model])
+        for day_key, pieces in day_pieces.items():
+            pieces.sort(key=lambda p: (p[0], p[1]))
+            union: list = []
+            for s, e, mdl in pieces:
+                if union and s <= union[-1][1]:
+                    if e > union[-1][1]:
+                        union[-1][1] = e
+                    if union[-1][2] is None:
+                        union[-1][2] = mdl
+                else:
+                    union.append([s, e, mdl])
+            rec = days[day_key]
+            rec["intervals"] = union
+            rec["total_seconds"] = sum(e - s for s, e, _ in union)
+    return days
 
 
 # ---------------------------------------------------------------------------
@@ -1391,8 +1789,16 @@ def print_by_day(sessions: dict, range_label: str):
 
 
 def print_json(sessions: dict, subscription_quota: Optional[dict] = None,
-               include_sessions: bool = True):
-    """Output structured JSON."""
+               include_sessions: bool = True, time_days: Optional[dict] = None):
+    """Output structured JSON.
+
+    time_days (additive top-level "time" section; JSON-only — the text output
+    modes do not surface active time) is the scan's per-day active-time dict:
+    {day_key: {"intervals": [[s, e, model], ...], "total_seconds": N}} with
+    model the interval's dominant model class (or null) and intervals sorted,
+    disjoint and 0 <= s <= e <= 86400 always (DST-transition days are
+    split/clamped to wall-clock pieces — see _split_interval_by_local_day).
+    """
     result = {
         "script_version": __version__,
         "pricing_source": _PRICING_SOURCE,
@@ -1449,6 +1855,9 @@ def print_json(sessions: dict, subscription_quota: Optional[dict] = None,
             day_entry["total_cost"] += c
         day_entry["total_cost"] = round(day_entry["total_cost"], 4)
         result["daily_breakdown"][day_key] = day_entry
+
+    if time_days is not None:
+        result["time"] = {"gap_minutes": _GAP_MINUTES, "days": time_days}
 
     result["diagnostics"] = scan_diagnostics()
 
@@ -1623,7 +2032,50 @@ def main():
                         help="Also fetch Anthropic's OAuth subscription quota (5h + 7d). "
                              "Only works for Pro/Max users who used `claude login`. "
                              "API-key users (Bedrock/Vertex) get no quota info — they have no cap.")
+    parser.add_argument("--gap-minutes", type=int, default=DEFAULT_GAP_MINUTES,
+                        help="Active-time sessionization gap in minutes (default "
+                             f"{DEFAULT_GAP_MINUTES}); events closer than this merge "
+                             "into one active interval. Changing it invalidates the scan cache.")
+    parser.add_argument("--time-year", type=int, default=None, metavar="YYYY",
+                        help="Emit per-day active-time totals for the whole year as JSON "
+                             "and exit (no pricing/quota fetch). Respects --no-cache, "
+                             "--gap-minutes and --project.")
     args = parser.parse_args()
+
+    if args.gap_minutes < 1:
+        print(f"Error: --gap-minutes must be >= 1 (got {args.gap_minutes})", file=sys.stderr)
+        sys.exit(2)
+    # Must be set BEFORE any cache load or scan: the cache header stamps it.
+    global _GAP_MINUTES
+    _GAP_MINUTES = args.gap_minutes
+
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        print("Error: ~/.claude/projects/ not found. Is Claude Code installed?", file=sys.stderr)
+        sys.exit(1)
+
+    # --time-year: active-time only, whole year. Skips load_pricing (no
+    # network; per-bucket costs computed during merge fall back to
+    # FALLBACK_PRICING internally and are discarded) and the quota fetch.
+    # Warm runs lean entirely on the per-file cache (entries are
+    # range-agnostic), well under 1s.
+    if args.time_year is not None:
+        if not (1970 <= args.time_year <= 9999):
+            print(f"Error: --time-year must be within 1970-9999 (got {args.time_year})",
+                  file=sys.stderr)
+            sys.exit(2)
+        y = args.time_year
+        _sessions, time_days = scan_sessions(
+            projects_dir, datetime(y, 1, 1), datetime(y + 1, 1, 1),
+            args.project, use_cache=not args.no_cache)
+        out = {
+            "script_version": __version__,
+            "year": y,
+            "gap_minutes": _GAP_MINUTES,
+            "days": {day: rec["total_seconds"] for day, rec in time_days.items()},
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(0)
 
     # Load model pricing (LiteLLM with cache, or fallback)
     load_pricing()
@@ -1631,20 +2083,17 @@ def main():
     # Optionally fetch OAuth quota. Done BEFORE scanning so failures are fast.
     subscription_quota = fetch_oauth_usage() if args.include_quota else None
 
-    projects_dir = Path.home() / ".claude" / "projects"
-    if not projects_dir.exists():
-        print("Error: ~/.claude/projects/ not found. Is Claude Code installed?", file=sys.stderr)
-        sys.exit(1)
-
     start_dt, end_dt = resolve_range(args.range)
     range_label = f"{start_dt.strftime('%Y/%m/%d')} ~ {(end_dt - timedelta(days=1)).strftime('%Y/%m/%d')}"
 
-    sessions = scan_sessions(projects_dir, start_dt, end_dt, args.project,
-                             use_cache=not args.no_cache)
+    sessions, time_days = scan_sessions(projects_dir, start_dt, end_dt, args.project,
+                                        use_cache=not args.no_cache)
 
     if not sessions:
         # Emit a well-formed empty result in JSON mode so callers (e.g. the Swift UI)
         # can parse stdout unconditionally. Prose-only output breaks JSONSerialization.
+        # Active time can exist with zero usage sessions (e.g. user/system lines
+        # only), so the "time" section carries the scan's real result here too.
         if args.json:
             empty = {
                 "script_version": __version__,
@@ -1654,6 +2103,7 @@ def main():
                 "totals_by_model": {},
                 "grand_total_cost": 0.0,
                 "daily_breakdown": {},
+                "time": {"gap_minutes": _GAP_MINUTES, "days": time_days},
                 "diagnostics": scan_diagnostics(),
             }
             if args.no_sessions:
@@ -1669,7 +2119,7 @@ def main():
 
     if args.json:
         print_json(sessions, subscription_quota=subscription_quota,
-                   include_sessions=not args.no_sessions)
+                   include_sessions=not args.no_sessions, time_days=time_days)
     elif args.by_project:
         print_by_project(sessions, range_label)
     elif args.by_day:

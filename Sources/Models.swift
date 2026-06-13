@@ -51,15 +51,21 @@ struct OAuthUsage: Codable, Equatable {
 }
 
 // Tab selection
+// rawValues are APPENDED, never renumbered: the selected tab's rawValue may be
+// persisted (UserDefaults) and renumbering would silently remap saved choices.
+// Display order is decoupled from rawValue order — PopoverView.visibleTabs
+// lists cost, tokens, time, subscription explicitly.
 enum DisplayTab: Int, CaseIterable {
     case cost = 0
     case tokens = 1
     case subscription = 2
+    case time = 3
     var icon: String {
         switch self {
         case .cost:         return "dollarsign.circle"
         case .tokens:       return "number.circle"
         case .subscription: return "gauge.with.dots.needle.67percent"
+        case .time:         return "clock"
         }
     }
     func label(_ loc: Localizer) -> String {
@@ -67,6 +73,23 @@ enum DisplayTab: Int, CaseIterable {
         case .cost:         return loc("cost")
         case .tokens:       return loc("tokens")
         case .subscription: return loc("subTab")
+        case .time:         return loc("timeTab")
+        }
+    }
+}
+
+/// Inner sub-view switcher of the Time tab (Week / Month / Year). App-only —
+/// not persisted, defaults to .week on each launch.
+enum TimeRange: Int, CaseIterable {
+    case week = 0
+    case month = 1
+    case year = 2
+
+    func label(_ loc: Localizer) -> String {
+        switch self {
+        case .week:  return loc("timeWeek")
+        case .month: return loc("timeMonth")
+        case .year:  return loc("timeYear")
         }
     }
 }

@@ -2,8 +2,19 @@
 
 [English](#english) | [中文](#中文)
 
-<img width="193" height="330" alt="image" src="https://github.com/user-attachments/assets/13c5218d-5e0f-4ad3-ade1-f80416825592" />
-<img width="193" height="418" alt="image" src="https://github.com/user-attachments/assets/8b9e98f6-0543-47cd-b694-f4e531d09f01" />
+<table>
+  <tr>
+    <td align="center"><img src="docs/cost.png" width="260" alt="Cost tab"/><br/><sub><b>Cost</b> — monthly total, per-model split, daily chart</sub></td>
+    <td align="center"><img src="docs/tokens.png" width="260" alt="Tokens tab"/><br/><sub><b>Tokens</b> — by type (in / out / cache) and by model</sub></td>
+    <td align="center"><img src="docs/plan.png" width="260" alt="Plan tab"/><br/><sub><b>Plan</b> — subscription quota left, with resets</sub></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><img src="docs/time-week.png" width="400" alt="Time — week view"/><br/><sub><b>Time · Week</b> — Apple-Health-style timeline, colored by model</sub></td>
+    <td align="center"><img src="docs/time-year.png" width="400" alt="Time — year heatmap"/><br/><sub><b>Time · Year</b> — GitHub-style activity heatmap</sub></td>
+  </tr>
+</table>
+
+<sub>Screenshots use synthetic demo data.</sub>
 
 ---
 
@@ -20,6 +31,10 @@ This app reads all your local session data and puts it in one place. One menu ba
 ### What you get
 
 - **Cost & Tokens** — switch views, with per-model breakdown (Opus / Sonnet / Haiku)
+- **Time** — *when* you actually used Claude Code, derived from session timestamps:
+  - **Week** — an Apple-Health-sleep-style timeline (Mon–Sun × 0–24h), each active block colored by the model in use
+  - **Month** — the same timeline, one row per week of the month
+  - **Year** — a GitHub-style activity heatmap
 - **Subscription quota** (Pro / Max) — dedicated tab showing how much is *left* in the 5-hour, 7-day and 7-day Sonnet windows, with reset countdowns. Live from Anthropic's official usage endpoint — the same source Claude Code's `/usage` uses
 - **Today / This Week / This Month** — token distribution by type (input, output, cache read, cache write)
 - **Daily bar chart** — hover for details
@@ -89,7 +104,7 @@ The **Subscription** tab is separate: it calls Anthropic's OAuth usage endpoint 
 No Xcode project — the app is compiled with plain `swiftc`. `Package.swift` exists only so `swift test` can run.
 
 ```
-Sources/                    ← 14 Swift files
+Sources/                    ← 16 Swift files
   main.swift                  ← entry point (single-instance check + bootstrap)
   AppDelegate.swift           ← menu bar item + title, popover, refresh timers, FSEvents watcher
   UsageStore.swift            ← published state + refresh orchestration
@@ -99,7 +114,8 @@ Sources/                    ← 14 Swift files
   Formatters.swift            ← number formatting
   Localization.swift          ← i18n strings
   Models.swift                ← app-only OAuth/quota data models
-  Core_*.swift                ← pure Foundation-only logic (unit-tested)
+  Core_*.swift                ← pure Foundation-only logic, unit-tested
+                                (usage parsing, dates, model classes, Time-tab math)
 Tests/CCCostCoreTests/      ← swift-testing unit tests for the Core_* files
 Package.swift               ← test harness ONLY (app builds via swiftc)
 Resources/analyze_usage.py  ← bundled Python analysis script
@@ -117,6 +133,14 @@ Costs are estimates based on public API pricing. If you're on a subscription pla
 
 Token counts match [ccusage](https://github.com/ryoppippi/ccusage) within ~0.5%.
 
+### A note on historical data
+
+This app can only show what's still on disk. Claude Code deletes session transcripts older than **`cleanupPeriodDays`** (default **30 days**) at startup, so months beyond that window will gradually become incomplete or disappear. If you want long-term history, raise the setting in `~/.claude/settings.json`:
+
+```json
+{ "cleanupPeriodDays": 3650 }
+```
+
 ---
 
 ## 中文
@@ -132,6 +156,10 @@ Claude Code 的 `/cost` 只显示当前会话。如果你有多个 Anthropic 账
 ### 功能
 
 - **费用 & Tokens** — 双视图切换，按模型分类（Opus / Sonnet / Haiku）
+- **时长（Time）** — 从会话时间戳还原你**什么时候**在用 Claude Code：
+  - **周视图** — 类似 Apple 健康「睡眠」的时间轴（周一~周日 × 0–24h），每段活跃色块按当时所用模型着色
+  - **月视图** — 同样的时间轴，每行是该月的一周
+  - **年视图** — GitHub 风格的活跃度热力图
 - **订阅剩余用量**（Pro / Max）— 独立 tab，查看 5 小时 / 7 天 / 7 天 Sonnet 窗口**还剩多少**及重置倒计时。数据来自 Anthropic 官方用量接口 —— 与 Claude Code `/usage` 同源
 - **今日 / 本周 / 本月** — 按类型拆分 token（输入、输出、缓存读、缓存写）
 - **每日柱状图** — 悬浮查看详情
@@ -199,7 +227,7 @@ open build/CCCostMonitor.app
 不依赖 Xcode 项目 —— app 直接用 `swiftc` 编译。`Package.swift` 仅用于跑 `swift test`。
 
 ```
-Sources/                    ← 14 个 Swift 文件
+Sources/                    ← 16 个 Swift 文件
   main.swift                  ← 入口（单实例检测 + 启动引导）
   AppDelegate.swift           ← 菜单栏图标与标题、弹窗、刷新定时器、FSEvents 监听
   UsageStore.swift            ← 状态发布 + 刷新编排
@@ -209,7 +237,8 @@ Sources/                    ← 14 个 Swift 文件
   Formatters.swift            ← 数字格式化
   Localization.swift          ← 多语言文案
   Models.swift                ← 仅供 app 使用的 OAuth/配额数据模型
-  Core_*.swift                ← 纯 Foundation 逻辑（有单元测试）
+  Core_*.swift                ← 纯 Foundation 逻辑，有单元测试
+                                （用量解析、日期、模型分类、Time tab 计算）
 Tests/CCCostCoreTests/      ← swift-testing 单元测试（针对 Core_* 文件）
 Package.swift               ← 仅作测试 harness（app 仍用 swiftc 构建）
 Resources/analyze_usage.py  ← 内置 Python 分析脚本
@@ -226,6 +255,14 @@ Info.plist                  ← LSUIElement=true；版本号的单一来源
 费用基于公开 API 定价估算。如果你使用订阅计划（Pro / Max / Team），实际计费方式不同 — 数字仅供参考。
 
 Token 计数与 [ccusage](https://github.com/ryoppippi/ccusage) 误差在 ~0.5% 以内。
+
+### 关于历史数据
+
+应用只能展示磁盘上还存在的数据。Claude Code 会在启动时删除超过 **`cleanupPeriodDays`**（默认 **30 天**）的会话日志，因此更早的月份会逐渐残缺甚至消失。如果你想长期保留历史，在 `~/.claude/settings.json` 里调大这个设置：
+
+```json
+{ "cleanupPeriodDays": 3650 }
+```
 
 ---
 
