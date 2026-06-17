@@ -68,6 +68,12 @@ class UsageStore: ObservableObject {
     // Localization
     @Published var language: AppLanguage
 
+    /// Whether to keep a durable local archive of daily usage so history
+    /// survives Claude Code's transcript cleanup (default on). Persisted to
+    /// UserDefaults. When off, the archive is neither written nor overlaid —
+    /// the existing file is left untouched until the user clears it.
+    @Published var archiveHistoryLocally: Bool = true
+
     // Subscription quota (from Anthropic OAuth endpoint, only populated for Pro/Max users)
     @Published var subscriptionQuota: OAuthUsage?
     @Published var hasOAuthToken: Bool = false {
@@ -107,6 +113,14 @@ class UsageStore: ObservableObject {
     // Script discovery + Process spawning (incl. timeout machinery) live in
     // UsageScriptClient; ALL invocations still flow through scriptQueue below.
     private let scriptClient = UsageScriptClient()
+
+    // Durable local usage archive (Application Support, outside ~/.claude).
+    // Fed monotonically from each successful scan + a periodic wide-range sweep;
+    // overlaid onto historical-month and year-heatmap reads. See UsageArchive.
+    private let archive = UsageArchive()
+    // Main-thread only: when the last wide-range archive sweep ran, so the
+    // periodic refresh doesn't sweep more than ~every 6h.
+    private var lastArchiveSweep: Date?
 
     // Serial queue for ALL analyze_usage.py executions: rapid month flipping or
     // repeated ⌘R must never stack concurrent full Python scans.
@@ -156,6 +170,11 @@ class UsageStore: ObservableObject {
             language = lang
         } else {
             language = AppLanguage.fromSystem()
+        }
+
+        // Archive-history preference: default ON; honor a stored choice if any.
+        if UserDefaults.standard.object(forKey: "archiveHistoryLocally") != nil {
+            archiveHistoryLocally = UserDefaults.standard.bool(forKey: "archiveHistoryLocally")
         }
 
         // Probe OAuth state once at startup so UI can choose Bedrock vs subscription branch.
@@ -209,6 +228,120 @@ class UsageStore: ObservableObject {
         UserDefaults.standard.set(lang.rawValue, forKey: "appLanguage")
     }
 
+    // MARK: - Local archive (durable history)
+
+    /// Toggle the durable local archive. Turning it ON backfills immediately
+    /// (a sweep) so existing history is captured; turning it OFF re-publishes
+    /// the live-only views (the archive file is kept until explicitly cleared).
+    func setArchiveHistoryLocally(_ on: Bool) {
+        guard archiveHistoryLocally != on else { return }
+        archiveHistoryLocally = on
+        UserDefaults.standard.set(on, forKey: "archiveHistoryLocally")
+        if on {
+            archiveSweepIfNeeded(force: true)
+        }
+        republishAfterArchiveChange()
+    }
+
+    /// Wipe the archive and re-publish the currently visible views from live
+    /// data only.
+    func clearArchive() {
+        archive.clear()
+        republishAfterArchiveChange()
+    }
+
+    /// Re-render whatever historical/year view is on screen after the archive
+    /// content or toggle changed (cache-first — no forced full scan unless the
+    /// year view needs a live refetch).
+    private func republishAfterArchiveChange() {
+        if !isCurrentMonth { loadHistoricalMonth() }
+        if selectedTab == .time && timeRange == .year {
+            loadYearTime(viewingTimeYear, force: true)
+        }
+    }
+
+    /// When archiving is on, fold the freshly-loaded month into the archive and
+    /// read back the monotonic superset so pruned days reappear; the month
+    /// total is recomputed from that superset. When off, returns the inputs
+    /// unchanged. Pure overlay — safe to call from any load path.
+    private func archiveOverlayHistorical(
+        month: PeriodUsage?, daily: [DailyUsage]?, time: TimeData?, yearMonth: String
+    ) -> (PeriodUsage?, [DailyUsage]?, TimeData?) {
+        guard archiveHistoryLocally else { return (month, daily, time) }
+        archive.merge(daily: daily, time: time)
+        let archivedDaily = archive.dailyBreakdown(yearMonth: yearMonth)
+        let archivedTimeDays = archive.timeDays(yearMonth: yearMonth)
+        let finalDaily = archivedDaily.isEmpty ? daily : archivedDaily
+        let finalTime: TimeData? = archivedTimeDays.isEmpty
+            ? time
+            : TimeData(gapMinutes: time?.gapMinutes ?? 10, days: archivedTimeDays)
+        let finalMonth: PeriodUsage? = (finalDaily?.isEmpty == false)
+            ? UsageParser.mergeDailyUsages(finalDaily!)
+            : month
+        return (finalMonth, finalDaily, finalTime)
+    }
+
+    /// Capture into the archive any days that are still on disk but not yet
+    /// fully archived — INCREMENTALLY. A high-water mark ("archiveSweptThrough")
+    /// records the last day swept; steady state re-scans only the last ~2 days
+    /// (today is still growing; yesterday just finalized), a gap after the app
+    /// was off re-scans back to the mark, and the very first run does one wide
+    /// pass to grab whatever is currently on disk. It NEVER scans below the
+    /// mark — days older than the retention window are already deleted, so
+    /// re-scanning that void is pure waste (and monotonic merge would ignore the
+    /// now-empty result anyway). Runs on launch + at most ~every 6h (force/⌘R
+    /// always runs); no-op when archiving is off. On the shared serial
+    /// scriptQueue, so it never stacks with the month scans.
+    func archiveSweepIfNeeded(force: Bool = false) {
+        guard archiveHistoryLocally else { return }
+        if !force, let last = lastArchiveSweep,
+           Date().timeIntervalSince(last) < 6 * 3600 { return }
+        lastArchiveSweep = Date()
+        let cal = AppDate.gregorian
+        let now = Date()
+        let todayKey = AppDate.dayKey(now)
+        let startKey: String
+        if let hwm = UserDefaults.standard.string(forKey: "archiveSweptThrough"),
+           let twoDaysAgo = cal.date(byAdding: .day, value: -2, to: now) {
+            // Incremental: from the high-water day (it may have been mid-day when
+            // last swept) through today, always covering at least the last ~2
+            // days. min() keeps us from ever reaching below the mark.
+            startKey = min(hwm, AppDate.dayKey(twoDaysAgo))
+        } else if let wide = cal.date(byAdding: .day, value: -200, to: now) {
+            // First-ever sweep: one pass over whatever is on disk now (warm
+            // scan-cache keeps it cheap); older-than-retention days are absent.
+            startKey = AppDate.dayKey(wide)
+        } else {
+            startKey = todayKey
+        }
+        scriptQueue.async { [weak self] in
+            guard let self = self else { return }
+            let range = "\(startKey):\(todayKey)"
+            guard let json = self.scriptClient.runScript(
+                ["--json", "--no-sessions", "--range", range]) else { return }
+            let daily = UsageParser.parseAllDailyBreakdown(json)
+            let time = UsageParser.parseTimeSection(json)
+            self.archive.merge(daily: daily, time: time)
+            // Advance the mark only after a successful scan+merge, so a failed
+            // scan retries the same range next time.
+            UserDefaults.standard.set(todayKey, forKey: "archiveSweptThrough")
+            DispatchQueue.main.async {
+                // The sweep may have added days the on-screen view didn't have;
+                // re-overlay it (cache-first, no extra scan for months).
+                guard self.archiveHistoryLocally else { return }
+                if !self.isCurrentMonth { self.loadHistoricalMonth() }
+                if self.selectedTab == .time && self.timeRange == .year {
+                    let archived = self.archive.yearSeconds(year: self.viewingTimeYear)
+                    guard !archived.isEmpty else { return }
+                    var merged = self.yearTimeCache[self.viewingTimeYear] ?? [:]
+                    for (k, v) in archived { merged[k] = max(merged[k] ?? 0, v) }
+                    self.yearTimeCache[self.viewingTimeYear] = merged
+                    self.yearTimeDays = merged
+                }
+            }
+        }
+    }
+
     // MARK: - Navigation
 
     func navigateMonth(offset: Int) {
@@ -244,11 +377,15 @@ class UsageStore: ObservableObject {
         // self-healing.
         if let snapshot = loadCacheSnapshot(year: y, month: m),
            snapshot.dailyBreakdown != nil, snapshot.time != nil {
+            let ym = String(format: "%04d-%02d", y, m)
+            let (om, od, ot) = archiveOverlayHistorical(
+                month: snapshot.data, daily: snapshot.dailyBreakdown,
+                time: snapshot.time, yearMonth: ym)
             self.today = nil
             self.week = nil
-            self.month = snapshot.data
-            self.dailyBreakdown = snapshot.dailyBreakdown
-            self.viewingTimeData = snapshot.time
+            self.month = om
+            self.dailyBreakdown = od
+            self.viewingTimeData = ot
             self.isLoading = false
             return
         }
@@ -266,15 +403,21 @@ class UsageStore: ObservableObject {
                 // superseded this one — while loading
                 guard generation == self.fetchGeneration,
                       self.viewingYear == y && self.viewingMonth == m else { return }
-                self.today = nil
-                self.week = nil
-                self.month = data
-                self.dailyBreakdown = daily
-                self.viewingTimeData = time
-                self.isLoading = false
+                // Persist the RAW scan to the month snapshot cache (a faithful
+                // record), then overlay the archive for display so pruned days
+                // reappear and the month total reflects them.
                 if let data = data {
                     self.saveCache(year: y, month: m, data: data, daily: daily, time: time)
                 }
+                let ym = String(format: "%04d-%02d", y, m)
+                let (om, od, ot) = self.archiveOverlayHistorical(
+                    month: data, daily: daily, time: time, yearMonth: ym)
+                self.today = nil
+                self.week = nil
+                self.month = om
+                self.dailyBreakdown = od
+                self.viewingTimeData = ot
+                self.isLoading = false
             }
         }
     }
@@ -288,6 +431,11 @@ class UsageStore: ObservableObject {
         // It keeps its own independent 5-minute cache — unaffected by the
         // JSONL fingerprint below.
         refreshQuota()
+
+        // Backfill the durable archive before transcripts get pruned. Throttled
+        // to ~every 6h (force/⌘R always runs); first call after launch sweeps
+        // since lastArchiveSweep is nil. No-op when archiving is off.
+        archiveSweepIfNeeded(force: force)
 
         // ⌘R also invalidates the per-year time cache; refetch only the year
         // the user is actually looking at (other years reload lazily on nav).
@@ -441,6 +589,14 @@ class UsageStore: ObservableObject {
                 // so update them regardless of what the user is currently viewing.
                 self.currentMonthData = m
                 self.currentTimeData = mergedTime
+                // Fold the fresh current-month scan into the durable archive
+                // (monotonic — never lowers a stored day). Current-month JSONL
+                // isn't pruned, so no overlay is needed for the live view; this
+                // keeps today's/this-month's archived values up to date between
+                // the wider sweeps.
+                if self.archiveHistoryLocally {
+                    self.archive.merge(daily: daily, time: mergedTime)
+                }
                 self.recomputeTimeToday()
                 self.lastUpdate = Date()
                 if let m = m {
@@ -585,8 +741,29 @@ class UsageStore: ObservableObject {
                 guard generation == self.yearFetchGeneration,
                       self.viewingTimeYear == year else { return }
                 if let parsed = parsed, parsed.year == year {
-                    self.yearTimeCache[year] = parsed.days
-                    self.yearTimeDays = parsed.days
+                    let final: [String: Int]
+                    if self.archiveHistoryLocally {
+                        // Fold the live year into the archive, then publish the
+                        // monotonic superset so days pruned from the transcripts
+                        // still light up the heatmap.
+                        self.archive.mergeYearSeconds(parsed.days)
+                        let overlaid = self.archive.yearSeconds(year: year)
+                        final = overlaid.isEmpty ? parsed.days : overlaid
+                    } else {
+                        final = parsed.days
+                    }
+                    self.yearTimeCache[year] = final
+                    self.yearTimeDays = final
+                } else if self.archiveHistoryLocally {
+                    // Live scan failed: fall back to archived history so the
+                    // heatmap shows what we've preserved rather than going blank.
+                    let archived = self.archive.yearSeconds(year: year)
+                    if !archived.isEmpty {
+                        self.yearTimeCache[year] = archived
+                        self.yearTimeDays = archived
+                    } else {
+                        self.yearTimeDays = [:]
+                    }
                 } else {
                     self.yearTimeDays = [:]
                 }
