@@ -250,6 +250,9 @@ class UsageStore: ObservableObject {
         republishAfterArchiveChange()
     }
 
+    /// Number of days currently in the durable archive — shown in the ⋯ menu.
+    var archivedDayCount: Int { archive.dayCount }
+
     /// Re-render whatever historical/year view is on screen after the archive
     /// content or toggle changed (cache-first — no forced full scan unless the
     /// year view needs a live refetch).
@@ -268,9 +271,10 @@ class UsageStore: ObservableObject {
         month: PeriodUsage?, daily: [DailyUsage]?, time: TimeData?, yearMonth: String
     ) -> (PeriodUsage?, [DailyUsage]?, TimeData?) {
         guard archiveHistoryLocally else { return (month, daily, time) }
-        archive.merge(daily: daily, time: time)
-        let archivedDaily = archive.dailyBreakdown(yearMonth: yearMonth)
-        let archivedTimeDays = archive.timeDays(yearMonth: yearMonth)
+        // Merge + read back the month overlay under one lock (see UsageArchive.overlay)
+        // so a concurrent sweep can't hand us a mismatched daily/time snapshot.
+        let (archivedDaily, archivedTimeDays) = archive.overlay(
+            mergingDaily: daily, time: time, yearMonth: yearMonth)
         let finalDaily = archivedDaily.isEmpty ? daily : archivedDaily
         let finalTime: TimeData? = archivedTimeDays.isEmpty
             ? time
@@ -310,6 +314,10 @@ class UsageStore: ObservableObject {
         } else if let wide = cal.date(byAdding: .day, value: -200, to: now) {
             // First-ever sweep: one pass over whatever is on disk now (warm
             // scan-cache keeps it cheap); older-than-retention days are absent.
+            // Caveat: a brand-new install sitting on >200 days of retained
+            // transcripts (cleanupPeriodDays set very high) won't archive days
+            // older than 200 on this first pass — but every day still gets
+            // archived while it's within the window as the mark advances daily.
             startKey = AppDate.dayKey(wide)
         } else {
             startKey = todayKey
@@ -323,22 +331,12 @@ class UsageStore: ObservableObject {
             let time = UsageParser.parseTimeSection(json)
             self.archive.merge(daily: daily, time: time)
             // Advance the mark only after a successful scan+merge, so a failed
-            // scan retries the same range next time.
+            // scan retries the same range next time. No inline view republish:
+            // the on-screen view picks up newly archived days on its next load
+            // (nav / tab switch / refresh) through the overlay paths. (An inline
+            // republish here raced loadYearTime/loadHistoricalMonth — which carry
+            // their own generation guards — without one of its own.)
             UserDefaults.standard.set(todayKey, forKey: "archiveSweptThrough")
-            DispatchQueue.main.async {
-                // The sweep may have added days the on-screen view didn't have;
-                // re-overlay it (cache-first, no extra scan for months).
-                guard self.archiveHistoryLocally else { return }
-                if !self.isCurrentMonth { self.loadHistoricalMonth() }
-                if self.selectedTab == .time && self.timeRange == .year {
-                    let archived = self.archive.yearSeconds(year: self.viewingTimeYear)
-                    guard !archived.isEmpty else { return }
-                    var merged = self.yearTimeCache[self.viewingTimeYear] ?? [:]
-                    for (k, v) in archived { merged[k] = max(merged[k] ?? 0, v) }
-                    self.yearTimeCache[self.viewingTimeYear] = merged
-                    self.yearTimeDays = merged
-                }
-            }
         }
     }
 
