@@ -575,7 +575,11 @@ struct OptionsMenu: NSViewRepresentable {
             toggle.state = store.archiveHistoryLocally ? .on : .off
             menu.addItem(toggle)
 
-            let note = NSMenuItem(title: loc("archiveNote"), action: nil, keyEquivalent: "")
+            // Informational (disabled) line: live archived-day count once there's
+            // data, else the "what is this" hint for first-timers.
+            let count = store.archivedDayCount
+            let noteTitle = count > 0 ? String(format: loc("archiveCount"), count) : loc("archiveNote")
+            let note = NSMenuItem(title: noteTitle, action: nil, keyEquivalent: "")
             note.isEnabled = false
             menu.addItem(note)
 

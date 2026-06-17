@@ -15,16 +15,17 @@ import Foundation
 // only the month shards it actually changed (steady state: just the current
 // month, ~tens of KB), never re-serializing years of stable history. All shards
 // are read once at launch into one in-memory dict; reads/overlays operate on
-// that. A one-time migration folds any pre-shard single-file archive in.
+// that.
 //
 // Threading: `data` is guarded by `lock`. Merges (scriptQueue / main) and reads
 // (main) take the lock briefly; encode+write happens on `ioQueue` against a
-// per-month snapshot, so disk writes never block a caller.
+// per-month snapshot, so disk writes never block a caller. The combined
+// `overlay(...)` merges + reads under ONE lock so a concurrent sweep can't
+// interleave between a write and the paired reads.
 final class UsageArchive {
     private let lock = NSLock()
     private var data: UsageArchiveData
     private let shardDir: URL
-    private let legacyURL: URL
     private let ioQueue = DispatchQueue(label: "com.claude.cc-cost-monitor.archive-io", qos: .utility)
 
     init() {
@@ -34,44 +35,35 @@ final class UsageArchive {
                 .appendingPathComponent("Library/Application Support"))
         let appDir = base.appendingPathComponent("CCCostMonitor", isDirectory: true)
         shardDir = appDir.appendingPathComponent("archive", isDirectory: true)
-        legacyURL = appDir.appendingPathComponent("usage-archive.json")
-        try? FileManager.default.createDirectory(at: shardDir, withIntermediateDirectories: true)
-
-        var loaded = UsageArchiveData()
-        var migratedFromLegacy = false
-
-        // One-time migration from the pre-shard single-file layout.
-        if let raw = try? Data(contentsOf: legacyURL),
-           let old = try? JSONDecoder().decode(UsageArchiveData.self, from: raw) {
-            loaded.days.merge(old.days) { a, _ in a }
-            migratedFromLegacy = true
+        do {
+            try FileManager.default.createDirectory(at: shardDir, withIntermediateDirectories: true)
+        } catch {
+            // Should never happen in Application Support; if it does, every
+            // persist() below will no-op — surface it rather than lose data silently.
+            NSLog("CCCostMonitor: failed to create archive dir %@: %@",
+                  shardDir.path, error.localizedDescription)
         }
 
-        // Load every month shard.
+        var loaded = UsageArchiveData()
         if let files = try? FileManager.default.contentsOfDirectory(
             at: shardDir, includingPropertiesForKeys: nil) {
             for file in files where file.pathExtension == "json" {
-                if let raw = try? Data(contentsOf: file),
-                   let shard = try? JSONDecoder().decode(UsageArchiveData.self, from: raw) {
-                    loaded.days.merge(shard.days) { a, _ in a }
+                guard let raw = try? Data(contentsOf: file),
+                      let shard = try? JSONDecoder().decode(UsageArchiveData.self, from: raw) else { continue }
+                // Forward-compat: never merge a shard written by a newer schema
+                // we don't understand (its fields could mean something else).
+                guard shard.schemaVersion <= UsageArchiveData.currentSchema else {
+                    NSLog("CCCostMonitor: skipping archive shard %@ (schema %d > %d)",
+                          file.lastPathComponent, shard.schemaVersion, UsageArchiveData.currentSchema)
+                    continue
                 }
+                loaded.days.merge(shard.days) { a, _ in a }
             }
         }
         data = loaded
-
-        if migratedFromLegacy {
-            // Re-shard everything once, then drop the legacy file.
-            persist(changedDays: Set(loaded.days.keys))
-            ioQueue.async { [legacyURL] in try? FileManager.default.removeItem(at: legacyURL) }
-        }
     }
 
     // MARK: Status (for UI)
-
-    var isEmpty: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return data.days.isEmpty
-    }
 
     var dayCount: Int {
         lock.lock(); defer { lock.unlock() }
@@ -101,14 +93,30 @@ final class UsageArchive {
         persist(changedDays: changed)
     }
 
-    /// Merge an entire scan's daily + time payload in one shot (the sweep /
-    /// historical overlay), rewriting only the months that changed.
+    /// Merge an entire scan's daily + time payload in one shot (the sweep),
+    /// rewriting only the months that changed.
     func merge(daily: [DailyUsage]?, time: TimeData?) {
         lock.lock()
         var changed = UsageArchiveLogic.mergeDaily(daily, into: &data)
         changed.formUnion(UsageArchiveLogic.mergeTime(time, into: &data))
         lock.unlock()
         persist(changedDays: changed)
+    }
+
+    /// Atomically merge a scan's daily + time into the archive AND read back the
+    /// month's overlay (daily + time days) under a SINGLE lock — so a concurrent
+    /// merge (e.g. the background sweep) can't interleave between the write and
+    /// the paired reads and hand the caller a mismatched daily/time snapshot.
+    func overlay(mergingDaily daily: [DailyUsage]?, time: TimeData?, yearMonth: String)
+        -> (daily: [DailyUsage], timeDays: [String: DayTimeUsage]) {
+        lock.lock()
+        var changed = UsageArchiveLogic.mergeDaily(daily, into: &data)
+        changed.formUnion(UsageArchiveLogic.mergeTime(time, into: &data))
+        let d = UsageArchiveLogic.dailyBreakdown(data, yearMonth: yearMonth)
+        let t = UsageArchiveLogic.timeDays(data, yearMonth: yearMonth)
+        lock.unlock()
+        persist(changedDays: changed)
+        return (d, t)
     }
 
     // MARK: Reads (overlay sources)
@@ -136,14 +144,13 @@ final class UsageArchive {
         lock.lock()
         data = UsageArchiveData()
         lock.unlock()
-        ioQueue.async { [shardDir, legacyURL] in
+        ioQueue.async { [shardDir] in
             if let files = try? FileManager.default.contentsOfDirectory(
                 at: shardDir, includingPropertiesForKeys: nil) {
                 for file in files where file.pathExtension == "json" {
                     try? FileManager.default.removeItem(at: file)
                 }
             }
-            try? FileManager.default.removeItem(at: legacyURL)
         }
     }
 
