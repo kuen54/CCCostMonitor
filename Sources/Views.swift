@@ -535,6 +535,80 @@ struct LanguageSwitcher: NSViewRepresentable {
     }
 }
 
+/// Footer "⋯" menu: the durable-archive toggle + a confirmed clear. Mirrors
+/// LanguageSwitcher's NSButton→NSMenu coordinator pattern; localized strings are
+/// threaded in from the popover's Localizer (the menu lives in AppKit, outside
+/// the SwiftUI environment).
+struct OptionsMenu: NSViewRepresentable {
+    @ObservedObject var store: UsageStore
+    let loc: Localizer
+
+    func makeNSView(context: Context) -> NSButton {
+        let btn = NSButton(frame: .zero)
+        btn.image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: nil)
+        btn.imageScaling = .scaleProportionallyDown
+        btn.isBordered = false
+        btn.contentTintColor = .secondaryLabelColor
+        btn.target = context.coordinator
+        btn.action = #selector(Coordinator.showMenu(_:))
+        btn.setContentHuggingPriority(.required, for: .horizontal)
+        return btn
+    }
+
+    func updateNSView(_ btn: NSButton, context: Context) {
+        context.coordinator.loc = loc
+        btn.contentTintColor = .secondaryLabelColor
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(store: store, loc: loc) }
+
+    class Coordinator: NSObject {
+        let store: UsageStore
+        var loc: Localizer
+        init(store: UsageStore, loc: Localizer) { self.store = store; self.loc = loc }
+
+        @objc func showMenu(_ sender: NSButton) {
+            let menu = NSMenu()
+            let toggle = NSMenuItem(title: loc("archiveToggle"),
+                                    action: #selector(toggleArchive), keyEquivalent: "")
+            toggle.target = self
+            toggle.state = store.archiveHistoryLocally ? .on : .off
+            menu.addItem(toggle)
+
+            let note = NSMenuItem(title: loc("archiveNote"), action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            menu.addItem(note)
+
+            menu.addItem(.separator())
+
+            let clear = NSMenuItem(title: loc("archiveClear"),
+                                   action: #selector(clearArchive), keyEquivalent: "")
+            clear.target = self
+            menu.addItem(clear)
+
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+        }
+
+        @objc func toggleArchive() {
+            store.setArchiveHistoryLocally(!store.archiveHistoryLocally)
+        }
+
+        @objc func clearArchive() {
+            let alert = NSAlert()
+            alert.messageText = loc("archiveClearTitle")
+            alert.informativeText = loc("archiveClearBody")
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: loc("archiveClearConfirm"))
+            alert.addButton(withTitle: loc("archiveClearCancel"))
+            // First button (Clear) == NSAlertFirstButtonReturn (1000); compare by
+            // rawValue so the constant resolves across SDK variants.
+            if alert.runModal().rawValue == 1000 {
+                store.clearArchive()
+            }
+        }
+    }
+}
+
 // MARK: - Subscription tab
 
 /// One subscription window rendered with a "remaining" framing (how much quota is
@@ -1611,6 +1685,9 @@ struct PopoverView: View {
 
                 // Language switcher
                 LanguageSwitcher(store: store)
+
+                // Options (archive history toggle + clear)
+                OptionsMenu(store: store, loc: loc)
 
                 // Manual refresh ALWAYS runs a real scan: force bypasses the
                 // fingerprint short-circuit (the user is explicitly asking).

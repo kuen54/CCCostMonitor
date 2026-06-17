@@ -45,35 +45,56 @@ enum UsageParser {
         var result: [DailyUsage] = []
         for dateStr in breakdown.keys.sorted() {
             guard dateStr.hasPrefix(yearMonth),
-                  let dayData = breakdown[dateStr] as? [String: Any] else { continue }
-            let dayCost = dayData["total_cost"] as? Double ?? 0
-            var models: [ModelUsage] = []
-            var totalTokens = 0
-            if let modelsDict = dayData["models"] as? [String: Any] {
-                for cls in ModelClass.allCases {
-                    guard let data = modelsDict[cls.rawValue] as? [String: Any] else { continue }
-                    let inp  = data["input_tokens"] as? Int ?? 0
-                    let out  = data["output_tokens"] as? Int ?? 0
-                    let cr   = data["cache_read"] as? Int ?? 0
-                    let cw   = data["cache_write"] as? Int ?? 0
-                    let msgs = data["messages"] as? Int ?? 0
-                    let cost = data["cost"] as? Double ?? 0
-                    models.append(ModelUsage(
-                        id: cls.rawValue, name: cls.displayName,
-                        cost: cost, messages: msgs,
-                        inputTokens: inp, outputTokens: out,
-                        cacheRead: cr, cacheWrite: cw
-                    ))
-                    totalTokens += inp + out + cr + cw
-                }
-            }
-            let dayNum = Int(dateStr.suffix(2)) ?? 1
-            result.append(DailyUsage(
-                dateString: dateStr, day: dayNum,
-                cost: dayCost, totalTokens: totalTokens, models: models
-            ))
+                  let dayData = breakdown[dateStr] as? [String: Any],
+                  let day = parseDayEntry(dateStr, dayData) else { continue }
+            result.append(day)
         }
         return result.isEmpty ? nil : result
+    }
+
+    /// Parse the WHOLE daily_breakdown with no month filter — for the archive
+    /// sweep, which scans a wide range and merges every available day. Returns
+    /// nil when the section is absent/empty (matches parseDailyBreakdown).
+    static func parseAllDailyBreakdown(_ json: [String: Any]) -> [DailyUsage]? {
+        guard let breakdown = json["daily_breakdown"] as? [String: Any], !breakdown.isEmpty else {
+            return nil
+        }
+        var result: [DailyUsage] = []
+        for dateStr in breakdown.keys.sorted() {
+            guard let dayData = breakdown[dateStr] as? [String: Any],
+                  let day = parseDayEntry(dateStr, dayData) else { continue }
+            result.append(day)
+        }
+        return result.isEmpty ? nil : result
+    }
+
+    /// Build a single DailyUsage from one daily_breakdown entry. Shared by the
+    /// month-filtered and all-days parsers above.
+    private static func parseDayEntry(_ dateStr: String, _ dayData: [String: Any]) -> DailyUsage? {
+        let dayCost = dayData["total_cost"] as? Double ?? 0
+        var models: [ModelUsage] = []
+        var totalTokens = 0
+        if let modelsDict = dayData["models"] as? [String: Any] {
+            for cls in ModelClass.allCases {
+                guard let data = modelsDict[cls.rawValue] as? [String: Any] else { continue }
+                let inp  = data["input_tokens"] as? Int ?? 0
+                let out  = data["output_tokens"] as? Int ?? 0
+                let cr   = data["cache_read"] as? Int ?? 0
+                let cw   = data["cache_write"] as? Int ?? 0
+                let msgs = data["messages"] as? Int ?? 0
+                let cost = data["cost"] as? Double ?? 0
+                models.append(ModelUsage(
+                    id: cls.rawValue, name: cls.displayName,
+                    cost: cost, messages: msgs,
+                    inputTokens: inp, outputTokens: out,
+                    cacheRead: cr, cacheWrite: cw
+                ))
+                totalTokens += inp + out + cr + cw
+            }
+        }
+        let dayNum = Int(dateStr.suffix(2)) ?? 1
+        return DailyUsage(dateString: dateStr, day: dayNum,
+                          cost: dayCost, totalTokens: totalTokens, models: models)
     }
 
     /// Merge multiple DailyUsage entries into a single PeriodUsage
