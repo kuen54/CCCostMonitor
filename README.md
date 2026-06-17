@@ -149,6 +149,8 @@ If you want to keep long-term history, raise the setting in `~/.claude/settings.
 { "cleanupPeriodDays": 3650 }
 ```
 
+**Or just let the app keep it for you.** CCCostMonitor maintains its own durable archive of daily usage (cost, tokens, and active time) under `~/Library/Application Support/CCCostMonitor/` — *outside* `~/.claude`, so Claude Code's cleanup can't reach it. It's **on by default**: each day's totals are captured while the transcripts still exist, and the Cost / Tokens / year-heatmap views read through the archive, so older months keep showing even after their sessions are pruned. Toggle or clear it from the footer **⋯** menu. It stores compact daily aggregates (not transcripts), so you can still let Claude Code prune transcripts to save disk and keep your long-term stats.
+
 > Note: deletion happens at the whole-file level. The `/compact` command, by contrast, only summarizes a session's *in-context* history — it appends a summary line and does **not** rewrite or delete the older lines already written to the transcript ([sessions docs](https://code.claude.com/docs/en/sessions)).
 
 ---
@@ -280,6 +282,8 @@ Claude Code 在启动时会删除超过 **`cleanupPeriodDays`** 的会话日志�
 ```json
 { "cleanupPeriodDays": 3650 }
 ```
+
+**或者直接交给应用。** CCCostMonitor 会把每天的用量（费用、tokens、活跃时长）单独归档到 `~/Library/Application Support/CCCostMonitor/` —— 在 `~/.claude` *之外*，Claude Code 的清理碰不到。**默认开启**：趁会话日志还在时就把每天的汇总存下来，Cost / Tokens / 年度热力图都读取归档，所以即使底层会话被清掉，旧月份依然能显示。可在底部 **⋯** 菜单里开关或清空。它存的是紧凑的每日汇总（而非原始日志），所以你完全可以让 Claude Code 照常清理日志省磁盘，长期统计照样保留。
 
 > 注：删除是整文件级别的。而 `/compact` 命令只是压缩会话的*上下文内*历史 —— 它追加一条摘要行，**不会**重写或删除已经写入 transcript 的旧行（[sessions 文档](https://code.claude.com/docs/en/sessions)）。
 
