@@ -30,6 +30,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // the button (a resizing anchor makes NSPopover drift left); popoverDidClose flushes it.
     private var latestMenuTitle = " … "
 
+    // Notch display mode. When displayMode == .notch the controller owns the notch
+    // panel + its whole lifecycle; the displayMode sink below is the SINGLE writer of
+    // statusItem.isVisible and the only place the controller is built/torn down.
+    private var notchController: NotchController?
+    private var displayModeCancellable: AnyCancellable?
+
     // Claude official logo as a menu bar template image
     // SVG path from SimpleIcons (https://simpleicons.org/?q=claude), viewBox 0 0 24 24
     private func makeClaudeIcon(size: CGFloat = 18) -> NSImage {
@@ -60,7 +66,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Status bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.autosaveName = "CCCostMonitor"
-        statusItem.isVisible = true
+        // Initial visibility set synchronously to avoid a launch-time flash of the
+        // icon in notch mode; the displayMode sink below remains the single owner.
+        statusItem.isVisible = (store.displayMode == .menubar)
         if let button = statusItem.button {
             button.image = makeClaudeIcon()
             button.imagePosition = .imageLeft
@@ -93,27 +101,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             store.$currentMonthData, store.$selectedTab, store.$language, store.$subscriptionQuota)
             .combineLatest(store.$timeTodaySeconds)
             .receive(on: RunLoop.main)
-            .sink { [weak self] combined, todaySecs in
-                let (monthData, tab, _, quota) = combined
-                guard let self = self, let monthData = monthData else { return }
-                let title: String
-                switch tab {
-                case .cost:
-                    title = formatCost(monthData.cost)
-                case .tokens:
-                    title = formatTokensShort(monthData.totalTokens)
-                case .subscription:
-                    // Show what's LEFT in the 5-hour window — the limit subs hit first.
-                    if let q = quota {
-                        title = "5h \(max(0, 100 - q.five_hour.displayPercent))%"
-                    } else {
-                        title = formatCost(monthData.cost)
-                    }
-                case .time:
-                    // Today's active duration: "3.4h" / "32m" / "0m".
-                    title = TimeLogic.formatDurationShort(todaySecs)
-                }
-                let display = " \(title) "
+            .sink { [weak self] combined, _ in
+                let (monthData, _, _, _) = combined
+                guard let self = self, monthData != nil else { return }
+                // Single source of truth: store.menuBarValue (shared with the notch
+                // idle label) computes the per-tab string. Guard on monthData so a
+                // transient nil can never overwrite a good title with "…".
+                let display = " \(self.store.menuBarValue) "
                 self.latestMenuTitle = display
                 // Don't resize the status button while the popover is open — a resizing
                 // anchor makes NSPopover creep left. popoverDidClose applies the latest.
@@ -147,6 +141,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             name: NSNotification.Name("com.claude.cc-cost-monitor.show"),
             object: nil
         )
+
+        // Display-mode lifecycle: the SINGLE owner of statusItem visibility and the
+        // notch controller. @Published delivers the current value on subscribe, so
+        // this sink also performs the initial build for a saved .notch preference.
+        displayModeCancellable = store.$displayMode
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] mode in self?.applyDisplayMode(mode) }
+    }
+
+    /// Build or tear down the notch UI and toggle the menu-bar item to match the mode.
+    /// Idempotent — safe to call repeatedly with the same value. The one place that
+    /// writes statusItem.isVisible while a notch controller may exist.
+    private func applyDisplayMode(_ mode: DisplayMode) {
+        switch mode {
+        case .menubar:
+            notchController?.stop()
+            notchController = nil
+            statusItem.isVisible = true
+        case .notch:
+            statusItem.isVisible = false
+            // If the popover happened to be open when switching, close it.
+            if popover.isShown { popover.performClose(nil) }
+            if notchController == nil {
+                let controller = NotchController(store: store, onQuit: {
+                    NSApplication.shared.terminate(nil)
+                })
+                notchController = controller
+                controller.start()
+            }
+        }
     }
 
     // Called when user opens the app again (double-click, Spotlight, Launchpad, etc.)
@@ -175,6 +200,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func showPopover() {
+        // In notch mode there is no status item to anchor to — a relaunch / reopen
+        // expands the notch instead of popping the (hidden) menu-bar popover.
+        if store.displayMode == .notch {
+            notchController?.reveal()
+            return
+        }
         // Ensure the status item is visible in case macOS hid it in overflow
         statusItem.isVisible = true
         guard let button = statusItem.button else { return }
@@ -257,6 +288,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        notchController?.stop()
+        notchController = nil
         fsRefreshDebounce?.cancel()
         fsRefreshDebounce = nil
         if let stream = fsEventStream {

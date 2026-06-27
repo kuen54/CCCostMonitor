@@ -74,6 +74,11 @@ class UsageStore: ObservableObject {
     /// the existing file is left untouched until the user clears it.
     @Published var archiveHistoryLocally: Bool = true
 
+    /// Where the idle icon+value lives: the system menu bar (default) or the
+    /// MacBook notch. Persisted to UserDefaults; the AppDelegate sink reacts to
+    /// changes (builds/tears down the notch panel, toggles the status item).
+    @Published var displayMode: DisplayMode = .menubar
+
     // Subscription quota (from Anthropic OAuth endpoint, only populated for Pro/Max users)
     @Published var subscriptionQuota: OAuthUsage?
     @Published var hasOAuthToken: Bool = false {
@@ -108,6 +113,30 @@ class UsageStore: ObservableObject {
         // df.string(from:) output is human-facing and stays locale-aware.
         guard let date = AppDate.gregorian.date(from: comps) else { return "" }
         return df.string(from: date)
+    }
+
+    /// The menu-bar number string for the CURRENT month + selected tab — the
+    /// single source of truth shared by the menu-bar title sink (AppDelegate) and
+    /// the notch idle label, so the two presentations can never drift. Always the
+    /// current month (the menu bar ignores month navigation). Returns "…" until
+    /// the first scan lands. Mirrors the previously-inlined AppDelegate switch.
+    var menuBarValue: String {
+        guard let monthData = currentMonthData else { return "…" }
+        switch selectedTab {
+        case .cost:
+            return formatCost(monthData.cost)
+        case .tokens:
+            return formatTokensShort(monthData.totalTokens)
+        case .subscription:
+            // Show what's LEFT in the 5-hour window — the limit subs hit first.
+            if let q = subscriptionQuota {
+                return "5h \(max(0, 100 - q.five_hour.displayPercent))%"
+            }
+            return formatCost(monthData.cost)
+        case .time:
+            // Today's active duration: "3.4h" / "32m" / "0m".
+            return TimeLogic.formatDurationShort(timeTodaySeconds)
+        }
     }
 
     // Script discovery + Process spawning (incl. timeout machinery) live in
@@ -177,6 +206,12 @@ class UsageStore: ObservableObject {
             archiveHistoryLocally = UserDefaults.standard.bool(forKey: "archiveHistoryLocally")
         }
 
+        // Display-mode preference: menu bar (default) or notch.
+        if let savedMode = UserDefaults.standard.string(forKey: "displayMode"),
+           let mode = DisplayMode(rawValue: savedMode) {
+            displayMode = mode
+        }
+
         // Probe OAuth state once at startup so UI can choose Bedrock vs subscription branch.
         hasOAuthToken = SubscriptionQuotaService.shared.hasOAuthToken
     }
@@ -226,6 +261,12 @@ class UsageStore: ObservableObject {
     func setLanguage(_ lang: AppLanguage) {
         language = lang
         UserDefaults.standard.set(lang.rawValue, forKey: "appLanguage")
+    }
+
+    func setDisplayMode(_ mode: DisplayMode) {
+        guard displayMode != mode else { return }
+        displayMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "displayMode")
     }
 
     // MARK: - Local archive (durable history)

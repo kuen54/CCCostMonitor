@@ -93,3 +93,19 @@ enum TimeRange: Int, CaseIterable {
         }
     }
 }
+
+/// Where the app surfaces its idle icon+value: the system menu bar (default) or
+/// the MacBook notch (a drop-down panel on hover). String raw value — unlike the
+/// Int-raw DisplayTab above, a persisted choice can never silently remap if the
+/// cases are reordered. App-only — must NOT enter any Core_*.swift.
+enum DisplayMode: String, CaseIterable {
+    case menubar
+    case notch
+
+    func label(_ loc: Localizer) -> String {
+        switch self {
+        case .menubar: return loc("displayModeMenubar")
+        case .notch:   return loc("displayModeNotch")
+        }
+    }
+}
