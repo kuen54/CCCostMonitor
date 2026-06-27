@@ -506,17 +506,21 @@ struct LanguageSwitcher: NSViewRepresentable {
     }
 
     func updateNSView(_ btn: NSButton, context: Context) {
+        // nil in menu-bar mode (NSPopover host never injects it) → keepVisible no-ops.
+        context.coordinator.notchVM = context.environment.notchViewModel
         btn.contentTintColor = .secondaryLabelColor
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(store: store) }
 
-    class Coordinator: NSObject {
+    class Coordinator: NSObject, NSMenuDelegate {
         let store: UsageStore
+        weak var notchVM: NotchViewModel?
         init(store: UsageStore) { self.store = store }
 
         @objc func showMenu(_ sender: NSButton) {
             let menu = NSMenu()
+            menu.delegate = self
             for lang in AppLanguage.allCases {
                 let item = NSMenuItem(title: lang.displayName, action: #selector(pick(_:)), keyEquivalent: "")
                 item.target = self
@@ -532,6 +536,11 @@ struct LanguageSwitcher: NSViewRepresentable {
                 store.setLanguage(lang)
             }
         }
+
+        // keepVisible: hold the notch panel open while this NSMenu is up (the cursor
+        // leaves the notch's hover zone to reach the menu items).
+        func menuWillOpen(_ menu: NSMenu) { notchVM?.preventClose = true }
+        func menuDidClose(_ menu: NSMenu) { notchVM?.preventClose = false }
     }
 }
 
@@ -557,18 +566,38 @@ struct OptionsMenu: NSViewRepresentable {
 
     func updateNSView(_ btn: NSButton, context: Context) {
         context.coordinator.loc = loc
+        // nil in menu-bar mode (NSPopover host never injects it) → keepVisible no-ops.
+        context.coordinator.notchVM = context.environment.notchViewModel
         btn.contentTintColor = .secondaryLabelColor
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(store: store, loc: loc) }
 
-    class Coordinator: NSObject {
+    class Coordinator: NSObject, NSMenuDelegate {
         let store: UsageStore
         var loc: Localizer
+        weak var notchVM: NotchViewModel?
         init(store: UsageStore, loc: Localizer) { self.store = store; self.loc = loc }
 
         @objc func showMenu(_ sender: NSButton) {
             let menu = NSMenu()
+            menu.delegate = self
+
+            // Display location: menu bar vs notch. A disabled header + one
+            // checkable item per mode (mirrors the LanguageSwitcher pattern).
+            let modeHeader = NSMenuItem(title: loc("displayModeHeader"), action: nil, keyEquivalent: "")
+            modeHeader.isEnabled = false
+            menu.addItem(modeHeader)
+            for mode in DisplayMode.allCases {
+                let item = NSMenuItem(title: mode.label(loc),
+                                      action: #selector(pickDisplayMode(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = mode.rawValue
+                item.state = store.displayMode == mode ? .on : .off
+                menu.addItem(item)
+            }
+            menu.addItem(.separator())
+
             let toggle = NSMenuItem(title: loc("archiveToggle"),
                                     action: #selector(toggleArchive), keyEquivalent: "")
             toggle.target = self
@@ -593,11 +622,24 @@ struct OptionsMenu: NSViewRepresentable {
             menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
         }
 
+        @objc func pickDisplayMode(_ item: NSMenuItem) {
+            if let raw = item.representedObject as? String,
+               let mode = DisplayMode(rawValue: raw) {
+                store.setDisplayMode(mode)
+            }
+        }
+
         @objc func toggleArchive() {
             store.setArchiveHistoryLocally(!store.archiveHistoryLocally)
         }
 
         @objc func clearArchive() {
+            // Hold the notch open across the modal; in notch mode also bring the app
+            // forward so the alert (from a non-activating panel) isn't buried.
+            notchVM?.preventClose = true
+            if notchVM != nil { NSApp.activate(ignoringOtherApps: true) }
+            defer { notchVM?.preventClose = false }
+
             let alert = NSAlert()
             alert.messageText = loc("archiveClearTitle")
             alert.informativeText = loc("archiveClearBody")
@@ -610,6 +652,10 @@ struct OptionsMenu: NSViewRepresentable {
                 store.clearArchive()
             }
         }
+
+        // keepVisible: hold the notch panel open while the ⋯ NSMenu is up.
+        func menuWillOpen(_ menu: NSMenu) { notchVM?.preventClose = true }
+        func menuDidClose(_ menu: NSMenu) { notchVM?.preventClose = false }
     }
 }
 
