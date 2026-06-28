@@ -181,9 +181,13 @@ struct NotchRootView: View {
     /// Inner margin around the popover: at least the open top-corner radius (the
     /// NotchShape walls are inset by that) plus breathing room, so nothing is clipped.
     private let hMargin: CGFloat = 18
-    /// Breathing room ABOVE the notch band (the real top inset is added on top of this
-    /// so the header clears the physical camera).
-    private let topMargin: CGFloat = 8
+    /// Visible gap between the physical notch's bottom edge and the popover's first
+    /// content row (the "CC Monitor" header). Small so the header hugs the notch.
+    private let notchHeaderGap: CGFloat = 6
+    /// PopoverView's own header top padding (`.padding(.top, 14)`). We subtract it from
+    /// the notch offset so that transparent band overlaps the black notch instead of
+    /// stacking on top and pushing the header far below the camera.
+    private let popoverInnerTopPadding: CGFloat = 14
     private let bottomMargin: CGFloat = 14
 
     @State private var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -207,9 +211,11 @@ struct NotchRootView: View {
                     .environment(\.notchViewModel, vm)
                     .fixedSize()
                     .padding(.horizontal, hMargin)
-                    // Start the content BELOW the physical notch so the header clears the
-                    // camera; the empty black band above just blends with the real notch.
-                    .padding(.top, max(8, vm.closedNotchSize.height) + topMargin)
+                    // Drop the header just below the physical notch: the camera's height
+                    // minus PopoverView's own top padding (which harmlessly overlaps the
+                    // black notch) plus a small gap, so "CC Monitor" hugs the notch.
+                    .padding(.top, max(8, vm.closedNotchSize.height
+                                          + notchHeaderGap - popoverInnerTopPadding))
                     .padding(.bottom, bottomMargin)
                     .transition(reduceMotion
                         ? .opacity

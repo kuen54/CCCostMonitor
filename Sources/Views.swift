@@ -1566,6 +1566,17 @@ struct PopoverView: View {
         store.hasOAuthToken ? [.cost, .tokens, .time, .subscription] : [.cost, .tokens, .time]
     }
 
+    /// Notch-only spring for the per-tab WIDTH flip (360↔480). In the notch the black
+    /// shape grows symmetrically from the center, so a spring reads well. Menu bar gets
+    /// nil here, so tabs switch INSTANTLY: an animated NSPopover resize jitters the rows
+    /// above and a width animation overshoots, exposing the window backing as a black
+    /// flash — so the menu-bar popover snaps with no animation. Reduce-motion aware.
+    private var notchWidthAnimation: Animation? {
+        guard store.displayMode == .notch else { return nil }
+        return NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            ? NotchAnimations.reduced : NotchAnimations.open
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // ── Header ──
@@ -1652,14 +1663,12 @@ struct PopoverView: View {
             footer
         }
         // The Time tab needs room for a 53-column heatmap and a 0–24h timeline;
-        // the other tabs keep the original compact width. The width flip rides
-        // the same no-animation path as the height changes below (plus the
-        // popoverDidShow animates=false handling in AppDelegate) — no jitter.
+        // the other tabs keep the original compact width.
         .frame(width: store.selectedTab == .time ? 480 : 360)
-        // Switch tabs instantly. Without this, SwiftUI animates the content-height
-        // change when selectedTab flips, which ripples up and makes the month-nav row
-        // jitter as the popover resizes. nil animation = instant swap, no resize wobble.
-        .animation(nil, value: store.selectedTab)
+        // Notch: spring the width flip so it grows symmetrically from the notch center.
+        // Menu bar: nil → tabs switch instantly (no NSPopover resize animation). See
+        // notchWidthAnimation.
+        .animation(notchWidthAnimation, value: store.selectedTab)
         // Single injection point: every subview resolves strings via
         // @Environment(\.localizer) from here on down.
         .environment(\.localizer, loc)
