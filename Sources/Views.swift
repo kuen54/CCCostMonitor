@@ -875,8 +875,9 @@ struct SessionTabView: View {
                 emptyState
             } else {
                 if store.showOldClaudeHint { hintBanner }
+                if let jumpHint = store.sessionJumpHint { jumpHintBanner(jumpHint) }
                 ForEach(groups) { group in
-                    SessionGroupSection(group: group)
+                    SessionGroupSection(group: group, store: store)
                 }
             }
         }
@@ -912,12 +913,29 @@ struct SessionTabView: View {
         .padding(8)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
     }
+
+    /// Transient, non-modal hint after a click-to-jump that could only raise the
+    /// app (ambiguous pane) / needs Automation permission / failed. Auto-clears.
+    private func jumpHintBanner(_ key: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "info.circle")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+            Text(loc(key))
+                .font(.system(size: 10.5)).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.08)))
+        .transition(.opacity)
+    }
 }
 
 /// One cwd's card: folder header (basename / git top-level, full path on hover)
 /// + its session rows.
 struct SessionGroupSection: View {
     let group: SessionGroup
+    @ObservedObject var store: UsageStore
     @Environment(\.localizer) private var loc
 
     var body: some View {
@@ -940,7 +958,7 @@ struct SessionGroupSection: View {
 
             VStack(spacing: 2) {
                 ForEach(group.sessions) { session in
-                    SessionRow(session: session)
+                    SessionRow(session: session, store: store)
                 }
             }
         }
@@ -950,9 +968,13 @@ struct SessionGroupSection: View {
 }
 
 /// One session: colored status dot + label, short id / version, relative time.
+/// Phase 3: the whole row is clickable — a tap focuses/raises that session's
+/// terminal window (and pane/tab where possible) via store.jumpToSession.
 struct SessionRow: View {
     let session: SessionInfo
+    @ObservedObject var store: UsageStore
     @Environment(\.localizer) private var loc
+    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -980,12 +1002,29 @@ struct SessionRow: View {
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
             }
+            // Jump affordance: a subtle "open this terminal" glyph that fades in
+            // on hover. Always present in the layout (fixed width) so the row
+            // doesn't reflow when it appears.
+            Image(systemName: "arrow.up.forward.app")
+                .font(.system(size: 10.5))
+                .foregroundColor(.secondary)
+                .opacity(hovering ? 0.9 : 0.0)
+                .frame(width: 13)
         }
         .padding(.vertical, 3)
-        .padding(.horizontal, 2)
-        // Phase 3 attaches a tap handler here; structuring the row as a single
-        // hit-testable shape now keeps that change additive.
+        .padding(.horizontal, 4)
+        // Single hit-testable shape (set up in Phase 1) so the tap is additive.
         .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(Color.primary.opacity(hovering ? 0.06 : 0.0))
+        )
+        .onHover { inside in
+            hovering = inside
+            // Pointer cursor over a clickable row.
+            if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        .onTapGesture { store.jumpToSession(session) }
     }
 
     private var statusColor: Color {

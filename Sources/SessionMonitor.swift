@@ -15,6 +15,27 @@ import Darwin
 //
 // NOT part of CCCostCore — never add this file to Package.swift.
 
+/// Phase-3 runtime targeting facts for ONE live session — everything needed to
+/// raise its terminal window/pane, observed by the app layer but deliberately
+/// kept OUT of the Codable SessionInfo (these are ephemeral process facts, not
+/// registry data). Published as a parallel `[sessionId: SessionTarget]` map.
+struct SessionTarget: Equatable {
+    /// Controlling tty, bare ("ttys000"); nil when the session has none.
+    let tty: String?
+    /// The owning GUI terminal (Otty / Apple Terminal / iTerm2 / …).
+    let terminal: TerminalKind
+    /// Human display name of the terminal app (for hints / `open -a`).
+    let appName: String?
+    /// Bundle id of the terminal app (for `open -b` and otty-cli discovery).
+    let bundleId: String?
+    /// Running pid of the terminal GUI app (for NSRunningApplication.activate).
+    let appPid: Int?
+    /// A tmux/screen server sits between the shell and the GUI app.
+    let multiplexed: Bool
+    /// The session's cwd, copied here for the Otty fuzzy (cwd) join.
+    let cwd: String
+}
+
 /// Everything the monitor publishes in one Equatable payload so the consumer can
 /// guard a single comparison.
 struct SessionScan: Equatable {
@@ -29,6 +50,8 @@ struct SessionScan: Equatable {
     /// user hasn't looked at yet. Derived by the monitor across scans via the
     /// pure SessionLogic.stepDoneUnseen reducer; drives the notch's green dot.
     var anyDoneUnseen: Bool = false
+    /// Phase 3: sessionId → terminal targeting facts for click-to-jump.
+    var targets: [String: SessionTarget] = [:]
 
     static let empty = SessionScan(sessions: [], labels: [:], oldClaudeHint: false)
 }
@@ -211,7 +234,79 @@ final class SessionMonitor {
             a.cwd != b.cwd ? a.cwd < b.cwd : a.sessionId < b.sessionId
         }
         let labels = resolveLabels(for: ordered)
-        return SessionScan(sessions: ordered, labels: labels, oldClaudeHint: oldHint)
+        let targets = gatherTargets(for: ordered)
+        return SessionScan(sessions: ordered, labels: labels,
+                           oldClaudeHint: oldHint, targets: targets)
+    }
+
+    // MARK: - Jump targeting (Phase 3)
+
+    private struct ProcRow { let ppid: Int; let tty: String; let comm: String }
+
+    /// Build the per-session targeting map from ONE `ps -Ao pid,ppid,tty,comm`
+    /// snapshot (no N spawns): the session's tty comes straight from its row,
+    /// the owning GUI terminal from walking the ppid chain up to the first
+    /// process whose comm is a `.app` bundle, and `multiplexed` from spotting a
+    /// tmux/screen ancestor on the way up. App display name + bundle id are read
+    /// once per app bundle path (cached). Empty on any ps failure — the UI then
+    /// just app-activates with no exact target.
+    private func gatherTargets(for sessions: [SessionInfo]) -> [String: SessionTarget] {
+        guard !sessions.isEmpty,
+              let out = runProcess("/bin/ps", ["-Ao", "pid=,ppid=,tty=,comm="]) else { return [:] }
+        var table: [Int: ProcRow] = [:]
+        for line in out.split(separator: "\n") {
+            let toks = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard toks.count >= 4, let pid = Int(toks[0]), let ppid = Int(toks[1]) else { continue }
+            let comm = toks[3...].joined(separator: " ")
+            table[pid] = ProcRow(ppid: ppid, tty: toks[2], comm: comm)
+        }
+
+        var result: [String: SessionTarget] = [:]
+        for s in sessions {
+            let tty = table[s.pid].map { $0.tty }
+            // Walk the ppid chain: claude → -zsh → login → GUI app (ppid 1).
+            var multiplexed = false
+            var terminal: TerminalKind = .unknown
+            var appPid: Int? = nil
+            var appBundle: String? = nil
+            var cursor = table[s.pid]?.ppid ?? 0
+            var hops = 0
+            while let row = table[cursor], hops < 12 {
+                hops += 1
+                if SessionLogic.isMultiplexer(comm: row.comm) { multiplexed = true }
+                if let bundle = SessionLogic.appBundlePath(fromExecPath: row.comm) {
+                    appBundle = bundle
+                    appPid = cursor
+                    terminal = SessionLogic.classifyTerminal(commPath: row.comm)
+                    break
+                }
+                if row.ppid <= 1 { break }
+                cursor = row.ppid
+            }
+            let info = appBundle.map { terminalAppInfo(bundlePath: $0) }
+            result[s.sessionId] = SessionTarget(
+                tty: tty, terminal: terminal,
+                appName: info?.name, bundleId: info?.bundleId,
+                appPid: appPid, multiplexed: multiplexed, cwd: s.cwd)
+        }
+        return result
+    }
+
+    // bundlePath → (bundleId, display name), memoized (cheap Info.plist read).
+    private var terminalInfoCache: [String: (bundleId: String?, name: String?)] = [:]
+    private func terminalAppInfo(bundlePath: String) -> (bundleId: String?, name: String?) {
+        if let hit = terminalInfoCache[bundlePath] { return hit }
+        let bundle = Bundle(path: bundlePath)
+        let bundleId = bundle?.bundleIdentifier
+        let name = (bundle?.infoDictionary?["CFBundleDisplayName"] as? String)
+            ?? (bundle?.infoDictionary?["CFBundleName"] as? String)
+            ?? {
+                let base = (bundlePath as NSString).lastPathComponent
+                return base.hasSuffix(".app") ? String(base.dropLast(4)) : base
+            }()
+        let info = (bundleId, name)
+        terminalInfoCache[bundlePath] = info
+        return info
     }
 
     /// Decode every *.json under the sessions dir, keep listable (cli + status)

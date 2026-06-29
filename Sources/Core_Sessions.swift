@@ -142,6 +142,36 @@ struct SessionGroup: Identifiable, Equatable {
     var mostRecentUpdate: Double { sessions.compactMap { $0.updatedAt }.max() ?? 0 }
 }
 
+// MARK: - Jump targeting types (Phase 3)
+
+/// The GUI terminal that owns a session's tty, as far up the ppid chain as the
+/// app layer could resolve. Drives SessionJumper's per-terminal dispatch.
+enum TerminalKind: String, Equatable {
+    case otty
+    case appleTerminal
+    case iterm2
+    case ghostty
+    case wezterm
+    case kitty
+    case alacritty
+    case unknown
+}
+
+/// One Otty pane as reported by `otty-cli pane list --json`. Otty exposes only
+/// these for matching — notably NO pid/tty — so the session→pane join is fuzzy.
+struct OttyPane: Equatable {
+    let id: String
+    let cwd: String
+    let title: String   // the JSON `process` field (the agent/title line)
+}
+
+/// Outcome of matching a session to the live Otty panes.
+enum OttyMatch: Equatable {
+    case exact(paneId: String)   // exactly one pane fits → focus it
+    case ambiguous               // several candidates, can't disambiguate
+    case none                    // no pane matches this cwd
+}
+
 /// Pure session logic — decoding, filtering, grouping. No process or file I/O.
 enum SessionLogic {
 
@@ -199,6 +229,128 @@ enum SessionLogic {
         if a.anyBusy != b.anyBusy { return a.anyBusy }
         if a.mostRecentUpdate != b.mostRecentUpdate { return a.mostRecentUpdate > b.mostRecentUpdate }
         return a.cwd < b.cwd
+    }
+
+    // MARK: - Jump targeting (Phase 3) — pure helpers
+    //
+    // Everything here is Foundation-only string/collection logic so it's unit
+    // testable in CCCostCore. The impure parts — running `ps`, otty-cli,
+    // osascript, NSRunningApplication — live in the app layer (SessionMonitor /
+    // SessionJumper). These helpers just classify and match.
+
+    /// First `.app` bundle path embedded in an executable path, e.g.
+    /// "/Applications/Otty.app/Contents/MacOS/Otty" → "/Applications/Otty.app".
+    /// nil when the path has no ".app" segment.
+    static func appBundlePath(fromExecPath path: String) -> String? {
+        guard let r = path.range(of: ".app") else { return nil }
+        return String(path[path.startIndex..<r.upperBound])
+    }
+
+    /// True when an executable path / comm string belongs to a terminal
+    /// multiplexer (tmux or screen) sitting between the shell and the GUI app.
+    static func isMultiplexer(comm: String) -> Bool {
+        let base = (comm as NSString).lastPathComponent.lowercased()
+        return base == "tmux" || base.hasPrefix("tmux:")
+            || base == "screen" || base == "screen-256color"
+    }
+
+    /// Classify the owning GUI terminal from its executable path (ps `comm`).
+    /// Matched on the `.app` bundle name so it's robust to the helper binary's
+    /// own name (e.g. Otty's exec is `Otty`, WezTerm's is `wezterm-gui`).
+    static func classifyTerminal(commPath: String) -> TerminalKind {
+        let p = commPath.lowercased()
+        if p.contains("/otty.app/")      || p.hasSuffix("/otty") { return .otty }
+        if p.contains("/ghostty.app/")   || p.contains("ghostty") { return .ghostty }
+        if p.contains("/iterm.app/")     || p.contains("/iterm2") { return .iterm2 }
+        if p.contains("/wezterm.app/")   || p.contains("wezterm") { return .wezterm }
+        if p.contains("/kitty.app/")     || p.hasSuffix("/kitty") { return .kitty }
+        if p.contains("/alacritty.app/") || p.contains("alacritty") { return .alacritty }
+        // Apple Terminal last: its bundle is the only one that legitimately owns
+        // the generic "terminal.app" path.
+        if p.contains("/terminal.app/") { return .appleTerminal }
+        return .unknown
+    }
+
+    /// Normalize a tty to the "/dev/ttysNNN" form AppleScript's `tty of tab`
+    /// reports. ps prints it bare ("ttys000"); "??" / empty → nil (no tty).
+    static func devTTY(_ tty: String?) -> String? {
+        guard let t = tty, !t.isEmpty, t != "??" else { return nil }
+        return t.hasPrefix("/dev/") ? t : "/dev/\(t)"
+    }
+
+    /// Strip a leading Claude/spinner status glyph (✳ ⠐ … and friends) + spaces
+    /// from an Otty pane title so it can be compared to a plain session title.
+    static func normalizeOttyTitle(_ s: String) -> String {
+        var out = s
+        // Drop a leading run of non-alphanumeric "decoration" (emoji, braille
+        // spinner frames, bullets, whitespace) — keep the first letter/digit on.
+        while let f = out.unicodeScalars.first,
+              !(CharacterSet.alphanumerics.contains(f)) {
+            out.removeFirst()
+        }
+        return out.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Match a live session to one Otty pane. Otty exposes only {cwd, title}
+    /// per pane (no pid/tty), so this is a FUZZY join: unique cwd → exact; a cwd
+    /// shared by several panes falls back to a title tiebreak when a session
+    /// title is available, else reports `.ambiguous`.
+    static func matchOttyPane(cwd: String, title: String?, panes: [OttyPane]) -> OttyMatch {
+        let byCwd = panes.filter { $0.cwd == cwd }
+        if byCwd.isEmpty { return .none }
+        if byCwd.count == 1 { return .exact(paneId: byCwd[0].id) }
+        if let t = title.map(normalizeOttyTitle), !t.isEmpty {
+            let hits = byCwd.filter { normalizeOttyTitle($0.title) == t }
+            if hits.count == 1 { return .exact(paneId: hits[0].id) }
+        }
+        return .ambiguous
+    }
+
+    // MARK: AppleScript builders (pure strings)
+
+    /// Apple Terminal: select the tab whose `tty` matches, raise its window,
+    /// activate. Returns "ok" / "notfound" on stdout so the caller can tell a
+    /// missing tab from a TCC denial (which fails the osascript run entirely).
+    static func appleTerminalFocusScript(devTTY: String) -> String {
+        let tty = devTTY.replacingOccurrences(of: "\"", with: "")
+        return """
+        tell application "Terminal"
+            activate
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(tty)" then
+                        set selected of t to true
+                        set index of w to 1
+                        return "ok"
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return "notfound"
+        """
+    }
+
+    /// iTerm2: select the session whose `tty` matches (+ its tab/window), activate.
+    static func itermFocusScript(devTTY: String) -> String {
+        let tty = devTTY.replacingOccurrences(of: "\"", with: "")
+        return """
+        tell application "iTerm2"
+            activate
+            repeat with w in windows
+                repeat with t in tabs of w
+                    repeat with s in sessions of t
+                        if tty of s is "\(tty)" then
+                            select s
+                            select t
+                            select w
+                            return "ok"
+                        end if
+                    end repeat
+                end repeat
+            end repeat
+        end tell
+        return "notfound"
+        """
     }
 
     // MARK: - Done-unseen reducer (Phase 2)

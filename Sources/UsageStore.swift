@@ -87,6 +87,12 @@ class UsageStore: ObservableObject {
     /// cwd → display label (git top-level basename when resolvable) supplied by
     /// the monitor, overlaid onto the basename labels from SessionLogic.grouped.
     @Published var sessionLabels: [String: String] = [:]
+    /// Phase 3: sessionId → terminal targeting facts for click-to-jump. Parallel
+    /// to sessionLabels; maintained by the SessionMonitor, read by jumpToSession.
+    @Published var sessionTargets: [String: SessionTarget] = [:]
+    /// Phase 3: a transient, non-modal hint (localization KEY) shown in the
+    /// Session tab when a jump could only raise the app / failed. Auto-clears.
+    @Published var sessionJumpHint: String? = nil
     /// Set when no session registry exists but `claude` is running — old Claude
     /// Code; surfaces a subtle "update to see live status" hint in the tab.
     @Published var showOldClaudeHint: Bool = false
@@ -186,9 +192,16 @@ class UsageStore: ObservableObject {
         guard let self = self else { return }
         if self.sessions != scan.sessions { self.sessions = scan.sessions }
         if self.sessionLabels != scan.labels { self.sessionLabels = scan.labels }
+        if self.sessionTargets != scan.targets { self.sessionTargets = scan.targets }
         if self.showOldClaudeHint != scan.oldClaudeHint { self.showOldClaudeHint = scan.oldClaudeHint }
         if self.anySessionDoneUnseen != scan.anyDoneUnseen { self.anySessionDoneUnseen = scan.anyDoneUnseen }
     }
+    // Click-to-jump (Phase 3): focuses/raises a session's terminal window/pane.
+    // All process spawning is confined inside SessionJumper's own serial queue.
+    private let sessionJumper = SessionJumper()
+    // Main-thread only: cancels a pending hint auto-clear when a newer jump lands.
+    private var sessionJumpHintClear: DispatchWorkItem?
+
     // Main-thread only: when the last wide-range archive sweep ran, so the
     // periodic refresh doesn't sweep more than ~every 6h.
     private var lastArchiveSweep: Date?
@@ -325,6 +338,43 @@ class UsageStore: ObservableObject {
     /// The user is now looking at session state (the notch popover opened, or the
     /// Session tab appeared): clear the "a turn finished, unseen" cue (green dot).
     func markSessionsSeen() { sessionMonitor.markSeen() }
+
+    /// Click-to-jump: focus/raise the terminal window (and pane/tab where
+    /// possible) that owns `session`. Fire-and-forget — the SessionJumper does
+    /// all spawning on its own background queue; we just surface a brief hint
+    /// when the jump could only raise the app or failed outright.
+    func jumpToSession(_ session: SessionInfo) {
+        let target = sessionTargets[session.sessionId]
+            ?? SessionTarget(tty: nil, terminal: .unknown, appName: nil,
+                             bundleId: nil, appPid: nil, multiplexed: false, cwd: session.cwd)
+        sessionJumper.jump(session: session, target: target) { [weak self] outcome in
+            self?.handleJumpOutcome(outcome)
+        }
+    }
+
+    /// Map a jump outcome to a transient, non-modal hint (a localization key the
+    /// Session tab renders). Exact landings clear any stale hint silently; the
+    /// degraded cases auto-dismiss after a few seconds. Main thread only.
+    private func handleJumpOutcome(_ outcome: JumpOutcome) {
+        switch outcome {
+        case .focusedPane, .focusedWindow:
+            setSessionJumpHint(nil)
+        case .appOnly(let reason):
+            setSessionJumpHint(reason == .permissionDenied
+                ? "sessionJumpNeedsPermission" : "sessionJumpAppOnly")
+        case .failed:
+            setSessionJumpHint("sessionJumpFailed")
+        }
+    }
+
+    private func setSessionJumpHint(_ key: String?) {
+        sessionJumpHintClear?.cancel()
+        sessionJumpHint = key
+        guard key != nil else { return }
+        let work = DispatchWorkItem { [weak self] in self?.sessionJumpHint = nil }
+        sessionJumpHintClear = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.5, execute: work)
+    }
 
     // MARK: - Local archive (durable history)
 
