@@ -49,7 +49,7 @@ This app reads all your local session data and puts it in one place. One menu ba
 
 ### What you get
 
-- **Cost & Tokens** — switch views, with per-model breakdown (Opus / Sonnet / Haiku)
+- **Cost & Tokens** — switch views, with per-model breakdown (Fable / Opus / Sonnet / Haiku, plus non-Claude models)
 - **Time** — *when* you actually used Claude Code, derived from session timestamps:
   - **Week** — an Apple-Health-sleep-style timeline (Mon–Sun × 0–24h), each active block colored by the model in use
   - **Month** — the same timeline, one row per week of the month
@@ -124,13 +124,17 @@ The **Subscription** tab is separate: it calls Anthropic's OAuth usage endpoint 
 No Xcode project — the app is compiled with plain `swiftc`. `Package.swift` exists only so `swift test` can run.
 
 ```
-Sources/                    ← 16 Swift files
+Sources/                    ← 20 Swift files
   main.swift                  ← entry point (single-instance check + bootstrap)
   AppDelegate.swift           ← menu bar item + title, popover, refresh timers, FSEvents watcher
   UsageStore.swift            ← published state + refresh orchestration
+  UsageArchive.swift          ← durable local history (survives Claude Code cleanup)
   UsageScriptClient.swift     ← runs the bundled Python script
   QuotaService.swift          ← subscription quota (OAuth) + Keychain access
   Views.swift                 ← UI (popover, charts)
+  NotchController.swift       ← notch panels: geometry, lifecycle, hover/fullscreen
+  NotchView.swift             ← notch SwiftUI layer (compact pill ↔ popover)
+  ClaudeLogo.swift            ← shared Claude-logo path (menu bar, popover, app icon)
   Formatters.swift            ← number formatting
   Localization.swift          ← i18n strings
   Models.swift                ← app-only OAuth/quota data models
@@ -186,7 +190,7 @@ Claude Code 的 `/cost` 只显示当前会话。如果你有多个 Anthropic 账
 
 ### 功能
 
-- **费用 & Tokens** — 双视图切换，按模型分类（Opus / Sonnet / Haiku）
+- **费用 & Tokens** — 双视图切换，按模型分类（Fable / Opus / Sonnet / Haiku，及非 Claude 模型）
 - **时长（Time）** — 从会话时间戳还原你**什么时候**在用 Claude Code：
   - **周视图** — 类似 Apple 健康「睡眠」的时间轴（周一~周日 × 0–24h），每段活跃色块按当时所用模型着色
   - **月视图** — 同样的时间轴，每行是该月的一周
@@ -259,13 +263,17 @@ open build/CCCostMonitor.app
 不依赖 Xcode 项目 —— app 直接用 `swiftc` 编译。`Package.swift` 仅用于跑 `swift test`。
 
 ```
-Sources/                    ← 16 个 Swift 文件
+Sources/                    ← 20 个 Swift 文件
   main.swift                  ← 入口（单实例检测 + 启动引导）
   AppDelegate.swift           ← 菜单栏图标与标题、弹窗、刷新定时器、FSEvents 监听
   UsageStore.swift            ← 状态发布 + 刷新编排
+  UsageArchive.swift          ← 本地用量归档（对抗 Claude Code 清理）
   UsageScriptClient.swift     ← 调用内置 Python 脚本
   QuotaService.swift          ← 订阅配额（OAuth）+ 钥匙串读取
   Views.swift                 ← UI（弹窗、图表）
+  NotchController.swift       ← 刘海面板：几何、生命周期、hover/全屏
+  NotchView.swift             ← 刘海 SwiftUI 层（小条 ↔ 弹窗）
+  ClaudeLogo.swift            ← 共享 Claude logo 路径（菜单栏、弹窗、app 图标）
   Formatters.swift            ← 数字格式化
   Localization.swift          ← 多语言文案
   Models.swift                ← 仅供 app 使用的 OAuth/配额数据模型
