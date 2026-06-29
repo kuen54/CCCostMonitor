@@ -141,6 +141,96 @@ import Testing
         #expect(SessionLogic.grouped([a, b]) == SessionLogic.grouped([b, a]))
     }
 
+    // MARK: - Otty pane matching (Phase 4)
+
+    private func pane(_ id: String, _ cwd: String, _ title: String) -> OttyPane {
+        OttyPane(id: id, cwd: cwd, title: title)
+    }
+
+    @Test func normalizeStripsClaudeGlyphAndSpinner() {
+        // ✳ idle glyph and Braille spinner frames are stripped; CJK kept.
+        #expect(SessionLogic.normalizeOttyTitle("✳ Add notch display mode") == "Add notch display mode")
+        #expect(SessionLogic.normalizeOttyTitle("⠂ Add notch display mode") == "Add notch display mode")
+        #expect(SessionLogic.normalizeOttyTitle("⠐ 调研爬虫反风控技术") == "调研爬虫反风控技术")
+        #expect(SessionLogic.normalizeOttyTitle("查询 toy_series 不同值") == "查询 toy_series 不同值")
+        // Symmetric: a glyphed pane title normalizes equal to a plain session title.
+        #expect(SessionLogic.normalizeOttyTitle("✳ X") == SessionLogic.normalizeOttyTitle("X"))
+    }
+
+    @Test func matchTitlePlusCwdUniqueIsExact() {
+        // cwd shared by several panes — title disambiguates to one.
+        let panes = [
+            pane("p1", "/Users/x", "✳ Chinese astrology"),
+            pane("p2", "/Users/x", "✳ Crawler research"),
+            pane("p3", "/Users/x", "⠂ Individual finance plan"),
+        ]
+        #expect(SessionLogic.matchOttyPane(cwd: "/Users/x", title: "Crawler research", panes: panes)
+                == .exact(paneId: "p2"))
+    }
+
+    @Test func matchTitleCollisionAcrossCwdResolvesByCwdCrossCheck() {
+        // The SAME title appears in two different cwds — the cwd cross-check
+        // (only panes sharing the session's cwd are considered) picks the right one.
+        let panes = [
+            pane("p1", "/Users/x/a", "✳ Build feature"),
+            pane("p2", "/Users/x/b", "✳ Build feature"),
+            pane("p3", "/Users/x/b", "✳ Something else"),
+        ]
+        #expect(SessionLogic.matchOttyPane(cwd: "/Users/x/b", title: "Build feature", panes: panes)
+                == .exact(paneId: "p2"))
+    }
+
+    @Test func matchTitleAbsentFallsBackToCwdUnique() {
+        // No title → behaves exactly as before: unique cwd → exact.
+        let panes = [pane("p1", "/Users/x/solo", "whatever")]
+        #expect(SessionLogic.matchOttyPane(cwd: "/Users/x/solo", title: nil, panes: panes)
+                == .exact(paneId: "p1"))
+        #expect(SessionLogic.matchOttyPane(cwd: "/Users/x/solo", title: "", panes: panes)
+                == .exact(paneId: "p1"))
+    }
+
+    @Test func matchManualRenameSharedCwdIsAmbiguous() {
+        // User renamed the panes, so the session title matches NO pane; cwd is
+        // shared by several → degrade honestly to ambiguous (app-activate).
+        let panes = [
+            pane("p1", "/Users/x/mia", "热量识别探数-1"),
+            pane("p2", "/Users/x/mia", "热量识别探数-2"),
+        ]
+        #expect(SessionLogic.matchOttyPane(cwd: "/Users/x/mia",
+                title: "优化餐品热量识别的分层库方案", panes: panes) == .ambiguous)
+    }
+
+    @Test func matchNoPaneInCwdIsNone() {
+        let panes = [pane("p1", "/Users/x/a", "t")]
+        #expect(SessionLogic.matchOttyPane(cwd: "/Users/x/zzz", title: "t", panes: panes) == .none)
+    }
+
+    @Test func matchGlyphedPaneMatchesPlainSessionTitle() {
+        // Pane title carries a busy spinner; session aiTitle is plain — normalize
+        // both and they join.
+        let panes = [
+            pane("p1", "/Users/x", "⠂ Add notch display mode with hover popup"),
+            pane("p2", "/Users/x", "✳ Unrelated"),
+        ]
+        #expect(SessionLogic.matchOttyPane(cwd: "/Users/x",
+                title: "Add notch display mode with hover popup", panes: panes)
+                == .exact(paneId: "p1"))
+    }
+
+    @Test func matchTitleBeatsCwdAmbiguity() {
+        // Five panes share the cwd (like the live /Users/lijiakun): cwd-alone is
+        // ambiguous, but the ai-title resolves the exact pane.
+        let panes = [
+            pane("p1", "/Users/x", "✳ A"), pane("p2", "/Users/x", "✳ B"),
+            pane("p3", "/Users/x", "✳ C"), pane("p4", "/Users/x", "✳ D"),
+            pane("p5", "/Users/x", "✳ E"),
+        ]
+        #expect(SessionLogic.matchOttyPane(cwd: "/Users/x", title: "C", panes: panes)
+                == .exact(paneId: "p3"))
+        #expect(SessionLogic.matchOttyPane(cwd: "/Users/x", title: nil, panes: panes)
+                == .ambiguous)
+    }
+
     // MARK: - Done-unseen reducer (Phase 2)
 
     private func sess(_ id: String, _ status: SessionStatus) -> SessionInfo {

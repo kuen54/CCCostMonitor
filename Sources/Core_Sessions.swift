@@ -281,12 +281,16 @@ enum SessionLogic {
         return t.hasPrefix("/dev/") ? t : "/dev/\(t)"
     }
 
-    /// Strip a leading Claude/spinner status glyph (✳ ⠐ … and friends) + spaces
-    /// from an Otty pane title so it can be compared to a plain session title.
+    /// Strip a leading Claude/spinner status glyph from an Otty pane title so it
+    /// can be compared to a plain session title. Claude Code prefixes the pushed
+    /// title with `✳ ` (U+2733) when the session is idle/ready, or a Braille
+    /// spinner frame (`⠐ `/`⠂ `, U+2800–U+28FF) while it's busy. This drops a
+    /// leading run of any non-alphanumeric "decoration" (those glyphs, other
+    /// symbols, whitespace) up to the first letter/digit, then trims the tail.
+    /// CJK ideographs are Unicode letters, so a Chinese title's first character
+    /// is kept. Applied to BOTH sides before comparison so it's symmetric.
     static func normalizeOttyTitle(_ s: String) -> String {
         var out = s
-        // Drop a leading run of non-alphanumeric "decoration" (emoji, braille
-        // spinner frames, bullets, whitespace) — keep the first letter/digit on.
         while let f = out.unicodeScalars.first,
               !(CharacterSet.alphanumerics.contains(f)) {
             out.removeFirst()
@@ -294,18 +298,28 @@ enum SessionLogic {
         return out.trimmingCharacters(in: .whitespaces)
     }
 
-    /// Match a live session to one Otty pane. Otty exposes only {cwd, title}
-    /// per pane (no pid/tty), so this is a FUZZY join: unique cwd → exact; a cwd
-    /// shared by several panes falls back to a title tiebreak when a session
-    /// title is available, else reports `.ambiguous`.
+    /// Match a live session to one Otty pane. Otty exposes only {cwd, title} per
+    /// pane (no pid/tty), so this is a FUZZY join. Priority:
+    ///   1. TITLE+CWD exact — when `title` is non-empty, if exactly one pane in
+    ///      the session's cwd has `normalize(process) == normalize(title)` → that
+    ///      pane. The cwd cross-check (only panes sharing the session's cwd are
+    ///      considered) prevents a coincidental cross-directory title collision
+    ///      from mis-targeting.
+    ///   2. CWD-unique — a cwd owned by exactly one pane → that pane (this is the
+    ///      whole behavior when `title` is nil/empty, i.e. unchanged from before).
+    ///   3. else `.ambiguous` (several panes, can't disambiguate → app-activate).
+    /// `.none` only when no pane shares the cwd at all. Pure + deterministic.
     static func matchOttyPane(cwd: String, title: String?, panes: [OttyPane]) -> OttyMatch {
         let byCwd = panes.filter { $0.cwd == cwd }
         if byCwd.isEmpty { return .none }
-        if byCwd.count == 1 { return .exact(paneId: byCwd[0].id) }
+        // 1. title + cwd exact (cwd-restricted, so the cross-check is implicit).
         if let t = title.map(normalizeOttyTitle), !t.isEmpty {
             let hits = byCwd.filter { normalizeOttyTitle($0.title) == t }
             if hits.count == 1 { return .exact(paneId: hits[0].id) }
         }
+        // 2. cwd-unique.
+        if byCwd.count == 1 { return .exact(paneId: byCwd[0].id) }
+        // 3. can't disambiguate.
         return .ambiguous
     }
 

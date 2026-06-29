@@ -71,9 +71,12 @@ final class SessionJumper {
               let panes = parseOttyPanes(listOut) else {
             return activateApp(target, reason: .ambiguous)
         }
-        // Otty exposes no pid/tty per pane — fuzzy join on cwd (title tiebreak
-        // when a session title is available; today none is, so cwd-only).
-        switch SessionLogic.matchOttyPane(cwd: session.cwd, title: nil, panes: panes) {
+        // Otty exposes no pid/tty per pane — fuzzy join on cwd, disambiguated by
+        // the session's latest ai-title (which Otty surfaces as the pane title).
+        // Read lazily here at click time so the monitor's scan loop pays nothing;
+        // a miss (no transcript / no title) degrades to the cwd-only rule.
+        let aiTitle = AITitleReader.latestAITitle(sessionId: session.sessionId)
+        switch SessionLogic.matchOttyPane(cwd: session.cwd, title: aiTitle, panes: panes) {
         case .exact(let paneId):
             _ = run(cli, ["pane", "focus", paneId, "--json"])
             // pane focus selects the tab inside Otty but doesn't raise the GUI;
