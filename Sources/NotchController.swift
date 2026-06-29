@@ -516,9 +516,14 @@ final class NotchController: NSObject {
         // Fresh-when-you-look, mirroring the NSPopover open kick. Non-forced: the
         // fingerprint short-circuit makes it ~free when nothing changed.
         store.refresh()
-        // The user is now looking: clear the "a turn finished, unseen" cue so the
-        // notch's green dot drops once they've opened the popover.
-        store.markSessionsSeen()
+        // Clear the "a turn finished, unseen" cue ONLY when the popover opens straight
+        // onto the Session tab — that's the one view where the user can actually see
+        // which session finished. A plain hover-open on any other tab (Cost/Tokens/…)
+        // must NOT dismiss the green dot, or the cue is gone before they've identified
+        // the session. Navigating TO the Session tab later clears it via its .onAppear.
+        if store.selectedTab == .session {
+            store.markSessionsSeen()
+        }
     }
 
     private func close(_ inst: NotchInstance) {
