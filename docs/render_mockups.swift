@@ -382,9 +382,12 @@ struct DemoNotch: View {
             menuBar
             // The notch panel: flush with the very top edge, hanging down. Its top band
             // (the camera strip) overlaps the menu bar; the "CC Monitor" header sits
-            // clearly below the bar.
+            // clearly below the bar. Margins mirror NotchRootView so the popover floats
+            // inside the black instead of running edge-to-edge (hMargin 18, bottom 14).
             DemoPopover(store: store, loc: loc, bg: .clear, notch: true)
+                .padding(.horizontal, 18)
                 .padding(.top, menuBarHeight)   // header lands a row below the menu bar
+                .padding(.bottom, 14)
                 .background(Color.black)
                 .clipShape(NotchShape(topCornerRadius: 10, bottomCornerRadius: 22))
                 .environment(\.colorScheme, .dark)
