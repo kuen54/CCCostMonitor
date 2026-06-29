@@ -1755,10 +1755,10 @@ struct PopoverView: View {
         return max(240, screenH - 190)
     }
 
-    /// Cost + Tokens + Time always; the Plan tab only when the user has
-    /// subscription auth. Explicit arrays, NOT DisplayTab.allCases: display
-    /// order (cost, tokens, time, subscription) differs from rawValue order —
-    /// `time = 3` was APPENDED so persisted rawValues never remap.
+    /// Cost + Tokens + Time + Session always; the Plan tab only when the user has
+    /// subscription auth. Explicit arrays, NOT DisplayTab.allCases: display order
+    /// (cost, tokens, time, session, subscription) differs from rawValue order —
+    /// `time = 3` and `session = 4` were APPENDED so persisted rawValues never remap.
     private var visibleTabs: [DisplayTab] {
         store.hasOAuthToken
             ? [.cost, .tokens, .time, .session, .subscription]

@@ -153,16 +153,22 @@ final class SessionMonitor {
     }
 
     private func computeScan() -> SessionScan {
-        let parsed = parseRegistry()
+        let (parsed, hadRegistryFiles) = parseRegistry()
 
         let sessions: [SessionInfo]
         var oldHint = false
         if !parsed.isEmpty {
             // Modern Claude Code: trust the registry, keep only the live ones.
             sessions = filterAlive(parsed)
+        } else if hadRegistryFiles {
+            // Registry files exist but none are listable (e.g. only sdk-cli / `-p`
+            // sessions). This IS modern Claude Code — do NOT show the upgrade hint;
+            // there simply are no interactive sessions to display.
+            sessions = []
         } else {
-            // Fallback ladder: registry missing/empty. If `claude` is actually
-            // running, surface synthesized entries + a one-time upgrade hint.
+            // Fallback ladder: registry truly absent (no *.json at all). If `claude`
+            // is actually running, surface synthesized entries + a one-time upgrade
+            // hint (old Claude Code that doesn't write a session registry).
             let synth = scanClaudeProcessesAsSessions()
             sessions = synth
             oldHint = !synth.isEmpty
@@ -177,19 +183,22 @@ final class SessionMonitor {
     }
 
     /// Decode every *.json under the sessions dir, keep listable (cli + status)
-    /// entries. A malformed file is skipped, not fatal.
-    private func parseRegistry() -> [SessionInfo] {
+    /// entries. A malformed file is skipped, not fatal. Also reports whether ANY
+    /// *.json file existed at all, so the caller can tell "modern CC with no
+    /// listable sessions" apart from "no registry → maybe old CC".
+    private func parseRegistry() -> (sessions: [SessionInfo], hadFiles: Bool) {
         let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: sessionsDir) else { return [] }
+        guard let names = try? fm.contentsOfDirectory(atPath: sessionsDir) else { return ([], false) }
+        let jsonNames = names.filter { $0.hasSuffix(".json") }
         var out: [SessionInfo] = []
-        for name in names where name.hasSuffix(".json") {
+        for name in jsonNames {
             let path = (sessionsDir as NSString).appendingPathComponent(name)
             guard let data = fm.contents(atPath: path),
                   let info = SessionLogic.parse(jsonData: data),
                   SessionLogic.listable(info) else { continue }
             out.append(info)
         }
-        return out
+        return (out, !jsonNames.isEmpty)
     }
 
     // MARK: - Liveness
@@ -197,8 +206,18 @@ final class SessionMonitor {
     private struct ProcFact { let comm: String; let startEpoch: TimeInterval? }
 
     /// Keep only sessions whose pid is (a) alive, (b) actually a `claude` process
-    /// (PID-reuse guard), and (c) whose live start time matches the recorded
-    /// startedAt within 5s when both are parseable (skipped gracefully otherwise).
+    /// (PID-reuse guard via comm), and (c) not an obvious pid-reuse by start time.
+    ///
+    /// Start-time check is ASYMMETRIC by design. `startedAt` is the session-init
+    /// instant, which legitimately LAGS process spawn (`lstart`) by node boot +
+    /// claude init — measured 2–88s positive on real live sessions. So a process
+    /// whose lstart is at/before the recorded startedAt is the same session; a
+    /// symmetric window would false-drop live sessions. The only genuine pid-reuse
+    /// signature is a live process that spawned CLEARLY AFTER the recorded session
+    /// start, so we reject solely on `lstart - startedAt` exceeding a wide margin.
+    /// The comm guard already makes reuse astronomically unlikely; this is a weak
+    /// secondary. Skipped gracefully when either timestamp is unparseable.
+    private static let pidReuseMargin: TimeInterval = 120
     private func filterAlive(_ sessions: [SessionInfo]) -> [SessionInfo] {
         let pids = sessions.map { $0.pid }
         let facts = psFacts(for: pids)  // ONE batched ps call
@@ -206,7 +225,10 @@ final class SessionMonitor {
             guard processExists(s.pid) else { return false }
             guard let fact = facts[s.pid], fact.comm.contains("claude") else { return false }
             if let start = fact.startEpoch, let recorded = s.startedAt {
-                if abs(start - recorded / 1000.0) >= 5 { return false }  // PID reuse
+                // Only reject when the live process started well AFTER the recorded
+                // session — the pid-reuse signature. A lagging startedAt (negative
+                // here) is the normal, healthy case and must be kept.
+                if start - recorded / 1000.0 > SessionMonitor.pidReuseMargin { return false }
             }
             return true
         }
@@ -323,7 +345,9 @@ final class SessionMonitor {
         task.arguments = args
         let outPipe = Pipe()
         task.standardOutput = outPipe
-        task.standardError = Pipe()   // swallow stderr (lsof warnings etc.)
+        // Discard stderr to /dev/null (NOT a Pipe): an undrained Pipe whose child
+        // writes >64KB would block, stalling the serial queue until the watchdog.
+        task.standardError = FileHandle.nullDevice
         do {
             try task.run()
         } catch {
