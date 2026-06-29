@@ -262,6 +262,12 @@ struct DemoTimeTab: View {
 struct DemoPopover: View {
     @ObservedObject var store: UsageStore
     let loc: Localizer
+    /// Panel background. Default = the menu-bar popover material; the notch demo passes
+    /// `.clear` so its own black layer shows through.
+    var bg: Color = Color(nsColor: .windowBackgroundColor)
+    /// In the notch we use the app's REAL custom segmented control (pure SwiftUI, so it
+    /// rasterizes); the menu-bar shots keep the native-look SegmentedBar replica.
+    var notch: Bool = false
     private var visibleTabs: [DisplayTab] { [.cost, .tokens, .time, .subscription] }
 
     var body: some View {
@@ -285,9 +291,16 @@ struct DemoPopover: View {
             }
             .padding(.horizontal, 14).padding(.bottom, 8)
 
-            SegmentedBar(items: visibleTabs.map { ($0.label(loc), $0.icon) },
-                         selected: visibleTabs.firstIndex(of: store.selectedTab) ?? 0)
-                .padding(.horizontal, 10).padding(.bottom, 8)
+            Group {
+                if notch {
+                    TabSelector(isNotch: true, items: visibleTabs,
+                                selection: $store.selectedTab, label: { $0.label(loc) })
+                } else {
+                    SegmentedBar(items: visibleTabs.map { ($0.label(loc), $0.icon) },
+                                 selected: visibleTabs.firstIndex(of: store.selectedTab) ?? 0)
+                }
+            }
+            .padding(.horizontal, 10).padding(.bottom, 8)
 
             content
 
@@ -304,7 +317,7 @@ struct DemoPopover: View {
             .padding(.horizontal, 14).padding(.vertical, 10)
         }
         .frame(width: store.selectedTab == .time ? 480 : 360)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(bg)
         .environment(\.localizer, loc)
     }
 
@@ -322,6 +335,43 @@ struct DemoPopover: View {
             }
             .padding(.horizontal, 10).padding(.bottom, 6)
         }
+    }
+}
+
+// The notch experience: the idle pill and the expanded popover dropping out of the
+// physical notch, on a desktop backdrop. Reuses the REAL NotchShape + the dark popover
+// (custom segmented control, black layer) the app draws in the notch.
+struct DemoNotch: View {
+    @ObservedObject var store: UsageStore
+    let loc: Localizer
+
+    private var wallpaper: some View {
+        LinearGradient(
+            colors: [Color(red: 0.13, green: 0.12, blue: 0.30),
+                     Color(red: 0.42, green: 0.20, blue: 0.46),
+                     Color(red: 0.86, green: 0.46, blue: 0.35)],
+            startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            wallpaper
+            VStack(spacing: 22) {
+                // Idle pill: Claude logo + live value with the physical-notch gap.
+                CompactNotchView(store: store, notchWidth: 86, notchHeight: 30)
+                    .background(Color.black)
+                    .clipShape(NotchShape(topCornerRadius: 6, bottomCornerRadius: 13))
+
+                // Hover → the black grows out of the notch into the full popover.
+                DemoPopover(store: store, loc: loc, bg: .clear, notch: true)
+                    .padding(.top, 8)
+                    .background(Color.black)
+                    .clipShape(NotchShape(topCornerRadius: 11, bottomCornerRadius: 19))
+            }
+            .padding(.top, 18)
+            .environment(\.colorScheme, .dark)
+        }
+        .frame(width: 560, height: 820)
     }
 }
 
@@ -353,5 +403,6 @@ struct RenderApp {
         render("time-week", DemoPopover(store: makeStore(tab: .time, range: .week), loc: loc))
         render("time-month", DemoPopover(store: makeStore(tab: .time, range: .month), loc: loc))
         render("time-year", DemoPopover(store: makeStore(tab: .time, range: .year), loc: loc))
+        render("notch", DemoNotch(store: makeStore(tab: .cost), loc: loc))
     }
 }
