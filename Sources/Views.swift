@@ -819,13 +819,10 @@ struct TimeTabView: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            Picker("", selection: $store.timeRange) {
-                ForEach(TimeRange.allCases, id: \.self) { range in
-                    Text(range.label(loc)).tag(range)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            TabSelector(isNotch: store.displayMode == .notch,
+                        items: TimeRange.allCases,
+                        selection: $store.timeRange,
+                        label: { $0.label(loc) })
 
             switch store.timeRange {
             case .week:
@@ -1527,6 +1524,64 @@ struct YearHeatmap: View {
     }
 }
 
+// MARK: - Segmented tab selector
+
+/// Pure-SwiftUI segmented control used in the NOTCH. The native `NSSegmentedControl`
+/// (what `Picker(.segmented)` wraps) mis-measures its height on first appearance inside
+/// the borderless, NON-KEY notch NSPanel — it renders too tall until a real click (which
+/// keys the panel) forces a relayout. SwiftUI-level fixes (`.frame(height:)`, `.id`
+/// rebuild) can't help because the bug lives in the hosted AppKit control; drawing it
+/// ourselves sidesteps it entirely. The notch is always dark, so fixed colors are fine.
+struct NotchSegmentedControl<Value: Hashable>: View {
+    let items: [Value]
+    @Binding var selection: Value
+    let label: (Value) -> String
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(items, id: \.self) { item in
+                let selected = item == selection
+                Text(label(item))
+                    .font(.system(size: 12, weight: selected ? .semibold : .regular))
+                    .foregroundColor(selected ? .white : Color.white.opacity(0.55))
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 22)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(selected ? Color.white.opacity(0.18) : Color.clear))
+                    .contentShape(Rectangle())
+                    .onTapGesture { selection = item }
+            }
+        }
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(0.07)))
+    }
+}
+
+/// Tab selector: the custom dark control in the notch, the native segmented Picker in the
+/// menu bar (where it renders fine and matches the system look).
+struct TabSelector<Value: Hashable>: View {
+    let isNotch: Bool
+    let items: [Value]
+    @Binding var selection: Value
+    let label: (Value) -> String
+
+    var body: some View {
+        if isNotch {
+            NotchSegmentedControl(items: items, selection: $selection, label: label)
+        } else {
+            Picker("", selection: $selection) {
+                ForEach(items, id: \.self) { Text(label($0)).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+    }
+}
+
 struct PopoverView: View {
     @ObservedObject var store: UsageStore
     let onQuit: () -> Void
@@ -1631,18 +1686,15 @@ struct PopoverView: View {
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
 
-            // ── Tab Picker (Cost / Tokens / Time / Plan) ──
+            // ── Tab selector (Cost / Tokens / Time / Plan) ──
             // The Plan tab is only shown to subscription (OAuth) users — API-key users
             // (Bedrock / Vertex / Console) have no 5h/weekly quota to display.
-            Picker("", selection: $store.selectedTab) {
-                ForEach(visibleTabs, id: \.self) { tab in
-                    Label(tab.label(loc), systemImage: tab.icon).tag(tab)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .padding(.horizontal, 10)
-            .padding(.bottom, 8)
+            TabSelector(isNotch: store.displayMode == .notch,
+                        items: visibleTabs,
+                        selection: $store.selectedTab,
+                        label: { $0.label(loc) })
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
 
             // ── Content (sized to fit, scrolls only when taller than the screen) ──
             // Subscription quota lives in its own "Plan" tab; the Cost/Token tabs
