@@ -21,16 +21,6 @@ func modelClassColor(_ id: String?) -> Color {
 
 extension ModelUsage {
     var color: Color { modelClassColor(id) }
-
-    var icon: String {
-        switch id {
-        case "fable":  return "circle.fill"
-        case "opus":   return "circle.fill"
-        case "sonnet": return "circle.fill"
-        case "haiku":  return "circle.fill"
-        default:       return "circle"
-        }
-    }
 }
 
 // MARK: - Localizer environment

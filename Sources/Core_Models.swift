@@ -4,7 +4,7 @@ import Foundation
 //
 // Foundation-only on purpose: these structs are part of the pure testable core
 // (consumed by Core_UsageParser / Core_DateLogic and the SPM test target).
-// UI concerns (ModelUsage.color / .icon) live in a Views.swift extension.
+// UI concerns (ModelUsage.color) live in a Views.swift extension.
 // App-only models (OAuth quota, DisplayTab) stay in Models.swift.
 
 struct ModelUsage: Identifiable, Codable {
