@@ -3,9 +3,8 @@ import Foundation
 // MARK: - Helpers
 
 func formatCost(_ value: Double) -> String {
-    if value >= 1000    { return String(format: "$%.0f", value) }
-    if value >= 100     { return String(format: "$%.0f", value) }
-    if value >= 10      { return String(format: "$%.1f", value) }
+    if value >= 100 { return String(format: "$%.0f", value) }
+    if value >= 10  { return String(format: "$%.1f", value) }
     return String(format: "$%.2f", value)
 }
 
