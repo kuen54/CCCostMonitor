@@ -37,11 +37,24 @@ enum AITitleReader {
         let fm = FileManager.default
         let target = "\(sessionId).jsonl"
         guard let en = fm.enumerator(at: projectsDir,
-                                     includingPropertiesForKeys: nil,
+                                     includingPropertiesForKeys: [.isDirectoryKey],
                                      options: [.skipsHiddenFiles]) else { return nil }
+        // Bound the click-time walk so a pathological tree (huge project count,
+        // network home) can't stall the jump queue unboundedly. Also prune the
+        // descent into `subagents/` dirs rather than filtering their files after
+        // the fact — those nested agent transcripts are never the clicked session.
+        var scanned = 0
+        let maxEntries = 500_000
         for case let url as URL in en {
+            scanned += 1
+            if scanned > maxEntries { return nil }
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDir {
+                if url.lastPathComponent == "subagents" { en.skipDescendants() }
+                continue
+            }
             guard url.lastPathComponent == target else { continue }
-            if url.path.contains("/subagents/") { continue }
+            if url.path.contains("/subagents/") { continue }   // defense in depth
             return url.path
         }
         return nil
@@ -75,11 +88,18 @@ enum AITitleReader {
         return nil
     }
 
-    /// The aiTitle of the LAST line in `buffer` that carries the ai-title marker,
-    /// or nil if none is parseable yet (caller should widen the window). We take
-    /// the highest-index marker line (newest in file order) and never fall back
-    /// to an earlier one, so a stale title is never returned while a newer
-    /// (front-truncated) one exists — widening resolves the truncation.
+    /// The aiTitle of the newest parseable ai-title line in `buffer`, or nil if
+    /// none is parseable yet (caller should widen the window). We scan marker
+    /// lines newest→oldest and return the first that parses:
+    ///   - A complete-but-unparseable newest marker (a false-positive `"ai-title"`
+    ///     substring, a corrupt record, or a line END-truncated by a concurrent
+    ///     write at EOF) is skipped in favour of the prior complete title — which
+    ///     is exactly what Otty still shows until the new title finishes writing
+    ///     and Claude pushes it. So this never returns a *stale* title: the prior
+    ///     complete title IS the current pane title while the newer one is mid-write.
+    ///   - The only case we widen for is the FRONT line (index 0) failing: it may
+    ///     be a real newer title truncated at the window front, which one more
+    ///     read-back recovers. We never fall back past a front-truncated newest.
     private static func lastAITitle(in buffer: Data) -> String? {
         // Lossy decode: a multibyte char cut at the front becomes U+FFFD, which
         // only ever lands in the (skippable) front-truncated first line.
@@ -87,11 +107,17 @@ enum AITitleReader {
         let lines = text.components(separatedBy: "\n")
         var i = lines.count - 1
         while i >= 0 {
-            if lines[i].contains("\"ai-title\"") { break }
+            if lines[i].contains("\"ai-title\"") {
+                if let title = parseAITitle(lines[i]) { return title }
+                // Marker failed to parse. If it's the front line it may be a
+                // real newer title truncated at the window front → widen to
+                // recover it. Otherwise it's a complete false-positive/corrupt
+                // marker → keep scanning older lines for a usable title.
+                if i == 0 { return nil }
+            }
             i -= 1
         }
-        guard i >= 0 else { return nil }            // no marker in window → widen
-        return parseAITitle(lines[i])               // nil ⇒ truncated/malformed → widen
+        return nil                                  // no usable marker → widen
     }
 
     /// Parse one JSONL line, returning its `aiTitle` only when it is genuinely an

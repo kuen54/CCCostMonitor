@@ -295,7 +295,7 @@ enum SessionLogic {
               !(CharacterSet.alphanumerics.contains(f)) {
             out.removeFirst()
         }
-        return out.trimmingCharacters(in: .whitespaces)
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Match a live session to one Otty pane. Otty exposes only {cwd, title} per
