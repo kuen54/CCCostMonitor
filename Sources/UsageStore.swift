@@ -79,6 +79,31 @@ class UsageStore: ObservableObject {
     /// changes (builds/tears down the notch panel, toggles the status item).
     @Published var displayMode: DisplayMode = .menubar
 
+    // MARK: Live sessions ("Session" tab)
+
+    /// Live interactive Claude Code sessions (read-only). Maintained by the
+    /// SessionMonitor service; the Session tab and (Phase 2) the notch read this.
+    @Published var sessions: [SessionInfo] = []
+    /// cwd → display label (git top-level basename when resolvable) supplied by
+    /// the monitor, overlaid onto the basename labels from SessionLogic.grouped.
+    @Published var sessionLabels: [String: String] = [:]
+    /// Set when no session registry exists but `claude` is running — old Claude
+    /// Code; surfaces a subtle "update to see live status" hint in the tab.
+    @Published var showOldClaudeHint: Bool = false
+
+    var liveSessionCount: Int { sessions.count }
+    var busySessionCount: Int { sessions.filter { $0.status == .busy }.count }
+    var anySessionBusy: Bool { sessions.contains { $0.status == .busy } }
+    var anySessionWaiting: Bool { sessions.contains { $0.status == .waiting } }
+
+    /// Sessions grouped by cwd for the tab, with monitor-resolved labels overlaid.
+    var sessionGroups: [SessionGroup] {
+        SessionLogic.grouped(sessions).map { g in
+            guard let refined = sessionLabels[g.cwd], refined != g.label else { return g }
+            return SessionGroup(cwd: g.cwd, label: refined, sessions: g.sessions)
+        }
+    }
+
     // Subscription quota (from Anthropic OAuth endpoint, only populated for Pro/Max users)
     @Published var subscriptionQuota: OAuthUsage?
     @Published var hasOAuthToken: Bool = false {
@@ -136,6 +161,9 @@ class UsageStore: ObservableObject {
         case .time:
             // Today's active duration: "3.4h" / "32m" / "0m".
             return TimeLogic.formatDurationShort(timeTodaySeconds)
+        case .session:
+            // Live session count, with a busy marker when any are working.
+            return anySessionBusy ? "▸\(liveSessionCount)" : "\(liveSessionCount)"
         }
     }
 
@@ -147,6 +175,15 @@ class UsageStore: ObservableObject {
     // Fed monotonically from each successful scan + a periodic wide-range sweep;
     // overlaid onto historical-month and year-heatmap reads. See UsageArchive.
     private let archive = UsageArchive()
+
+    // Live session monitor (FSEvents + poll over ~/.claude/sessions). Owned here
+    // so it runs in BOTH menu-bar and notch modes; publishes onto the main thread.
+    private lazy var sessionMonitor = SessionMonitor { [weak self] scan in
+        guard let self = self else { return }
+        if self.sessions != scan.sessions { self.sessions = scan.sessions }
+        if self.sessionLabels != scan.labels { self.sessionLabels = scan.labels }
+        if self.showOldClaudeHint != scan.oldClaudeHint { self.showOldClaudeHint = scan.oldClaudeHint }
+    }
     // Main-thread only: when the last wide-range archive sweep ran, so the
     // periodic refresh doesn't sweep more than ~every 6h.
     private var lastArchiveSweep: Date?
@@ -268,6 +305,17 @@ class UsageStore: ObservableObject {
         displayMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: "displayMode")
     }
+
+    // MARK: - Live session monitoring
+
+    /// Begin watching ~/.claude/sessions. Idempotent; safe in both display modes.
+    func startSessionMonitoring() { sessionMonitor.start() }
+
+    /// Bump the monitor's poll cadence with UI visibility (faster while the
+    /// popover/notch is on screen, slower when hidden).
+    func setSessionMonitorActive(_ active: Bool) { sessionMonitor.setActive(active) }
+
+    func stopSessionMonitoring() { sessionMonitor.stop() }
 
     // MARK: - Local archive (durable history)
 

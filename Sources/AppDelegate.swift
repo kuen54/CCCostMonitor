@@ -120,6 +120,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         store.loadCacheForCurrentMonth()
         store.refresh()
 
+        // Live session monitor (FSEvents + poll over ~/.claude/sessions). Runs in
+        // both menu-bar and notch modes; the poll bumps to active while the
+        // popover is on screen (popoverDidShow/Close).
+        store.startSessionMonitoring()
+
         // Auto-refresh every 30 minutes
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 30 * 60, repeats: true) { [weak self] _ in
             self?.store.refresh()
@@ -191,12 +196,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // the popover was open and we deferred it to keep the anchor stable. Apply it now.
     func popoverDidClose(_ notification: Notification) {
         statusItem.button?.title = latestMenuTitle
+        store.setSessionMonitorActive(false)
     }
 
     // Animate the open, but stop animating once shown so per-tab content-height
     // changes resize the popover instantly instead of jittering the rows above.
     func popoverDidShow(_ notification: Notification) {
         popover.animates = false
+        store.setSessionMonitorActive(true)
     }
 
     private func showPopover() {
@@ -288,6 +295,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        store.stopSessionMonitoring()
         notchController?.stop()
         notchController = nil
         fsRefreshDebounce?.cancel()

@@ -858,6 +858,158 @@ struct TimeTabView: View {
     }
 }
 
+// MARK: - Session tab (live Claude Code sessions)
+
+/// Read-only list of live interactive Claude Code sessions, grouped by working
+/// directory. Structurally modeled on TimeTabView. Phase 1: rows are
+/// NON-interactive (no click-to-jump) — but each row carries a `contentShape`
+/// so a Phase 3 tap handler attaches without restructuring.
+struct SessionTabView: View {
+    @ObservedObject var store: UsageStore
+    @Environment(\.localizer) private var loc
+
+    var body: some View {
+        VStack(spacing: 8) {
+            let groups = store.sessionGroups
+            if groups.isEmpty {
+                emptyState
+            } else {
+                if store.showOldClaudeHint { hintBanner }
+                ForEach(groups) { group in
+                    SessionGroupSection(group: group)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 20)).foregroundColor(.secondary)
+            Text(loc("sessionEmpty"))
+                .font(.system(size: 11)).foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 120)
+    }
+
+    /// Shown when running `claude` processes exist but no session registry does
+    /// (old Claude Code) — synthesized rows below show only a "Running" status.
+    private var hintBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.up.circle")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+            Text(loc("sessionOldCCHint"))
+                .font(.system(size: 10.5)).foregroundColor(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
+    }
+}
+
+/// One cwd's card: folder header (basename / git top-level, full path on hover)
+/// + its session rows.
+struct SessionGroupSection: View {
+    let group: SessionGroup
+    @Environment(\.localizer) private var loc
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: "folder")
+                    .font(.system(size: 10)).foregroundColor(.secondary)
+                Text(group.label)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                Text("\(group.sessions.count)")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(Color.primary.opacity(0.07)))
+                Spacer(minLength: 0)
+            }
+            .help(group.cwd)
+
+            VStack(spacing: 2) {
+                ForEach(group.sessions) { session in
+                    SessionRow(session: session)
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+}
+
+/// One session: colored status dot + label, short id / version, relative time.
+struct SessionRow: View {
+    let session: SessionInfo
+    @Environment(\.localizer) private var loc
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(statusLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.primary)
+                HStack(spacing: 6) {
+                    Text(session.shortId)
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundColor(.secondary)
+                    if let v = session.version, !v.isEmpty {
+                        Text("v\(v)")
+                            .font(.system(size: 9.5))
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            Spacer(minLength: 4)
+            if let updated = session.updatedAt {
+                Text(timeAgo(Date(timeIntervalSince1970: updated / 1000), loc))
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 2)
+        // Phase 3 attaches a tap handler here; structuring the row as a single
+        // hit-testable shape now keeps that change additive.
+        .contentShape(Rectangle())
+    }
+
+    private var statusColor: Color {
+        switch session.status {
+        case .busy:                  return .orange
+        case .waiting:               return Color(red: 0.93, green: 0.69, blue: 0.22) // amber
+        case .idle, .shell, .unknown: return .gray
+        }
+    }
+
+    private var statusLabel: String {
+        switch session.status {
+        case .busy:
+            return loc("sessionWorking")
+        case .waiting:
+            switch session.waitReason {
+            case .needsConfirmation:    return loc("sessionNeedsConfirm")
+            case .needsInput, .none:    return loc("sessionWaitingInput")
+            }
+        case .idle, .shell:
+            return loc("sessionIdle")
+        case .unknown:
+            return loc("sessionRunning")
+        }
+    }
+}
+
 /// Monday-first localized short weekday symbols (DateFormatter's
 /// shortWeekdaySymbols is Sunday-first → rotate). Human-facing → locale-aware.
 private func mondayFirstWeekdaySymbols(_ loc: Localizer) -> [String] {
@@ -1608,7 +1760,9 @@ struct PopoverView: View {
     /// order (cost, tokens, time, subscription) differs from rawValue order —
     /// `time = 3` was APPENDED so persisted rawValues never remap.
     private var visibleTabs: [DisplayTab] {
-        store.hasOAuthToken ? [.cost, .tokens, .time, .subscription] : [.cost, .tokens, .time]
+        store.hasOAuthToken
+            ? [.cost, .tokens, .time, .session, .subscription]
+            : [.cost, .tokens, .time, .session]
     }
 
     /// Notch-only spring for the per-tab WIDTH flip (360↔480). In the notch the black
@@ -1704,9 +1858,10 @@ struct PopoverView: View {
 
             footer
         }
-        // The Time tab needs room for a 53-column heatmap and a 0–24h timeline;
-        // the other tabs keep the original compact width.
-        .frame(width: store.selectedTab == .time ? 480 : 360)
+        // The Time tab needs room for a 53-column heatmap and a 0–24h timeline,
+        // and the Session tab reads better wide for grouped path lists; the other
+        // tabs keep the original compact width.
+        .frame(width: (store.selectedTab == .time || store.selectedTab == .session) ? 480 : 360)
         // Notch: spring the width flip so it grows symmetrically from the notch center.
         // Menu bar: nil → tabs switch instantly (no NSPopover resize animation). See
         // notchWidthAnimation.
@@ -1720,6 +1875,8 @@ struct PopoverView: View {
     private var contentSection: some View {
             if store.selectedTab == .time {
                 TimeTabView(store: store)
+            } else if store.selectedTab == .session {
+                SessionTabView(store: store)
             } else if store.selectedTab == .subscription {
                 SubscriptionView(store: store)
             } else if store.isCurrentMonth {
