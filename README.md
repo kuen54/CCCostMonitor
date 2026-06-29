@@ -30,6 +30,7 @@
         <li><b>Every display</b> — a synthetic notch appears on external monitors too</li>
         <li><b>Respects fullscreen</b> — hides for immersion, then slides back in together with the menu bar when you hover the top</li>
       </ul>
+      <sub><b>Enable:</b> click <b>⋯</b> in the popover footer → <b>Display location</b> → <b>Notch</b>.</sub>
     </td>
   </tr>
 </table>
@@ -60,7 +61,7 @@ This app reads all your local session data and puts it in one place. One menu ba
 - **4 languages** — English, 简体中文, 繁體中文, 日本語
 - **Auto-refresh** — watches your session logs and updates within seconds of real usage (rate-limited to once per 2 min), with a 30-min fallback timer + refresh on screen wake
 - **Menu bar only** — no Dock icon, click app again to show popover
-- **Notch mode** — optionally move the display into the notch: an idle pill that hover-expands into the full popover, on every display (synthetic notch on externals), hiding for fullscreen and returning with the menu bar
+- **Notch mode** — optionally move the display into the notch: an idle pill that hover-expands into the full popover, on every display (synthetic notch on externals), hiding for fullscreen and returning with the menu bar. *Enable from the **⋯** menu in the popover footer → Display location → Notch*
 
 ### Requirements
 
@@ -197,7 +198,7 @@ Claude Code 的 `/cost` 只显示当前会话。如果你有多个 Anthropic 账
 - **4 种语言** — English、简体中文、繁體中文、日本語
 - **自动刷新** — 监听本地会话日志，实际使用后数秒内更新（限速为每 2 分钟最多一次），另有 30 分钟兜底定时器 + 屏幕唤醒后刷新
 - **仅菜单栏** — 无 Dock 图标，再次点击 app 可唤出弹窗
-- **刘海模式（Notch）** — 可选把显示移到屏幕刘海：平时是贴着刘海的悬浮小条，hover 展开成完整弹窗；外接屏也有（合成刘海），全屏时自动隐藏、hover 顶部唤出菜单栏时随之出现
+- **刘海模式（Notch）** — 可选把显示移到屏幕刘海：平时是贴着刘海的悬浮小条，hover 展开成完整弹窗；外接屏也有（合成刘海），全屏时自动隐藏、hover 顶部唤出菜单栏时随之出现。*在弹窗底部 **⋯** 菜单 → 显示位置 → 刘海 开启*
 
 ### 系统要求
 
