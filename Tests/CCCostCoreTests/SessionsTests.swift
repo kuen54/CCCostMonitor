@@ -140,4 +140,107 @@ import Testing
         // Equal updatedAt → tiebreak on sessionId, so order is stable across inputs.
         #expect(SessionLogic.grouped([a, b]) == SessionLogic.grouped([b, a]))
     }
+
+    // MARK: - Done-unseen reducer (Phase 2)
+
+    private func sess(_ id: String, _ status: SessionStatus) -> SessionInfo {
+        SessionInfo(pid: 1, sessionId: id, cwd: "/x", status: status, entrypoint: "cli")
+    }
+
+    @Test func justFinishedBusyToIdleMarks() {
+        #expect(SessionLogic.justFinished(previous: ["a": .busy], current: [sess("a", .idle)]) == ["a"])
+    }
+
+    @Test func justFinishedWaitingToIdleMarks() {
+        #expect(SessionLogic.justFinished(previous: ["a": .waiting], current: [sess("a", .idle)]) == ["a"])
+    }
+
+    @Test func justFinishedBusyToShellMarks() {
+        #expect(SessionLogic.justFinished(previous: ["a": .busy], current: [sess("a", .shell)]) == ["a"])
+    }
+
+    @Test func justFinishedIdleToIdleDoesNot() {
+        #expect(SessionLogic.justFinished(previous: ["a": .idle], current: [sess("a", .idle)]).isEmpty)
+    }
+
+    @Test func justFinishedBusyToBusyDoesNot() {
+        #expect(SessionLogic.justFinished(previous: ["a": .busy], current: [sess("a", .busy)]).isEmpty)
+    }
+
+    @Test func justFinishedFirstSeenIdleDoesNot() {
+        // No previous entry → first observation, not a finish.
+        #expect(SessionLogic.justFinished(previous: [:], current: [sess("a", .idle)]).isEmpty)
+    }
+
+    @Test func stepMarksFinishedAndAdvancesPrev() {
+        let (prev, done) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .busy], current: [sess("a", .idle)],
+            doneUnseen: [:], seenAll: false, now: 100)
+        #expect(done["a"] == 100)
+        #expect(prev["a"] == .idle)
+    }
+
+    @Test func stepIdleToIdleDoesNotMark() {
+        let (_, done) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .idle], current: [sess("a", .idle)],
+            doneUnseen: [:], seenAll: false, now: 1)
+        #expect(done.isEmpty)
+    }
+
+    @Test func stepFirstSeenIdleDoesNotMark() {
+        let (_, done) = SessionLogic.stepDoneUnseen(
+            prev: [:], current: [sess("a", .idle)],
+            doneUnseen: [:], seenAll: false, now: 1)
+        #expect(done.isEmpty)
+    }
+
+    @Test func stepGoingBusyAgainClears() {
+        var (prev, done) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .busy], current: [sess("a", .idle)],
+            doneUnseen: [:], seenAll: false, now: 100)
+        #expect(done["a"] == 100)
+        (prev, done) = SessionLogic.stepDoneUnseen(
+            prev: prev, current: [sess("a", .busy)],
+            doneUnseen: done, seenAll: false, now: 110)
+        #expect(done.isEmpty)                       // active again → cue cleared
+    }
+
+    @Test func stepDisappearanceClears() {
+        let (_, done0) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .busy], current: [sess("a", .idle)],
+            doneUnseen: [:], seenAll: false, now: 1)
+        #expect(done0["a"] == 1)
+        let (_, done1) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .idle], current: [],
+            doneUnseen: done0, seenAll: false, now: 2)
+        #expect(done1.isEmpty)                      // session gone → cue cleared
+    }
+
+    @Test func stepTtlExpiryClears() {
+        let (_, done0) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .busy], current: [sess("a", .idle)],
+            doneUnseen: [:], seenAll: false, now: 0)
+        // Just under ttl: kept.
+        let (_, kept) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .idle], current: [sess("a", .idle)],
+            doneUnseen: done0, seenAll: false, now: 3599, ttl: 3600)
+        #expect(kept["a"] == 0)
+        // Past ttl: evicted.
+        let (_, expired) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .idle], current: [sess("a", .idle)],
+            doneUnseen: done0, seenAll: false, now: 3601, ttl: 3600)
+        #expect(expired.isEmpty)
+    }
+
+    @Test func stepSeenAllClearsButAdvancesPrev() {
+        let (_, done0) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .busy], current: [sess("a", .idle)],
+            doneUnseen: [:], seenAll: false, now: 1)
+        #expect(done0["a"] == 1)
+        let (prev1, done1) = SessionLogic.stepDoneUnseen(
+            prev: ["a": .idle], current: [sess("a", .idle)],
+            doneUnseen: done0, seenAll: true, now: 2)
+        #expect(done1.isEmpty)
+        #expect(prev1["a"] == .idle)                // prev still advances on seenAll
+    }
 }

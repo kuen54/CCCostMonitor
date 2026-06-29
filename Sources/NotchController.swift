@@ -516,6 +516,9 @@ final class NotchController: NSObject {
         // Fresh-when-you-look, mirroring the NSPopover open kick. Non-forced: the
         // fingerprint short-circuit makes it ~free when nothing changed.
         store.refresh()
+        // The user is now looking: clear the "a turn finished, unseen" cue so the
+        // notch's green dot drops once they've opened the popover.
+        store.markSessionsSeen()
     }
 
     private func close(_ inst: NotchInstance) {

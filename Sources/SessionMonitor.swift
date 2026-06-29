@@ -25,6 +25,10 @@ struct SessionScan: Equatable {
     /// True only in the fallback case: no registry, but running `claude`
     /// processes were found → "update Claude Code to see live status".
     var oldClaudeHint: Bool
+    /// Phase 2: any session finished a turn (busy/waiting → idle/shell) that the
+    /// user hasn't looked at yet. Derived by the monitor across scans via the
+    /// pure SessionLogic.stepDoneUnseen reducer; drives the notch's green dot.
+    var anyDoneUnseen: Bool = false
 
     static let empty = SessionScan(sessions: [], labels: [:], oldClaudeHint: false)
 }
@@ -43,6 +47,11 @@ final class SessionMonitor {
     // queue-confined state
     private var lastScan: SessionScan?
     private var labelCache: [String: String] = [:]   // cwd → resolved label
+
+    // queue-confined done-unseen tracker state (Phase 2): the previous scan's
+    // per-session statuses + the sessionIds that finished a turn unseen (→ when).
+    private var prevStatuses: [String: SessionStatus] = [:]
+    private var doneUnseen: [String: Double] = [:]
 
     // Poll cadence. Faster while the UI is on screen, slower (but still alive,
     // to catch process death) when hidden.
@@ -144,10 +153,33 @@ final class SessionMonitor {
 
     // MARK: - Scan (queue only)
 
-    private func rescan() {
-        let scan = computeScan()
+    private func rescan(now: Double = Date().timeIntervalSince1970) {
+        var scan = computeScan()
+        // Fold this scan into the done-unseen tracker (pure reducer, our clock).
+        let stepped = SessionLogic.stepDoneUnseen(
+            prev: prevStatuses, current: scan.sessions,
+            doneUnseen: doneUnseen, seenAll: false, now: now)
+        prevStatuses = stepped.prev
+        doneUnseen = stepped.doneUnseen
+        scan.anyDoneUnseen = !doneUnseen.isEmpty
         if scan != lastScan {
             lastScan = scan
+            DispatchQueue.main.async { [weak self] in self?.onChange(scan) }
+        }
+    }
+
+    /// The user is now looking at session state (notch opened / Session tab
+    /// shown): forget every pending "finished, unseen" cue. Queue-confined like
+    /// the rest of the monitor's state; republishes the cleared flag on the main
+    /// thread (only when it was actually set, so no needless publish). prevStatuses
+    /// is intentionally NOT reset — transition tracking continues uninterrupted.
+    func markSeen() {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.doneUnseen.removeAll()
+            guard var scan = self.lastScan, scan.anyDoneUnseen else { return }
+            scan.anyDoneUnseen = false
+            self.lastScan = scan
             DispatchQueue.main.async { [weak self] in self?.onChange(scan) }
         }
     }

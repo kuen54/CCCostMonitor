@@ -90,6 +90,10 @@ class UsageStore: ObservableObject {
     /// Set when no session registry exists but `claude` is running — old Claude
     /// Code; surfaces a subtle "update to see live status" hint in the tab.
     @Published var showOldClaudeHint: Bool = false
+    /// Phase 2: a session finished a turn the user hasn't looked at yet — drives
+    /// the notch logo's green attention dot. Fed by the SessionMonitor; cleared
+    /// by markSessionsSeen() when the user opens the notch / views the tab.
+    @Published var anySessionDoneUnseen: Bool = false
 
     var liveSessionCount: Int { sessions.count }
     var busySessionCount: Int { sessions.filter { $0.status == .busy }.count }
@@ -183,6 +187,7 @@ class UsageStore: ObservableObject {
         if self.sessions != scan.sessions { self.sessions = scan.sessions }
         if self.sessionLabels != scan.labels { self.sessionLabels = scan.labels }
         if self.showOldClaudeHint != scan.oldClaudeHint { self.showOldClaudeHint = scan.oldClaudeHint }
+        if self.anySessionDoneUnseen != scan.anyDoneUnseen { self.anySessionDoneUnseen = scan.anyDoneUnseen }
     }
     // Main-thread only: when the last wide-range archive sweep ran, so the
     // periodic refresh doesn't sweep more than ~every 6h.
@@ -316,6 +321,10 @@ class UsageStore: ObservableObject {
     func setSessionMonitorActive(_ active: Bool) { sessionMonitor.setActive(active) }
 
     func stopSessionMonitoring() { sessionMonitor.stop() }
+
+    /// The user is now looking at session state (the notch popover opened, or the
+    /// Session tab appeared): clear the "a turn finished, unseen" cue (green dot).
+    func markSessionsSeen() { sessionMonitor.markSeen() }
 
     // MARK: - Local archive (durable history)
 

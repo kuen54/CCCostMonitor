@@ -200,4 +200,65 @@ enum SessionLogic {
         if a.mostRecentUpdate != b.mostRecentUpdate { return a.mostRecentUpdate > b.mostRecentUpdate }
         return a.cwd < b.cwd
     }
+
+    // MARK: - Done-unseen reducer (Phase 2)
+    //
+    // Tracks sessions that JUST finished a turn (an active → done transition) and
+    // that the user hasn't "looked at" yet — the data behind the notch's green
+    // "a turn finished" cue. Pure + deterministic with `now` injected, so the
+    // app-side SessionMonitor stays a thin queue-confined wrapper and all the
+    // transition logic is unit-testable.
+
+    /// Session ids whose status went from ACTIVE (.busy/.waiting) to DONE
+    /// (.idle/.shell) between `previous` and `current` — i.e. a turn just ended.
+    /// A session ABSENT from `previous` (first observation) is never a finish:
+    /// seeing a brand-new idle session is not "it just finished for you".
+    static func justFinished(previous: [String: SessionStatus],
+                             current: [SessionInfo]) -> [String] {
+        current.compactMap { s in
+            guard let prev = previous[s.sessionId] else { return nil }
+            let wasActive = (prev == .busy || prev == .waiting)
+            let nowDone = (s.status == .idle || s.status == .shell)
+            return (wasActive && nowDone) ? s.sessionId : nil
+        }
+    }
+
+    /// One pure step of the done-unseen tracker. Folds `justFinished` into
+    /// `doneUnseen` (sessionId → finishedAt epoch) and then evicts any entry that
+    /// is no longer "an unseen finish":
+    ///   (a) the session is .busy/.waiting again,
+    ///   (b) the session vanished from `current`,
+    ///   (c) its finishedAt is older than `ttl` (default 3600s),
+    ///   (d) `seenAll` (the user looked) clears everything.
+    /// Returns the next (prevStatuses, doneUnseen). Deterministic for a given
+    /// `now`, so the caller must pass its own clock (no Date() in core).
+    static func stepDoneUnseen(prev: [String: SessionStatus],
+                               current: [SessionInfo],
+                               doneUnseen: [String: Double],
+                               seenAll: Bool,
+                               now: Double,
+                               ttl: Double = 3600) -> (prev: [String: SessionStatus],
+                                                       doneUnseen: [String: Double]) {
+        let curStatus = Dictionary(current.map { ($0.sessionId, $0.status) },
+                                   uniquingKeysWith: { _, b in b })
+        // The user looked: forget every pending cue, but still advance prev so a
+        // later genuine transition is detected against an up-to-date baseline.
+        guard !seenAll else { return (curStatus, [:]) }
+
+        var next = doneUnseen
+        for id in justFinished(previous: prev, current: current) {
+            next[id] = now
+        }
+        let currentIds = Set(curStatus.keys)
+        for (id, finishedAt) in next {
+            if let st = curStatus[id], st == .busy || st == .waiting {
+                next.removeValue(forKey: id)            // (a) active again
+            } else if !currentIds.contains(id) {
+                next.removeValue(forKey: id)            // (b) session gone
+            } else if now - finishedAt > ttl {
+                next.removeValue(forKey: id)            // (c) stale
+            }
+        }
+        return (curStatus, next)
+    }
 }

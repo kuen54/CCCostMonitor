@@ -882,6 +882,9 @@ struct SessionTabView: View {
         }
         .padding(.horizontal, 10)
         .padding(.bottom, 6)
+        // Viewing the Session tab counts as "looking" — clear the unseen-finished
+        // cue (the notch's green dot) the moment the tab appears.
+        .onAppear { store.markSessionsSeen() }
     }
 
     private var emptyState: some View {
