@@ -118,12 +118,17 @@ final class SessionJumper {
         let script = kind == .iterm2
             ? SessionLogic.itermFocusScript(devTTY: dev)
             : SessionLogic.appleTerminalFocusScript(devTTY: dev)
-        guard let (status, out) = run("/usr/bin/osascript", ["-e", script]) else {
+        // First-ever jump to a scriptable terminal blocks on the system Automation
+        // (TCC) consent dialog. A 5s watchdog would kill that prompt before the
+        // user can click Allow; give osascript a longer (still bounded) leash so
+        // the first attempt isn't silently degraded. The watchdog still fires if
+        // osascript truly hangs — it only blocks this private jump queue, never UI.
+        guard let (status, out) = run("/usr/bin/osascript", ["-e", script], timeout: 30.0) else {
             // osascript itself failed to launch.
             return activateApp(target, reason: .unsupported)
         }
         if status == 0 {
-            if out.contains("ok") { return .focusedPane }     // tab matched + activated
+            if out == "ok" { return .focusedPane }             // tab matched + activated
             return activateApp(target, reason: .ambiguous)     // ran, tty not found
         }
         // Non-zero exit ⇒ almost always a denied Automation (TCC) prompt, or the

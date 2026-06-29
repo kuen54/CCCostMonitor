@@ -240,10 +240,13 @@ enum SessionLogic {
 
     /// First `.app` bundle path embedded in an executable path, e.g.
     /// "/Applications/Otty.app/Contents/MacOS/Otty" → "/Applications/Otty.app".
-    /// nil when the path has no ".app" segment.
+    /// nil when the path has no ".app" segment. Matches the ".app/" boundary (or a
+    /// trailing ".app") so it can't mis-slice "/Users/foo.apptest/bin/term".
     static func appBundlePath(fromExecPath path: String) -> String? {
-        guard let r = path.range(of: ".app") else { return nil }
-        return String(path[path.startIndex..<r.upperBound])
+        if let r = path.range(of: ".app/") {
+            return String(path[path.startIndex..<path.index(r.lowerBound, offsetBy: 4)])
+        }
+        return path.hasSuffix(".app") ? path : nil
     }
 
     /// True when an executable path / comm string belongs to a terminal

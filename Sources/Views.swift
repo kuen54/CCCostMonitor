@@ -883,6 +883,10 @@ struct SessionTabView: View {
         }
         .padding(.horizontal, 10)
         .padding(.bottom, 6)
+        // Drive the jump-hint banner's `.transition(.opacity)` — the hint is set
+        // from a background completion (no withAnimation at the source), so animate
+        // its insertion/removal here instead.
+        .animation(.easeInOut(duration: 0.2), value: store.sessionJumpHint)
         // Viewing the Session tab counts as "looking" — clear the unseen-finished
         // cue (the notch's green dot) the moment the tab appears.
         .onAppear { store.markSessionsSeen() }
@@ -1020,9 +1024,20 @@ struct SessionRow: View {
                 .fill(Color.primary.opacity(hovering ? 0.06 : 0.0))
         )
         .onHover { inside in
+            // Only act on a REAL transition. SwiftUI can re-deliver the same
+            // value on a re-render; without this guard a repeated `true` would
+            // double-push the cursor stack (and a repeated `false` underflow-pop).
+            guard inside != hovering else { return }
             hovering = inside
-            // Pointer cursor over a clickable row.
+            // Pointer cursor over a clickable row. push/pop must stay balanced.
             if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        // Tapping a row activates the terminal app, which makes the menu-bar
+        // popover resign key and tear down WHILE the pointer is still over the
+        // row — so onHover's `false` never arrives. Pop the cursor we pushed on
+        // teardown so it can't leak a stuck pointing-hand into the next popover.
+        .onDisappear {
+            if hovering { NSCursor.pop(); hovering = false }
         }
         .onTapGesture { store.jumpToSession(session) }
     }
