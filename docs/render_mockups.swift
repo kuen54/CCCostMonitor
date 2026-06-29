@@ -338,12 +338,15 @@ struct DemoPopover: View {
     }
 }
 
-// The notch experience: the idle pill and the expanded popover dropping out of the
-// physical notch, on a desktop backdrop. Reuses the REAL NotchShape + the dark popover
+// The notch experience: the expanded popover dropping straight out of the display notch
+// at the top-center of the screen, interrupting the menu bar. ONE black element flush
+// with the top edge (not a floating blob). Reuses the REAL NotchShape + the dark popover
 // (custom segmented control, black layer) the app draws in the notch.
 struct DemoNotch: View {
     @ObservedObject var store: UsageStore
     let loc: Localizer
+
+    private let menuBarHeight: CGFloat = 28
 
     private var wallpaper: some View {
         LinearGradient(
@@ -353,25 +356,40 @@ struct DemoNotch: View {
             startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
+    // Faint menu bar of the FOREGROUND app, so the black panel reads as the NOTCH
+    // interrupting the top of the screen (not a card floating in space). The popover
+    // covers its center (where the physical notch is).
+    private var menuBar: some View {
+        HStack(spacing: 16) {
+            Image(systemName: "apple.logo")
+            Text("Terminal").fontWeight(.semibold)
+            Spacer()
+            Image(systemName: "battery.100")
+            Image(systemName: "wifi")
+            Text("Wed 16:30")
+        }
+        .font(.system(size: 12))
+        .foregroundColor(.white.opacity(0.9))
+        .padding(.horizontal, 16)
+        .frame(height: menuBarHeight)
+        .background(Color.black.opacity(0.22))
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+
     var body: some View {
         ZStack(alignment: .top) {
             wallpaper
-            VStack(spacing: 22) {
-                // Idle pill: Claude logo + live value with the physical-notch gap.
-                CompactNotchView(store: store, notchWidth: 86, notchHeight: 30)
-                    .background(Color.black)
-                    .clipShape(NotchShape(topCornerRadius: 6, bottomCornerRadius: 13))
-
-                // Hover → the black grows out of the notch into the full popover.
-                DemoPopover(store: store, loc: loc, bg: .clear, notch: true)
-                    .padding(.top, 8)
-                    .background(Color.black)
-                    .clipShape(NotchShape(topCornerRadius: 11, bottomCornerRadius: 19))
-            }
-            .padding(.top, 18)
-            .environment(\.colorScheme, .dark)
+            menuBar
+            // The notch panel: flush with the very top edge, hanging down. Its top band
+            // (the camera strip) overlaps the menu bar; the "CC Monitor" header sits
+            // clearly below the bar.
+            DemoPopover(store: store, loc: loc, bg: .clear, notch: true)
+                .padding(.top, menuBarHeight)   // header lands a row below the menu bar
+                .background(Color.black)
+                .clipShape(NotchShape(topCornerRadius: 10, bottomCornerRadius: 22))
+                .environment(\.colorScheme, .dark)
         }
-        .frame(width: 560, height: 820)
+        .frame(width: 720, height: 772)
     }
 }
 
