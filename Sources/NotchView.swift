@@ -156,7 +156,7 @@ struct CompactNotchView: View {
     /// shape), so the dot stays put while the logo spins.
     private var logoMark: some View {
         ClaudeLogoShape()
-            .fill(Color(red: 0.851, green: 0.467, blue: 0.341)) // Claude brand #D97757
+            .fill(Color.ccBrand)
             .frame(width: 16, height: 16)
     }
 
@@ -187,7 +187,7 @@ struct CompactNotchView: View {
     /// (no pulse), and independent of the spin (both may co-occur).
     private var dotColor: Color? {
         if store.anySessionWaiting {
-            return Color(red: 0.949, green: 0.706, blue: 0.361) // brand amber ≈ #F2B45C
+            return Color.ccStatusWaiting
         }
         if store.anySessionDoneUnseen {
             return .green

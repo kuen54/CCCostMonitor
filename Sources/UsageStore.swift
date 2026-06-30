@@ -104,7 +104,7 @@ class UsageStore: ObservableObject {
     @Published var showOldClaudeHint: Bool = false
     /// Phase 2: a session finished a turn the user hasn't looked at yet — drives
     /// the notch logo's aggregate green attention dot. Fed by the SessionMonitor;
-    /// cleared per-session on engagement (clicking a row) or by markSessionsSeen().
+    /// cleared per-session on engagement (clicking a row).
     /// Kept equal to `!sessionDoneUnseen.isEmpty`.
     @Published var anySessionDoneUnseen: Bool = false
     /// Phase 6: the exact sessionIds that finished a turn unseen — drives each
@@ -349,12 +349,6 @@ class UsageStore: ObservableObject {
 
     func stopSessionMonitoring() { sessionMonitor.stop() }
 
-    /// The user is now looking at session state: clear ALL "a turn finished,
-    /// unseen" cues (every green dot). Kept for completeness; Phase 6 no longer
-    /// calls this on popover-open / tab-appear (that wiped the cue before the user
-    /// could tell which session finished) — clearing is now per-session on tap.
-    func markSessionsSeen() { sessionMonitor.markSeen() }
-
     /// Phase 6: the user engaged with ONE session (clicked its row to jump) —
     /// clear just that session's finished-unseen green dot, leaving the others.
     func markSessionSeen(_ sessionId: String) { sessionMonitor.markSeen(sessionId: sessionId) }
@@ -381,7 +375,7 @@ class UsageStore: ObservableObject {
     /// degraded cases auto-dismiss after a few seconds. Main thread only.
     private func handleJumpOutcome(_ outcome: JumpOutcome) {
         switch outcome {
-        case .focusedPane, .focusedWindow:
+        case .focusedPane:
             setSessionJumpHint(nil)
         case .appOnly(let reason):
             setSessionJumpHint(reason == .permissionDenied
@@ -809,8 +803,16 @@ class UsageStore: ObservableObject {
         snapshot.week = week
         snapshot.weekStart = weekStart
         snapshot.time = time
-        guard let jsonData = UsageParser.encodeSnapshot(snapshot) else { return }
-        try? jsonData.write(to: URL(fileURLWithPath: cachePath(year: year, month: month)))
+        // Encode + write off the main thread: JSON encode + the cacheDir
+        // createDirectory + the file write are pure I/O with no @Published side
+        // effects, but ran inside the refresh/loadHistoricalMonth main-thread
+        // completion. scriptQueue is serial, so writes stay ordered and never
+        // collide. The snapshot is a value type, captured by copy.
+        scriptQueue.async { [weak self] in
+            guard let self = self,
+                  let jsonData = UsageParser.encodeSnapshot(snapshot) else { return }
+            try? jsonData.write(to: URL(fileURLWithPath: self.cachePath(year: year, month: month)))
+        }
     }
 
     private func loadCache(year: Int, month: Int) -> PeriodUsage? {

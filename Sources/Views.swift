@@ -1067,7 +1067,7 @@ struct SessionRow: View {
     private var statusColor: Color {
         switch dotKind {
         case .busy:       return .orange
-        case .waiting:    return Color(red: 0.93, green: 0.69, blue: 0.22) // amber
+        case .waiting:    return Color.ccStatusWaiting
         case .doneUnseen: return .green
         case .grey:       return .gray
         }
@@ -1860,7 +1860,7 @@ struct PopoverView: View {
             HStack {
                 HStack(spacing: 6) {
                     ClaudeLogoShape()
-                        .fill(Color(red: 0.851, green: 0.467, blue: 0.341)) // Claude brand orange (#D97757)
+                        .fill(Color.ccBrand)
                         .frame(width: 14, height: 14)
                     Text(loc("title"))
                         .font(.system(size: 13, weight: .bold))
