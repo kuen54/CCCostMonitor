@@ -323,6 +323,128 @@ enum SessionLogic {
         return .ambiguous
     }
 
+    /// Parse `otty-cli pane list --json` → [OttyPane]. Panes live under a
+    /// top-level `data` array; an entry missing id/cwd is skipped; the `process`
+    /// field is the title. nil when the JSON isn't the expected shape. Pure, so
+    /// the fuzzy-join match logic is testable without spawning otty-cli.
+    static func parseOttyPanes(_ json: String) -> [OttyPane]? {
+        guard let data = json.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = root["data"] as? [[String: Any]] else { return nil }
+        return arr.compactMap { p in
+            guard let id = p["id"] as? String, let cwd = p["cwd"] as? String else { return nil }
+            return OttyPane(id: id, cwd: cwd, title: (p["process"] as? String) ?? "")
+        }
+    }
+
+    // MARK: - Process table parsing + ppid-chain targeting (pure)
+    //
+    // The string/collection half of SessionMonitor's jump targeting and liveness:
+    // splitting `ps` output and walking a ppid chain to the owning GUI terminal.
+    // Foundation-only so the column math (a comm path may contain spaces; lstart
+    // is exactly 5 tokens) and the ancestry walk are unit-testable. Spawning `ps`
+    // and converting lstart→epoch (locale/TZ-dependent) stay in the app layer.
+
+    /// One row of `ps -Ao pid=,ppid=,tty=,comm=`: parent pid, controlling tty,
+    /// executable path. Keyed by pid in `parseProcTable`.
+    struct ProcRow: Equatable {
+        let ppid: Int
+        let tty: String
+        let comm: String
+    }
+
+    /// Parse `ps -Ao pid=,ppid=,tty=,comm=` output into pid → row. `comm` is the
+    /// remainder of the line so an executable path containing spaces survives;
+    /// rows with < 4 columns or a non-integer pid/ppid are skipped. Pure.
+    static func parseProcTable(_ out: String) -> [Int: ProcRow] {
+        var table: [Int: ProcRow] = [:]
+        for line in out.split(separator: "\n") {
+            let toks = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard toks.count >= 4, let pid = Int(toks[0]), let ppid = Int(toks[1]) else { continue }
+            let comm = toks[3...].joined(separator: " ")
+            table[pid] = ProcRow(ppid: ppid, tty: toks[2], comm: comm)
+        }
+        return table
+    }
+
+    /// Split one `ps -o pid=,lstart=,comm=` (or `-axo`) line into (pid, lstart,
+    /// comm). lstart is exactly the 5 whitespace tokens of "EEE MMM d HH:mm:ss
+    /// yyyy" (a single-digit day still yields 5 tokens — empty subsequences are
+    /// omitted); comm is the remainder (may contain spaces). nil for a line with
+    /// fewer than 7 tokens or a non-integer pid. Pure + timezone-independent —
+    /// the lstart→epoch conversion stays in the app layer (it needs a DateFormatter
+    /// in the local zone, which would make a date assertion machine-dependent).
+    static func parsePsLine(_ line: String) -> (pid: Int, lstart: String, comm: String)? {
+        let tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        guard tokens.count >= 7, let pid = Int(tokens[0]) else { return nil }
+        let lstart = tokens[1...5].joined(separator: " ")
+        let comm = tokens[6...].joined(separator: " ")
+        return (pid, lstart, comm)
+    }
+
+    /// Targeting facts resolved purely from a proc table by walking a session's
+    /// ppid chain (claude → -zsh → login → GUI app). `pidPresent` is false when
+    /// the session's own pid wasn't in the snapshot (a racy/partial table) — the
+    /// app layer uses it to avoid caching a degraded result. `appBundlePath` is
+    /// the first `.app` ancestor (the app layer turns it into a display name /
+    /// bundle id). Bounded to 12 hops so a cycle can't spin.
+    struct ProcTarget: Equatable {
+        let tty: String?
+        let terminal: TerminalKind
+        let appBundlePath: String?
+        let appPid: Int?
+        let multiplexed: Bool
+        let pidPresent: Bool
+    }
+
+    static func resolveTarget(table: [Int: ProcRow], pid: Int) -> ProcTarget {
+        let own = table[pid]
+        var multiplexed = false
+        var terminal: TerminalKind = .unknown
+        var appPid: Int? = nil
+        var appBundle: String? = nil
+        var cursor = own?.ppid ?? 0
+        var hops = 0
+        while let row = table[cursor], hops < 12 {
+            hops += 1
+            if isMultiplexer(comm: row.comm) { multiplexed = true }
+            if let bundle = appBundlePath(fromExecPath: row.comm) {
+                appBundle = bundle
+                appPid = cursor
+                terminal = classifyTerminal(commPath: row.comm)
+                break
+            }
+            if row.ppid <= 1 { break }
+            cursor = row.ppid
+        }
+        return ProcTarget(tty: own?.tty, terminal: terminal, appBundlePath: appBundle,
+                          appPid: appPid, multiplexed: multiplexed, pidPresent: own != nil)
+    }
+
+    // MARK: - Status dot (pure decision)
+
+    /// The Session-row / notch status dot, by PRIORITY. Pure so the view's color
+    /// map and its accessibility-label switch derive from ONE decision and can't
+    /// drift apart, and the priority (busy > waiting > done-unseen > grey) is
+    /// unit-testable. A finished-unseen session is by definition idle/shell/unknown
+    /// (the done-unseen reducer does NOT evict on idle→unknown), so `.doneUnseen`
+    /// replaces `.grey` for exactly those rows.
+    enum SessionDotKind: Equatable {
+        case busy        // working (orange)
+        case waiting     // wants the user (amber)
+        case doneUnseen  // finished a turn the user hasn't engaged (green)
+        case grey        // idle / shell / unknown, nothing pending
+    }
+
+    static func dotKind(status: SessionStatus, doneUnseen: Bool) -> SessionDotKind {
+        switch status {
+        case .busy:    return .busy
+        case .waiting: return .waiting
+        case .idle, .shell, .unknown:
+            return doneUnseen ? .doneUnseen : .grey
+        }
+    }
+
     // MARK: AppleScript builders (pure strings)
 
     /// Apple Terminal: select the tab whose `tty` matches, raise its window,

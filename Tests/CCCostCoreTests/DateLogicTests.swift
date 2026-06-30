@@ -132,4 +132,20 @@ import Testing
         #expect(today.cost == 0)
         #expect(today.models.isEmpty)
     }
+
+    @Test func daysInMonthHandlesAllLengths() {
+        #expect(AppDate.daysInMonth(year: 2026, month: 1) == 31)
+        #expect(AppDate.daysInMonth(year: 2026, month: 4) == 30)
+        #expect(AppDate.daysInMonth(year: 2026, month: 2) == 28)  // common year
+        #expect(AppDate.daysInMonth(year: 2024, month: 2) == 29)  // leap year
+        #expect(AppDate.daysInMonth(year: 2000, month: 2) == 29)  // div-by-400 leap
+        #expect(AppDate.daysInMonth(year: 1900, month: 2) == 28)  // div-by-100 non-leap
+        #expect(AppDate.daysInMonth(year: 2026, month: 12) == 31)
+    }
+
+    @Test func monthDateRangeUsesDaysInMonth() {
+        #expect(AppDate.monthDateRange(year: 2026, month: 2) == "2026-02-01:2026-02-28")
+        #expect(AppDate.monthDateRange(year: 2024, month: 2) == "2024-02-01:2024-02-29")
+        #expect(AppDate.monthDateRange(year: 2026, month: 4) == "2026-04-01:2026-04-30")
+    }
 }

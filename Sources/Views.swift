@@ -151,17 +151,7 @@ struct DailyChart: View {
 
     @State private var hoveredDay: Int? = nil
 
-    private var daysInMonth: Int {
-        let cal = AppDate.gregorian
-        var comps = DateComponents()
-        comps.year = year
-        comps.month = month
-        comps.day = 1
-        guard let start = cal.date(from: comps),
-              let next = cal.date(byAdding: .month, value: 1, to: start),
-              let last = cal.date(byAdding: .day, value: -1, to: next) else { return 30 }
-        return cal.component(.day, from: last)
-    }
+    private var daysInMonth: Int { AppDate.daysInMonth(year: year, month: month) ?? 30 }
 
     private var dayLookup: [Int: DailyUsage] {
         Dictionary(uniqueKeysWithValues: data.map { ($0.day, $0) })
@@ -1064,20 +1054,29 @@ struct SessionRow: View {
     /// the per-session twin of the notch's aggregate green cue.
     private var isDoneUnseen: Bool { store.sessionDoneUnseen.contains(session.sessionId) }
 
-    /// Leading dot color by PRIORITY: busy → orange (working); waiting → amber;
-    /// else a finished-unseen session → GREEN (identical to the notch aggregate
-    /// done dot); else idle/shell/unknown → grey. A done-unseen session is by
-    /// definition idle/shell, so green replaces grey for exactly those rows.
+    /// Leading dot kind by PRIORITY (busy > waiting > done-unseen > grey). One
+    /// pure decision in SessionLogic.dotKind so the color and the accessibility
+    /// label can't drift apart.
+    private var dotKind: SessionLogic.SessionDotKind {
+        SessionLogic.dotKind(status: session.status, doneUnseen: isDoneUnseen)
+    }
+
+    /// Dot color: a 1:1 map of dotKind. done-unseen GREEN is identical to the
+    /// notch aggregate done dot; a done-unseen session is by definition
+    /// idle/shell/unknown, so green replaces grey for exactly those rows.
     private var statusColor: Color {
-        switch session.status {
-        case .busy:                  return .orange
-        case .waiting:               return Color(red: 0.93, green: 0.69, blue: 0.22) // amber
-        case .idle, .shell, .unknown:
-            return isDoneUnseen ? .green : .gray
+        switch dotKind {
+        case .busy:       return .orange
+        case .waiting:    return Color(red: 0.93, green: 0.69, blue: 0.22) // amber
+        case .doneUnseen: return .green
+        case .grey:       return .gray
         }
     }
 
     private var statusLabel: String {
+        // Lockstep with the dot: a green (done-unseen) dot must never read
+        // "Running"/"Idle". Finer-grained text (wait reason) layers on top.
+        if dotKind == .doneUnseen { return loc("sessionFinishedUnread") }
         switch session.status {
         case .busy:
             return loc("sessionWorking")
@@ -1087,12 +1086,9 @@ struct SessionRow: View {
             case .needsInput, .none:    return loc("sessionWaitingInput")
             }
         case .idle, .shell:
-            return isDoneUnseen ? loc("sessionFinishedUnread") : loc("sessionIdle")
+            return loc("sessionIdle")
         case .unknown:
-            // statusColor renders .unknown as green when done-unseen (the reducer
-            // does NOT evict on idle→unknown), so keep the label in lockstep with
-            // the dot instead of reading "Running" under a green dot.
-            return isDoneUnseen ? loc("sessionFinishedUnread") : loc("sessionRunning")
+            return loc("sessionRunning")
         }
     }
 }
@@ -1146,7 +1142,7 @@ struct WeekTimeChart: View {
     /// Stats/render scope: in-month days always; out-of-month days only when
     /// the payload actually carries them (no fabricated zeros).
     private var renderedDayKeys: [String] {
-        dayKeys.filter { $0.hasPrefix(monthPrefix) || timeData.days[$0] != nil }
+        TimeLogic.renderedDayKeys(dayKeys, monthPrefix: monthPrefix, days: timeData.days)
     }
     private var todayKey: String { AppDate.dayKey(Date()) }
     private var weekTotal: Int {
@@ -1156,12 +1152,7 @@ struct WeekTimeChart: View {
     /// Mon..today (a Tuesday isn't averaged over 7 days); a fully past week
     /// over the days that rendered data (min 1); a future week renders 0s.
     private var avgDivisor: Int {
-        if let todayIndex = dayKeys.firstIndex(of: todayKey) {
-            return todayIndex + 1
-        }
-        // "yyyy-MM-dd" keys compare chronologically as strings.
-        guard let first = dayKeys.first, first <= todayKey else { return 1 }
-        return max(1, renderedDayKeys.count)
+        TimeLogic.avgDivisor(dayKeys: dayKeys, todayKey: todayKey, renderedCount: renderedDayKeys.count)
     }
     /// Monday-first row labels (shared with the month view's column headers).
     private var weekdaySymbols: [String] { mondayFirstWeekdaySymbols(loc) }

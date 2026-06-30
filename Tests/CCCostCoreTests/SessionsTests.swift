@@ -343,4 +343,169 @@ import Testing
         #expect(done1.isEmpty)
         #expect(prev1["a"] == .idle)                // prev still advances on seenAll
     }
+
+    // MARK: - Terminal classification helpers
+
+    @Test func appBundlePathSlicesAtDotAppBoundary() {
+        #expect(SessionLogic.appBundlePath(fromExecPath: "/Applications/Otty.app/Contents/MacOS/Otty")
+                == "/Applications/Otty.app")
+        // A trailing ".app" with no slash after it.
+        #expect(SessionLogic.appBundlePath(fromExecPath: "/Applications/Otty.app") == "/Applications/Otty.app")
+        // Must NOT mis-slice a directory that merely contains ".app" mid-name.
+        #expect(SessionLogic.appBundlePath(fromExecPath: "/Users/foo.apptest/bin/term") == nil)
+        #expect(SessionLogic.appBundlePath(fromExecPath: "/usr/bin/login") == nil)
+    }
+
+    @Test func isMultiplexerMatchesTmuxAndScreen() {
+        #expect(SessionLogic.isMultiplexer(comm: "tmux"))
+        #expect(SessionLogic.isMultiplexer(comm: "/usr/local/bin/tmux"))
+        #expect(SessionLogic.isMultiplexer(comm: "tmux: server"))
+        #expect(SessionLogic.isMultiplexer(comm: "screen"))
+        #expect(SessionLogic.isMultiplexer(comm: "screen-256color"))
+        #expect(!SessionLogic.isMultiplexer(comm: "-zsh"))
+        #expect(!SessionLogic.isMultiplexer(comm: "/Applications/Otty.app/Contents/MacOS/Otty"))
+    }
+
+    @Test func classifyTerminalByBundleName() {
+        #expect(SessionLogic.classifyTerminal(commPath: "/Applications/Otty.app/Contents/MacOS/Otty") == .otty)
+        #expect(SessionLogic.classifyTerminal(commPath: "/Applications/Ghostty.app/Contents/MacOS/ghostty") == .ghostty)
+        #expect(SessionLogic.classifyTerminal(commPath: "/Applications/iTerm.app/Contents/MacOS/iTerm2") == .iterm2)
+        #expect(SessionLogic.classifyTerminal(commPath: "/Applications/WezTerm.app/Contents/MacOS/wezterm-gui") == .wezterm)
+        #expect(SessionLogic.classifyTerminal(commPath: "/Applications/kitty.app/Contents/MacOS/kitty") == .kitty)
+        // Apple Terminal is matched LAST so its generic bundle can't shadow others.
+        #expect(SessionLogic.classifyTerminal(commPath: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal") == .appleTerminal)
+        #expect(SessionLogic.classifyTerminal(commPath: "/usr/bin/login") == .unknown)
+    }
+
+    @Test func devTTYNormalizesAndRejectsNone() {
+        #expect(SessionLogic.devTTY("ttys000") == "/dev/ttys000")
+        #expect(SessionLogic.devTTY("/dev/ttys003") == "/dev/ttys003")
+        #expect(SessionLogic.devTTY("??") == nil)
+        #expect(SessionLogic.devTTY("") == nil)
+        #expect(SessionLogic.devTTY(nil) == nil)
+    }
+
+    // MARK: - ps / proc table parsing
+
+    @Test func parsePsLineSplitsLstartAndSpacedComm() throws {
+        let p = try #require(SessionLogic.parsePsLine("  5185 Wed Jun 24 21:38:58 2026 /path/to/claude"))
+        #expect(p.pid == 5185)
+        #expect(p.lstart == "Wed Jun 24 21:38:58 2026")
+        #expect(p.comm == "/path/to/claude")
+    }
+
+    @Test func parsePsLineSingleDigitDayStillFiveTokens() throws {
+        // ps pads a single-digit day with an extra space; empty tokens are omitted.
+        let p = try #require(SessionLogic.parsePsLine("42 Wed Jun  4 21:38:58 2026 /Applications/My App.app/x"))
+        #expect(p.pid == 42)
+        #expect(p.lstart == "Wed Jun 4 21:38:58 2026")
+        #expect(p.comm == "/Applications/My App.app/x")   // comm keeps embedded spaces
+    }
+
+    @Test func parsePsLineRejectsShortOrNonNumeric() {
+        #expect(SessionLogic.parsePsLine("not enough tokens here") == nil)
+        #expect(SessionLogic.parsePsLine("xx Wed Jun 24 21:38:58 2026 /bin/claude") == nil)
+        #expect(SessionLogic.parsePsLine("") == nil)
+    }
+
+    @Test func parseProcTableKeepsSpacedCommSkipsBadRows() {
+        let out = """
+          1 0 ?? /sbin/launchd
+        100 1 ?? /Applications/My App.app/Contents/MacOS/My App
+        bad row skip
+        200 100 ttys001 -zsh
+        """
+        let t = SessionLogic.parseProcTable(out)
+        #expect(t[1]?.comm == "/sbin/launchd")
+        #expect(t[100]?.comm == "/Applications/My App.app/Contents/MacOS/My App")
+        #expect(t[200]?.ppid == 100)
+        #expect(t[200]?.tty == "ttys001")
+        #expect(t.count == 3)   // "bad row skip" dropped (non-int ppid)
+    }
+
+    // MARK: - ppid-chain targeting
+
+    private func row(_ ppid: Int, _ tty: String, _ comm: String) -> SessionLogic.ProcRow {
+        SessionLogic.ProcRow(ppid: ppid, tty: tty, comm: comm)
+    }
+
+    @Test func resolveTargetWalksToOwningApp() {
+        let table: [Int: SessionLogic.ProcRow] = [
+            500: row(400, "ttys002", "/opt/homebrew/bin/claude"),
+            400: row(300, "ttys002", "-zsh"),
+            300: row(1, "??", "/Applications/Otty.app/Contents/MacOS/Otty"),
+        ]
+        let pt = SessionLogic.resolveTarget(table: table, pid: 500)
+        #expect(pt.tty == "ttys002")
+        #expect(pt.terminal == .otty)
+        #expect(pt.appBundlePath == "/Applications/Otty.app")
+        #expect(pt.appPid == 300)
+        #expect(pt.multiplexed == false)
+        #expect(pt.pidPresent == true)
+    }
+
+    @Test func resolveTargetFlagsMultiplexerAncestor() {
+        let table: [Int: SessionLogic.ProcRow] = [
+            5: row(4, "ttys000", "/bin/claude"),
+            4: row(3, "ttys000", "tmux: server"),
+            3: row(1, "??", "/Applications/iTerm.app/Contents/MacOS/iTerm2"),
+        ]
+        let pt = SessionLogic.resolveTarget(table: table, pid: 5)
+        #expect(pt.multiplexed == true)
+        #expect(pt.terminal == .iterm2)
+    }
+
+    @Test func resolveTargetMissingPidIsNotPresent() {
+        let pt = SessionLogic.resolveTarget(table: [:], pid: 999)
+        #expect(pt.pidPresent == false)
+        #expect(pt.tty == nil)
+        #expect(pt.terminal == .unknown)
+        #expect(pt.appPid == nil)
+    }
+
+    @Test func resolveTargetNoAppAncestorIsUnknownButPresent() {
+        let table: [Int: SessionLogic.ProcRow] = [
+            10: row(1, "ttys009", "/bin/claude"),  // parent is launchd, no .app
+        ]
+        let pt = SessionLogic.resolveTarget(table: table, pid: 10)
+        #expect(pt.pidPresent == true)
+        #expect(pt.tty == "ttys009")
+        #expect(pt.terminal == .unknown)
+        #expect(pt.appBundlePath == nil)
+    }
+
+    // MARK: - Otty pane JSON parsing
+
+    @Test func parseOttyPanesSkipsIncompleteEntries() throws {
+        let json = """
+        {"data":[
+          {"id":"p1","cwd":"/a","process":"✳ Title"},
+          {"id":"p2","cwd":"/b"},
+          {"cwd":"/c","process":"no id"},
+          {"id":"p4","process":"no cwd"}
+        ]}
+        """
+        let panes = try #require(SessionLogic.parseOttyPanes(json))
+        #expect(panes.count == 2)
+        #expect(panes[0] == OttyPane(id: "p1", cwd: "/a", title: "✳ Title"))
+        #expect(panes[1] == OttyPane(id: "p2", cwd: "/b", title: ""))   // missing process → ""
+    }
+
+    @Test func parseOttyPanesRejectsWrongShape() {
+        #expect(SessionLogic.parseOttyPanes("not json") == nil)
+        #expect(SessionLogic.parseOttyPanes("[]") == nil)                 // no top-level "data"
+        #expect(SessionLogic.parseOttyPanes("{\"data\":{}}") == nil)      // data not an array
+    }
+
+    // MARK: - Status dot priority
+
+    @Test func dotKindPriority() {
+        #expect(SessionLogic.dotKind(status: .busy, doneUnseen: true) == .busy)      // busy wins over done
+        #expect(SessionLogic.dotKind(status: .waiting, doneUnseen: true) == .waiting) // waiting wins over done
+        #expect(SessionLogic.dotKind(status: .idle, doneUnseen: true) == .doneUnseen)
+        #expect(SessionLogic.dotKind(status: .shell, doneUnseen: true) == .doneUnseen)
+        #expect(SessionLogic.dotKind(status: .unknown, doneUnseen: true) == .doneUnseen) // reducer keeps green on idle→unknown
+        #expect(SessionLogic.dotKind(status: .idle, doneUnseen: false) == .grey)
+        #expect(SessionLogic.dotKind(status: .unknown, doneUnseen: false) == .grey)
+    }
 }

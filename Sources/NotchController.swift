@@ -474,6 +474,9 @@ final class NotchController: NSObject {
             inst.panel.close()                      // isReleasedWhenClosed == false → ref stays valid
         }
         instances.removeAll()
+        // Nothing is open anymore (mode switch / display rebuild / stop) — let the
+        // session monitor fall back to its idle cadence.
+        syncSessionMonitorActive()
     }
 
     /// Top-center placement at the FIXED window size, using `frame` (not visibleFrame)
@@ -513,6 +516,7 @@ final class NotchController: NSObject {
         // NSMenus work without key; open() also refreshes, so ⌘R is rarely needed.
         inst.panel.isInteractive = true
         applyPanelState()
+        syncSessionMonitorActive()
         // Fresh-when-you-look, mirroring the NSPopover open kick. Non-forced: the
         // fingerprint short-circuit makes it ~free when nothing changed.
         store.refresh()
@@ -531,6 +535,17 @@ final class NotchController: NSObject {
         // regains key (caret) instead of us holding focus while collapsed.
         if inst.panel.isKeyWindow { inst.panel.resignKey() }
         applyPanelState()
+        syncSessionMonitorActive()
+    }
+
+    /// Keep the session monitor's FAST poll on whenever ANY display's notch is
+    /// expanded — the notch equivalent of the menu-bar popoverDidShow/Close
+    /// wiring (without this, notch mode never bumps the monitor off its 6 s idle
+    /// cadence, so silent process death takes ~6 s instead of ~2 s to notice).
+    /// Reference-counted across displays (open on one screen, closed on another →
+    /// stays active) rather than a bare per-instance toggle.
+    private func syncSessionMonitorActive() {
+        store.setSessionMonitorActive(instances.values.contains { $0.vm.isOpen })
     }
 
     /// Expand the notch programmatically (AppDelegate's reopen / relaunch path). Targets
