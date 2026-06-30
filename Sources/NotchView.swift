@@ -134,6 +134,7 @@ extension EnvironmentValues {
 /// parent layer owns the black, so closed and open are one continuous shape that grows.
 struct CompactNotchView: View {
     @ObservedObject var store: UsageStore
+    @ObservedObject var sessionStore: SessionStore
     var notchWidth: CGFloat
     var notchHeight: CGFloat
     /// Passed down from NotchRootView (the same source the rest of the notch reads).
@@ -165,13 +166,13 @@ struct CompactNotchView: View {
     /// repeatForever "unwind" jump on stop — it just renders static). Under
     /// reduceMotion+busy it breathes opacity instead of spinning; idle is static.
     @ViewBuilder private var animatedLogo: some View {
-        if store.anySessionBusy && !reduceMotion {
+        if sessionStore.anyBusy && !reduceMotion {
             TimelineView(.animation) { ctx in
                 let angle = (ctx.date.timeIntervalSinceReferenceDate * Self.spinDegreesPerSecond)
                     .truncatingRemainder(dividingBy: 360)
                 logoMark.rotationEffect(.degrees(angle))
             }
-        } else if store.anySessionBusy && reduceMotion {
+        } else if sessionStore.anyBusy && reduceMotion {
             TimelineView(.animation) { ctx in
                 let t = ctx.date.timeIntervalSinceReferenceDate
                 let phase = (sin(2 * Double.pi * t / Self.breathePeriod) + 1) / 2  // 0…1
@@ -186,10 +187,10 @@ struct CompactNotchView: View {
     /// input) outranks green (a turn just finished, unseen). nil → no dot. Static
     /// (no pulse), and independent of the spin (both may co-occur).
     private var dotColor: Color? {
-        if store.anySessionWaiting {
+        if sessionStore.anyWaiting {
             return Color.ccStatusWaiting
         }
-        if store.anySessionDoneUnseen {
+        if sessionStore.anyDoneUnseen {
             return .green
         }
         return nil
@@ -239,6 +240,7 @@ struct CompactNotchView: View {
 
 struct NotchRootView: View {
     @ObservedObject var store: UsageStore
+    @ObservedObject var sessionStore: SessionStore
     @ObservedObject var vm: NotchViewModel
     let onQuit: () -> Void
 
@@ -286,6 +288,7 @@ struct NotchRootView: View {
                         : .scale(scale: 0.9, anchor: .top).combined(with: .opacity))
             } else {
                 CompactNotchView(store: store,
+                                 sessionStore: sessionStore,
                                  notchWidth: vm.closedNotchSize.width,
                                  notchHeight: vm.closedNotchSize.height,
                                  reduceMotion: reduceMotion)

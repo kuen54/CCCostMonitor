@@ -308,7 +308,7 @@ final class NotchController: NSObject {
             inst.isFullscreen = ns.screen.displayUUID
                 .map { FullscreenDetector.shared.isFullscreen(displayUUID: $0) } ?? false
 
-            let host = FirstMouseHostingView(rootView: NotchRootView(store: store, vm: inst.vm, onQuit: onQuit))
+            let host = FirstMouseHostingView(rootView: NotchRootView(store: store, sessionStore: store.sessionStore, vm: inst.vm, onQuit: onQuit))
             host.translatesAutoresizingMaskIntoConstraints = true
             host.frame = NSRect(origin: .zero, size: frame.size)
             host.autoresizingMask = [.width, .height]
@@ -395,7 +395,7 @@ final class NotchController: NSObject {
         // Phase 6: opening the popover (even straight onto the Session tab) NO LONGER
         // clears the green "finished, unseen" cue. Merely looking can't tell which
         // session finished — so the per-session green dots persist until the user
-        // genuinely engages (clicks a session row → store.jumpToSession clears that
+        // genuinely engages (clicks a session row → sessionStore.jump clears that
         // one), or the reducer auto-evicts it (busy/waiting again, gone).
     }
 
