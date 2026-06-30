@@ -128,7 +128,7 @@ The **Subscription** tab is separate: it calls Anthropic's OAuth usage endpoint 
 No Xcode project — the app is compiled with plain `swiftc`. `Package.swift` exists only so `swift test` can run.
 
 ```
-Sources/                    ← 29 Swift files
+Sources/                    ← 35 Swift files
   main.swift                  ← entry point (single-instance check + bootstrap)
   AppDelegate.swift           ← menu bar item + title, popover, refresh timers, FSEvents watcher
   UsageStore.swift            ← published state + refresh orchestration
@@ -272,7 +272,7 @@ open build/CCCostMonitor.app
 不依赖 Xcode 项目 —— app 直接用 `swiftc` 编译。`Package.swift` 仅用于跑 `swift test`。
 
 ```
-Sources/                    ← 29 个 Swift 文件
+Sources/                    ← 35 个 Swift 文件
   main.swift                  ← 入口（单实例检测 + 启动引导）
   AppDelegate.swift           ← 菜单栏图标与标题、弹窗、刷新定时器、FSEvents 监听
   UsageStore.swift            ← 状态发布 + 刷新编排
