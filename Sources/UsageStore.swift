@@ -90,6 +90,12 @@ class UsageStore: ObservableObject {
     /// Phase 3: sessionId → terminal targeting facts for click-to-jump. Parallel
     /// to sessionLabels; maintained by the SessionMonitor, read by jumpToSession.
     @Published var sessionTargets: [String: SessionTarget] = [:]
+    /// Phase 5: sessionId → session title (newest transcript `ai-title`). Drives
+    /// the Session row's primary line; absent → the row falls back to the cwd.
+    @Published var sessionTitles: [String: String] = [:]
+    /// Phase 5: sessionId → the latest clean user instruction (one line). Drives
+    /// the Session row's subtitle; absent → a "(no recent prompt)" placeholder.
+    @Published var sessionInstructions: [String: String] = [:]
     /// Phase 3: a transient, non-modal hint (localization KEY) shown in the
     /// Session tab when a jump could only raise the app / failed. Auto-clears.
     @Published var sessionJumpHint: String? = nil
@@ -193,6 +199,8 @@ class UsageStore: ObservableObject {
         if self.sessions != scan.sessions { self.sessions = scan.sessions }
         if self.sessionLabels != scan.labels { self.sessionLabels = scan.labels }
         if self.sessionTargets != scan.targets { self.sessionTargets = scan.targets }
+        if self.sessionTitles != scan.titles { self.sessionTitles = scan.titles }
+        if self.sessionInstructions != scan.instructions { self.sessionInstructions = scan.instructions }
         if self.showOldClaudeHint != scan.oldClaudeHint { self.showOldClaudeHint = scan.oldClaudeHint }
         if self.anySessionDoneUnseen != scan.anyDoneUnseen { self.anySessionDoneUnseen = scan.anyDoneUnseen }
     }

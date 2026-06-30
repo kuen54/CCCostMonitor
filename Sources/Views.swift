@@ -971,7 +971,9 @@ struct SessionGroupSection: View {
     }
 }
 
-/// One session: colored status dot + label, short id / version, relative time.
+/// One session: leading colored STATUS dot + the session TITLE (the transcript
+/// ai-title) as the primary line + the latest user INSTRUCTION as the subtitle
+/// (one line, …-truncated), relative time, hover jump affordance.
 /// Phase 3: the whole row is clickable — a tap focuses/raises that session's
 /// terminal window (and pane/tab where possible) via store.jumpToSession.
 struct SessionRow: View {
@@ -982,23 +984,23 @@ struct SessionRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            // Status survives as the leading dot (busy=orange, waiting=amber,
+            // idle/shell=grey); the label moves to accessibility, not the title.
             Circle()
                 .fill(statusColor)
                 .frame(width: 7, height: 7)
+                .accessibilityLabel(statusLabel)
             VStack(alignment: .leading, spacing: 1) {
-                Text(statusLabel)
-                    .font(.system(size: 11, weight: .medium))
+                Text(titleText)
+                    .font(.system(size: 11.5, weight: .semibold))
                     .foregroundColor(.primary)
-                HStack(spacing: 6) {
-                    Text(session.shortId)
-                        .font(.system(size: 9.5, design: .monospaced))
-                        .foregroundColor(.secondary)
-                    if let v = session.version, !v.isEmpty {
-                        Text("v\(v)")
-                            .font(.system(size: 9.5))
-                            .foregroundColor(.secondary)
-                    }
-                }
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(subtitleText)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
             Spacer(minLength: 4)
             if let updated = session.updatedAt {
@@ -1040,6 +1042,21 @@ struct SessionRow: View {
             if hovering { NSCursor.pop(); hovering = false }
         }
         .onTapGesture { store.jumpToSession(session) }
+    }
+
+    /// Primary line: the session title (newest transcript ai-title). Falls back
+    /// to the cwd basename (repo), then a localized "Untitled session".
+    private var titleText: String {
+        if let t = store.sessionTitles[session.sessionId], !t.isEmpty { return t }
+        let base = SessionLogic.basename(session.cwd)
+        return base.isEmpty ? loc("sessionUntitled") : base
+    }
+
+    /// Subtitle: the latest clean user instruction. SwiftUI tail-truncates it to
+    /// one line ("…"); falls back to a localized "(no recent prompt)".
+    private var subtitleText: String {
+        if let i = store.sessionInstructions[session.sessionId], !i.isEmpty { return i }
+        return loc("sessionNoPrompt")
     }
 
     private var statusColor: Color {

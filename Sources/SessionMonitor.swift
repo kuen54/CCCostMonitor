@@ -52,6 +52,12 @@ struct SessionScan: Equatable {
     var anyDoneUnseen: Bool = false
     /// Phase 3: sessionId → terminal targeting facts for click-to-jump.
     var targets: [String: SessionTarget] = [:]
+    /// Phase 5: sessionId → session title (newest `ai-title` in the transcript).
+    /// Absent when the session has no transcript / no title yet (view falls back).
+    var titles: [String: String] = [:]
+    /// Phase 5: sessionId → the latest clean user instruction (one line). Absent
+    /// when none found (view falls back to a placeholder).
+    var instructions: [String: String] = [:]
 
     static let empty = SessionScan(sessions: [], labels: [:], oldClaudeHint: false)
 }
@@ -59,6 +65,7 @@ struct SessionScan: Equatable {
 final class SessionMonitor {
     private let onChange: (SessionScan) -> Void
     private let sessionsDir: String
+    private let projectsDir: URL
 
     // Private serial queue: ALL file/ps/lsof/git work runs here, never on main.
     private let queue = DispatchQueue(label: "com.claude.cc-cost-monitor.sessions", qos: .utility)
@@ -71,6 +78,19 @@ final class SessionMonitor {
     private var lastScan: SessionScan?
     private var labelCache: [String: String] = [:]   // cwd → resolved label
 
+    // queue-confined transcript-summary cache (Phase 5): sessionId → the last
+    // read title/instruction plus the (path,size,mtime) it was read from. A
+    // stable session is just a `stat` (no re-read); only a session whose
+    // transcript file changed is re-read. Dead sessions are pruned each scan.
+    private struct TranscriptCacheEntry {
+        let path: String
+        let size: Int
+        let mtime: TimeInterval
+        let title: String?
+        let instruction: String?
+    }
+    private var transcriptCache: [String: TranscriptCacheEntry] = [:]
+
     // queue-confined done-unseen tracker state (Phase 2): the previous scan's
     // per-session statuses + the sessionIds that finished a turn unseen (→ when).
     private var prevStatuses: [String: SessionStatus] = [:]
@@ -82,10 +102,14 @@ final class SessionMonitor {
     private var idleInterval: TimeInterval = 6.0
     private var isActive = false
 
-    init(sessionsDir: String? = nil, onChange: @escaping (SessionScan) -> Void) {
+    init(sessionsDir: String? = nil, projectsDir: URL? = nil,
+         onChange: @escaping (SessionScan) -> Void) {
         self.onChange = onChange
         self.sessionsDir = sessionsDir
             ?? (NSHomeDirectory() as NSString).appendingPathComponent(".claude/sessions")
+        self.projectsDir = projectsDir
+            ?? URL(fileURLWithPath: (NSHomeDirectory() as NSString)
+                .appendingPathComponent(".claude/projects"), isDirectory: true)
     }
 
     // MARK: - Lifecycle
@@ -235,8 +259,56 @@ final class SessionMonitor {
         }
         let labels = resolveLabels(for: ordered)
         let targets = gatherTargets(for: ordered)
+        let (titles, instructions) = gatherSummaries(for: ordered)
         return SessionScan(sessions: ordered, labels: labels,
-                           oldClaudeHint: oldHint, targets: targets)
+                           oldClaudeHint: oldHint, targets: targets,
+                           titles: titles, instructions: instructions)
+    }
+
+    // MARK: - Transcript summaries (Phase 5)
+
+    /// For each live session, resolve its transcript title + latest instruction,
+    /// served from a (path,size,mtime) cache so a stable session costs only a
+    /// `stat` and only a changed transcript is re-read. The expensive glob runs
+    /// at most once per session (cached path is re-`stat`ed thereafter; re-glob
+    /// only if it vanished). All on the monitor's serial queue (off-main).
+    private func gatherSummaries(for sessions: [SessionInfo])
+        -> (titles: [String: String], instructions: [String: String]) {
+        let fm = FileManager.default
+        var titles: [String: String] = [:]
+        var instructions: [String: String] = [:]
+        var live = Set<String>()
+        for s in sessions {
+            live.insert(s.sessionId)
+            // Reuse the cached path while it still exists; else re-glob.
+            var path = transcriptCache[s.sessionId]?.path
+            if path == nil || !fm.fileExists(atPath: path!) {
+                path = AITitleReader.transcriptPath(sessionId: s.sessionId,
+                                                    projectsDir: projectsDir)
+            }
+            guard let p = path else { continue }
+            let attrs = try? fm.attributesOfItem(atPath: p)
+            let size = (attrs?[.size] as? Int) ?? -1
+            let mtime = (attrs?[.modificationDate] as? Date)?
+                .timeIntervalSinceReferenceDate ?? -1
+            let entry: TranscriptCacheEntry
+            if let hit = transcriptCache[s.sessionId],
+               hit.path == p, hit.size == size, hit.mtime == mtime {
+                entry = hit                                  // unchanged → no re-read
+            } else {
+                let sum = AITitleReader.summary(inFileAt: p)
+                entry = TranscriptCacheEntry(path: p, size: size, mtime: mtime,
+                                             title: sum.title, instruction: sum.instruction)
+                transcriptCache[s.sessionId] = entry
+            }
+            if let t = entry.title { titles[s.sessionId] = t }
+            if let i = entry.instruction { instructions[s.sessionId] = i }
+        }
+        // Drop cache entries for sessions that are no longer live.
+        if transcriptCache.count != live.count {
+            transcriptCache = transcriptCache.filter { live.contains($0.key) }
+        }
+        return (titles, instructions)
     }
 
     // MARK: - Jump targeting (Phase 3)
