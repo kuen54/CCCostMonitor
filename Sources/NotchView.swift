@@ -240,7 +240,12 @@ struct CompactNotchView: View {
 
 struct NotchRootView: View {
     @ObservedObject var store: UsageStore
-    @ObservedObject var sessionStore: SessionStore
+    // Plain `let`, NOT @ObservedObject: NotchRootView only forwards this down to
+    // CompactNotchView (which observes it itself). Observing here would re-run this
+    // body — and re-evaluate the embedded PopoverView while open — on every ~2s
+    // session tick, the exact churn batch C removes. The compact logo-spin/dot
+    // still update via CompactNotchView's own subscription.
+    let sessionStore: SessionStore
     @ObservedObject var vm: NotchViewModel
     let onQuit: () -> Void
 
