@@ -49,7 +49,12 @@ struct SessionScan: Equatable {
     /// Phase 2: any session finished a turn (busy/waiting → idle/shell) that the
     /// user hasn't looked at yet. Derived by the monitor across scans via the
     /// pure SessionLogic.stepDoneUnseen reducer; drives the notch's green dot.
+    /// Equals `!doneUnseenIds.isEmpty`.
     var anyDoneUnseen: Bool = false
+    /// Phase 6: the exact sessionIds that finished a turn unseen (= keys of the
+    /// monitor's doneUnseen tracker). Lets the Session LIST give each finished-
+    /// unseen row its own green dot, not just the notch's aggregate cue.
+    var doneUnseenIds: Set<String> = []
     /// Phase 3: sessionId → terminal targeting facts for click-to-jump.
     var targets: [String: SessionTarget] = [:]
     /// Phase 5: sessionId → session title (newest `ai-title` in the transcript).
@@ -208,6 +213,7 @@ final class SessionMonitor {
             doneUnseen: doneUnseen, seenAll: false, now: now)
         prevStatuses = stepped.prev
         doneUnseen = stepped.doneUnseen
+        scan.doneUnseenIds = Set(doneUnseen.keys)
         scan.anyDoneUnseen = !doneUnseen.isEmpty
         if scan != lastScan {
             lastScan = scan
@@ -226,6 +232,27 @@ final class SessionMonitor {
             self.doneUnseen.removeAll()
             guard var scan = self.lastScan, scan.anyDoneUnseen else { return }
             scan.anyDoneUnseen = false
+            scan.doneUnseenIds = []
+            self.lastScan = scan
+            DispatchQueue.main.async { [weak self] in self?.onChange(scan) }
+        }
+    }
+
+    /// Phase 6: the user ENGAGED with ONE session (clicked its list row to jump):
+    /// forget just that session's "finished, unseen" cue, leaving every other
+    /// session's green dot intact. Queue-confined; republishes guarded on the main
+    /// thread only when that id was actually pending. prevStatuses is intentionally
+    /// NOT touched: the cleared id is already at its done status there (it only
+    /// entered doneUnseen via a busy/waiting → idle TRANSITION, which advanced prev
+    /// to that idle/shell status), so the next stepDoneUnseen sees prev == current
+    /// for it (no transition) and will NOT re-add the green we just cleared.
+    func markSeen(sessionId: String) {
+        queue.async { [weak self] in
+            guard let self = self,
+                  self.doneUnseen.removeValue(forKey: sessionId) != nil else { return }
+            guard var scan = self.lastScan else { return }
+            scan.doneUnseenIds = Set(self.doneUnseen.keys)
+            scan.anyDoneUnseen = !self.doneUnseen.isEmpty
             self.lastScan = scan
             DispatchQueue.main.async { [weak self] in self?.onChange(scan) }
         }

@@ -103,9 +103,14 @@ class UsageStore: ObservableObject {
     /// Code; surfaces a subtle "update to see live status" hint in the tab.
     @Published var showOldClaudeHint: Bool = false
     /// Phase 2: a session finished a turn the user hasn't looked at yet — drives
-    /// the notch logo's green attention dot. Fed by the SessionMonitor; cleared
-    /// by markSessionsSeen() when the user opens the notch / views the tab.
+    /// the notch logo's aggregate green attention dot. Fed by the SessionMonitor;
+    /// cleared per-session on engagement (clicking a row) or by markSessionsSeen().
+    /// Kept equal to `!sessionDoneUnseen.isEmpty`.
     @Published var anySessionDoneUnseen: Bool = false
+    /// Phase 6: the exact sessionIds that finished a turn unseen — drives each
+    /// finished-unseen Session ROW's own green status dot (the per-session twin of
+    /// the notch aggregate cue). Fed from `scan.doneUnseenIds`.
+    @Published var sessionDoneUnseen: Set<String> = []
 
     var liveSessionCount: Int { sessions.count }
     var busySessionCount: Int { sessions.filter { $0.status == .busy }.count }
@@ -203,6 +208,7 @@ class UsageStore: ObservableObject {
         if self.sessionInstructions != scan.instructions { self.sessionInstructions = scan.instructions }
         if self.showOldClaudeHint != scan.oldClaudeHint { self.showOldClaudeHint = scan.oldClaudeHint }
         if self.anySessionDoneUnseen != scan.anyDoneUnseen { self.anySessionDoneUnseen = scan.anyDoneUnseen }
+        if self.sessionDoneUnseen != scan.doneUnseenIds { self.sessionDoneUnseen = scan.doneUnseenIds }
     }
     // Click-to-jump (Phase 3): focuses/raises a session's terminal window/pane.
     // All process spawning is confined inside SessionJumper's own serial queue.
@@ -343,15 +349,25 @@ class UsageStore: ObservableObject {
 
     func stopSessionMonitoring() { sessionMonitor.stop() }
 
-    /// The user is now looking at session state (the notch popover opened, or the
-    /// Session tab appeared): clear the "a turn finished, unseen" cue (green dot).
+    /// The user is now looking at session state: clear ALL "a turn finished,
+    /// unseen" cues (every green dot). Kept for completeness; Phase 6 no longer
+    /// calls this on popover-open / tab-appear (that wiped the cue before the user
+    /// could tell which session finished) — clearing is now per-session on tap.
     func markSessionsSeen() { sessionMonitor.markSeen() }
+
+    /// Phase 6: the user engaged with ONE session (clicked its row to jump) —
+    /// clear just that session's finished-unseen green dot, leaving the others.
+    func markSessionSeen(_ sessionId: String) { sessionMonitor.markSeen(sessionId: sessionId) }
 
     /// Click-to-jump: focus/raise the terminal window (and pane/tab where
     /// possible) that owns `session`. Fire-and-forget — the SessionJumper does
     /// all spawning on its own background queue; we just surface a brief hint
     /// when the jump could only raise the app or failed outright.
     func jumpToSession(_ session: SessionInfo) {
+        // Engaging with a session clears its finished-unseen green dot, regardless
+        // of whether the jump lands exactly, raises the app, or fails — the user
+        // has acknowledged THIS session. Other sessions' green cues stay put.
+        markSessionSeen(session.sessionId)
         let target = sessionTargets[session.sessionId]
             ?? SessionTarget(tty: nil, terminal: .unknown, appName: nil,
                              bundleId: nil, appPid: nil, multiplexed: false, cwd: session.cwd)

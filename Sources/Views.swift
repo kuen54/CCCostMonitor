@@ -887,9 +887,10 @@ struct SessionTabView: View {
         // from a background completion (no withAnimation at the source), so animate
         // its insertion/removal here instead.
         .animation(.easeInOut(duration: 0.2), value: store.sessionJumpHint)
-        // Viewing the Session tab counts as "looking" — clear the unseen-finished
-        // cue (the notch's green dot) the moment the tab appears.
-        .onAppear { store.markSessionsSeen() }
+        // Phase 6: viewing the Session tab no longer wipes the green cue — that
+        // cleared it before the user could tell which session finished. Each
+        // finished-unseen row keeps its own green dot until the user clicks it
+        // (engagement) or the reducer auto-evicts it.
     }
 
     private var emptyState: some View {
@@ -1059,11 +1060,20 @@ struct SessionRow: View {
         return loc("sessionNoPrompt")
     }
 
+    /// True when THIS session just finished a turn the user hasn't engaged with —
+    /// the per-session twin of the notch's aggregate green cue.
+    private var isDoneUnseen: Bool { store.sessionDoneUnseen.contains(session.sessionId) }
+
+    /// Leading dot color by PRIORITY: busy → orange (working); waiting → amber;
+    /// else a finished-unseen session → GREEN (identical to the notch aggregate
+    /// done dot); else idle/shell/unknown → grey. A done-unseen session is by
+    /// definition idle/shell, so green replaces grey for exactly those rows.
     private var statusColor: Color {
         switch session.status {
         case .busy:                  return .orange
         case .waiting:               return Color(red: 0.93, green: 0.69, blue: 0.22) // amber
-        case .idle, .shell, .unknown: return .gray
+        case .idle, .shell, .unknown:
+            return isDoneUnseen ? .green : .gray
         }
     }
 
@@ -1077,7 +1087,7 @@ struct SessionRow: View {
             case .needsInput, .none:    return loc("sessionWaitingInput")
             }
         case .idle, .shell:
-            return loc("sessionIdle")
+            return isDoneUnseen ? loc("sessionFinishedUnread") : loc("sessionIdle")
         case .unknown:
             return loc("sessionRunning")
         }
