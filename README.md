@@ -13,6 +13,9 @@
     <td align="center"><img src="docs/time-month.png" width="250" alt="Time — month view"/><br/><sub><b>Time · Month</b> — one row per week of the month</sub></td>
     <td align="center"><img src="docs/time-year.png" width="250" alt="Time — year heatmap"/><br/><sub><b>Time · Year</b> — GitHub-style activity heatmap</sub></td>
   </tr>
+  <tr>
+    <td align="center" colspan="3"><img src="docs/session.png" width="360" alt="Session tab"/><br/><sub><b>Sessions</b> — live Claude Code sessions grouped by folder, click to jump to its terminal</sub></td>
+  </tr>
 </table>
 
 <sub>Screenshots are rendered from the app's real SwiftUI views (<code>docs/render_mockups.swift</code>) with synthetic demo data — no real usage.</sub>
@@ -54,6 +57,7 @@ This app reads all your local session data and puts it in one place. One menu ba
   - **Week** — an Apple-Health-sleep-style timeline (Mon–Sun × 0–24h), each active block colored by the model in use
   - **Month** — the same timeline, one row per week of the month
   - **Year** — a GitHub-style activity heatmap
+- **Sessions** — a live list of your running Claude Code sessions, grouped by folder. Each row shows a status dot (working / waiting for input / just-finished / idle), the session's title, and its latest prompt. **Click a row to jump straight to that session's terminal window** — pinpointing the exact pane/tab for Otty, Terminal and iTerm, with an honest *bring-the-app-forward* fallback elsewhere. The notch logo **spins while any session is working** and shows an attention dot (amber = waiting, green = just finished) until you look
 - **Subscription quota** (Pro / Max) — dedicated tab showing how much is *left* in the 5-hour, 7-day and 7-day Sonnet windows, with reset countdowns. Live from Anthropic's official usage endpoint — the same source Claude Code's `/usage` uses
 - **Today / This Week / This Month** — token distribution by type (input, output, cache read, cache write)
 - **Daily bar chart** — hover for details
@@ -124,7 +128,7 @@ The **Subscription** tab is separate: it calls Anthropic's OAuth usage endpoint 
 No Xcode project — the app is compiled with plain `swiftc`. `Package.swift` exists only so `swift test` can run.
 
 ```
-Sources/                    ← 20 Swift files
+Sources/                    ← 24 Swift files
   main.swift                  ← entry point (single-instance check + bootstrap)
   AppDelegate.swift           ← menu bar item + title, popover, refresh timers, FSEvents watcher
   UsageStore.swift            ← published state + refresh orchestration
@@ -134,12 +138,16 @@ Sources/                    ← 20 Swift files
   Views.swift                 ← UI (popover, charts)
   NotchController.swift       ← notch panels: geometry, lifecycle, hover/fullscreen
   NotchView.swift             ← notch SwiftUI layer (compact pill ↔ popover)
+  SessionMonitor.swift        ← watches ~/.claude/sessions: liveness, titles, done-unseen
+  SessionJumper.swift         ← click-to-jump: focuses a session's terminal pane/tab
+  AITitleReader.swift         ← tail-reads a transcript for its ai-title + latest prompt
   ClaudeLogo.swift            ← shared Claude-logo path (menu bar, popover, app icon)
   Formatters.swift            ← number formatting
   Localization.swift          ← i18n strings
   Models.swift                ← app-only OAuth/quota data models
   Core_*.swift                ← pure Foundation-only logic, unit-tested
-                                (usage parsing, dates, model classes, Time-tab math)
+                                (usage parsing, dates, model classes, Time-tab math,
+                                 live-session decode/group/done-unseen)
 Tests/CCCostCoreTests/      ← swift-testing unit tests for the Core_* files
 Package.swift               ← test harness ONLY (app builds via swiftc)
 Resources/analyze_usage.py  ← bundled Python analysis script
@@ -195,6 +203,7 @@ Claude Code 的 `/cost` 只显示当前会话。如果你有多个 Anthropic 账
   - **周视图** — 类似 Apple 健康「睡眠」的时间轴（周一~周日 × 0–24h），每段活跃色块按当时所用模型着色
   - **月视图** — 同样的时间轴，每行是该月的一周
   - **年视图** — GitHub 风格的活跃度热力图
+- **会话（Sessions）** — 实时列出正在运行的 Claude Code 会话，按文件夹分组。每行显示状态点（处理中 / 等待输入 / 刚完成 / 空闲）、会话标题和最近一条指令。**点击任意一行即可跳转到该会话所在的终端窗口** —— Otty、Terminal、iTerm 能精确定位到具体的 pane/标签页，其它终端则诚实地回退为「把 app 切到前台」。只要有会话在处理，刘海里的 logo 会**持续旋转**，并显示一个提醒圆点（琥珀=等待，绿色=刚完成），直到你查看为止
 - **订阅剩余用量**（Pro / Max）— 独立 tab，查看 5 小时 / 7 天 / 7 天 Sonnet 窗口**还剩多少**及重置倒计时。数据来自 Anthropic 官方用量接口 —— 与 Claude Code `/usage` 同源
 - **今日 / 本周 / 本月** — 按类型拆分 token（输入、输出、缓存读、缓存写）
 - **每日柱状图** — 悬浮查看详情
@@ -263,7 +272,7 @@ open build/CCCostMonitor.app
 不依赖 Xcode 项目 —— app 直接用 `swiftc` 编译。`Package.swift` 仅用于跑 `swift test`。
 
 ```
-Sources/                    ← 20 个 Swift 文件
+Sources/                    ← 24 个 Swift 文件
   main.swift                  ← 入口（单实例检测 + 启动引导）
   AppDelegate.swift           ← 菜单栏图标与标题、弹窗、刷新定时器、FSEvents 监听
   UsageStore.swift            ← 状态发布 + 刷新编排
@@ -273,12 +282,16 @@ Sources/                    ← 20 个 Swift 文件
   Views.swift                 ← UI（弹窗、图表）
   NotchController.swift       ← 刘海面板：几何、生命周期、hover/全屏
   NotchView.swift             ← 刘海 SwiftUI 层（小条 ↔ 弹窗）
+  SessionMonitor.swift        ← 监听 ~/.claude/sessions：存活检测、标题、done-unseen
+  SessionJumper.swift         ← 点击跳转：聚焦会话所在的终端 pane/标签页
+  AITitleReader.swift         ← 尾读 transcript 取 ai-title + 最新指令
   ClaudeLogo.swift            ← 共享 Claude logo 路径（菜单栏、弹窗、app 图标）
   Formatters.swift            ← 数字格式化
   Localization.swift          ← 多语言文案
   Models.swift                ← 仅供 app 使用的 OAuth/配额数据模型
   Core_*.swift                ← 纯 Foundation 逻辑，有单元测试
-                                （用量解析、日期、模型分类、Time tab 计算）
+                                （用量解析、日期、模型分类、Time tab 计算、
+                                 实时会话解码/分组/done-unseen）
 Tests/CCCostCoreTests/      ← swift-testing 单元测试（针对 Core_* 文件）
 Package.swift               ← 仅作测试 harness（app 仍用 swiftc 构建）
 Resources/analyze_usage.py  ← 内置 Python 分析脚本
