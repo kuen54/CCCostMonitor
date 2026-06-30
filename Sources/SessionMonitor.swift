@@ -79,6 +79,30 @@ final class SessionMonitor {
     private var pollTimer: DispatchSourceTimer?
     private var started = false
 
+    // Backstop-poll gating (queue only). The poll exists ONLY to catch silent
+    // process death (a SIGKILL leaves a stale registry file FSEvents never
+    // reports); with zero live sessions there is nothing to catch, so it is
+    // suspended — see reconcilePoll(). `fsHealthy` is true only when the FS
+    // watcher is proven to be watching a dir that already existed; otherwise the
+    // poll must stay on (a stream created on a missing dir won't attach when it
+    // is later mkdir'd, and the old-Claude ps fallback has no sessions dir at
+    // all). `pollInterval` is the currently scheduled cadence, nil = suspended.
+    private var fsHealthy = false
+    private var pollInterval: TimeInterval?
+    private var lastLiveCount = 0
+    // Suspension is only safe when FSEvents on the sessions dir is the COMPLETE
+    // detector. Two more guards beyond fsHealthy:
+    //   sawRegistry — we've seen ≥1 *.json this run, proving this is modern
+    //     Claude Code (registry-backed). Until then we might be in the old-Claude
+    //     ps fallback (scanClaudeProcessesAsSessions), whose processes never
+    //     touch the watched dir, so FSEvents would never wake us for them.
+    //   lastReadOK — the latest sessions-dir read actually succeeded. A failed
+    //     read (dir vanished / transient FS error) reports zero sessions but is
+    //     NOT trustworthy zero; suspending on it would strand a live session.
+    // Both are set in computeScan() before reconcilePoll() runs.
+    private var sawRegistry = false
+    private var lastReadOK = false
+
     // queue-confined state
     private var lastScan: SessionScan?
     private var labelCache: [String: String] = [:]   // cwd → resolved label
@@ -133,7 +157,9 @@ final class SessionMonitor {
             guard let self = self, !self.started else { return }
             self.started = true
             self.startFSWatcher()
-            self.startPollTimer(interval: self.idleInterval)
+            // The first rescan sets lastLiveCount and reconcilePoll() starts the
+            // backstop poll iff it's actually needed (sessions present, or no
+            // healthy FSEvents to rely on).
             self.rescan()
         }
     }
@@ -142,8 +168,8 @@ final class SessionMonitor {
         queue.async { [weak self] in
             guard let self = self, self.started else { return }
             self.started = false
-            self.pollTimer?.cancel()
-            self.pollTimer = nil
+            self.cancelPoll()
+            self.fsHealthy = false
             if let s = self.fsStream {
                 FSEventStreamStop(s)
                 FSEventStreamInvalidate(s)
@@ -160,7 +186,8 @@ final class SessionMonitor {
         queue.async { [weak self] in
             guard let self = self, self.started, self.isActive != active else { return }
             self.isActive = active
-            self.startPollTimer(interval: active ? self.activeInterval : self.idleInterval)
+            // rescan()'s tail reconciles the poll cadence to the new isActive
+            // (and leaves it suspended if there's still nothing to poll).
             self.rescan()
         }
     }
@@ -168,6 +195,14 @@ final class SessionMonitor {
     // MARK: - FSEvents (low latency)
 
     private func startFSWatcher() {
+        fsHealthy = false
+        // Only a stream over a dir that ALREADY exists reliably reports child
+        // creation; one created on a missing dir won't attach when the dir is
+        // later mkdir'd (picked up only on a restart), so it can't justify
+        // suspending the poll. Stat it up front and gate fsHealthy on it.
+        var isDir: ObjCBool = false
+        let dirExists = FileManager.default
+            .fileExists(atPath: sessionsDir, isDirectory: &isDir) && isDir.boolValue
         var context = FSEventStreamContext(
             version: 0,
             info: Unmanaged.passUnretained(self).toOpaque(),
@@ -185,12 +220,19 @@ final class SessionMonitor {
             [sessionsDir] as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
             0.3,  // sub-second latency so status flips reflect fast
-            FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone)
+            // WatchRoot: deliver an event if the sessions dir itself is deleted/
+            // recreated (new inode). Without it, a runtime `rm -rf` + recreate of
+            // ~/.claude/sessions would strand us while the poll is suspended (the
+            // stream watches the old inode, which sees nothing); the root-change
+            // event wakes a rescan that resumes the poll and re-detects sessions.
+            FSEventStreamCreateFlags(kFSEventStreamCreateFlagWatchRoot)
         ) else { return }
         // Deliver callbacks on our serial queue so rescan never touches main.
         FSEventStreamSetDispatchQueue(stream, queue)
         if FSEventStreamStart(stream) {
             fsStream = stream
+            // Trust suspension only when we're watching a real, pre-existing dir.
+            fsHealthy = dirExists
         } else {
             // The sessions dir may not exist yet on a fresh machine; the poll
             // timer keeps us correct and a later mkdir is picked up on restart.
@@ -209,7 +251,35 @@ final class SessionMonitor {
         timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(500))
         timer.setEventHandler { [weak self] in self?.rescan() }
         pollTimer = timer
+        pollInterval = interval
         timer.resume()
+    }
+
+    private func cancelPoll() {
+        pollTimer?.cancel()
+        pollTimer = nil
+        pollInterval = nil
+    }
+
+    /// Bring the backstop poll into line with the current state (queue only).
+    /// The poll's sole job is to notice silent process death (a SIGKILL leaves a
+    /// stale registry file that FSEvents never reports). With zero live sessions
+    /// there is nothing to catch, so — IF FSEvents is healthy enough to wake us
+    /// when the next session file appears — suspend the poll entirely: no timer,
+    /// no periodic CPU wakeups while no Claude Code session is running. When a
+    /// new file lands, the FSEvents callback runs rescan(), lastLiveCount goes
+    /// positive, and this restarts the poll. While !fsHealthy (stream failed, or
+    /// watching a not-yet-existent dir, or the old-Claude ps fallback) the poll
+    /// always runs — it's the only safety net there. Only (re)builds the timer
+    /// when the desired cadence actually changes, so steady ticks aren't reset.
+    private func reconcilePoll() {
+        guard started else { cancelPoll(); return }
+        // Suspend ONLY when FSEvents is the complete, trustworthy detector and
+        // there's genuinely nothing live. Any doubt → keep polling (safe default).
+        let canSuspend = fsHealthy && sawRegistry && lastReadOK && lastLiveCount == 0
+        guard !canSuspend else { cancelPoll(); return }
+        let desired = isActive ? activeInterval : idleInterval
+        if pollInterval != desired { startPollTimer(interval: desired) }
     }
 
     // MARK: - Scan (queue only)
@@ -228,6 +298,12 @@ final class SessionMonitor {
             lastScan = scan
             DispatchQueue.main.async { [weak self] in self?.onChange(scan) }
         }
+        // Drive the backstop poll off the freshly observed live count: it stays
+        // on while sessions exist (to catch silent death) and suspends to zero
+        // wakeups when none do. Always reconcile — an unchanged scan keeps the
+        // same count, so this is a no-op then.
+        lastLiveCount = scan.sessions.count
+        reconcilePoll()
     }
 
     /// Phase 6: the user ENGAGED with ONE session (clicked its list row to jump):
@@ -251,7 +327,12 @@ final class SessionMonitor {
     }
 
     private func computeScan(now: Double) -> SessionScan {
-        let (parsed, hadRegistryFiles) = parseRegistry()
+        let (parsed, hadRegistryFiles, readOK) = parseRegistry()
+        // Feed the poll-suspension guards (read before reconcilePoll, which runs
+        // at the tail of rescan after this returns). sawRegistry latches sticky:
+        // once this machine has shown a registry file, it's modern Claude Code.
+        lastReadOK = readOK
+        if hadRegistryFiles { sawRegistry = true }
 
         let sessions: [SessionInfo]
         var oldHint = false
@@ -414,9 +495,13 @@ final class SessionMonitor {
     /// entries. A malformed file is skipped, not fatal. Also reports whether ANY
     /// *.json file existed at all, so the caller can tell "modern CC with no
     /// listable sessions" apart from "no registry → maybe old CC".
-    private func parseRegistry() -> (sessions: [SessionInfo], hadFiles: Bool) {
+    private func parseRegistry() -> (sessions: [SessionInfo], hadFiles: Bool, readOK: Bool) {
         let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: sessionsDir) else { return ([], false) }
+        // Distinguish "dir read failed" (readOK=false → untrustworthy zero, never
+        // suspend the poll on it) from "dir genuinely empty" (readOK=true).
+        guard let names = try? fm.contentsOfDirectory(atPath: sessionsDir) else {
+            return ([], false, false)
+        }
         let jsonNames = names.filter { $0.hasSuffix(".json") }
         var out: [SessionInfo] = []
         for name in jsonNames {
@@ -426,7 +511,7 @@ final class SessionMonitor {
                   SessionLogic.listable(info) else { continue }
             out.append(info)
         }
-        return (out, !jsonNames.isEmpty)
+        return (out, !jsonNames.isEmpty, true)
     }
 
     // MARK: - Liveness
