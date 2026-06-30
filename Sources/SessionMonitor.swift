@@ -304,8 +304,11 @@ final class SessionMonitor {
             if let t = entry.title { titles[s.sessionId] = t }
             if let i = entry.instruction { instructions[s.sessionId] = i }
         }
-        // Drop cache entries for sessions that are no longer live.
-        if transcriptCache.count != live.count {
+        // Drop cache entries for sessions that are no longer live. Filter
+        // unconditionally: a live session with no transcript path is never
+        // inserted, so `cache.count == live.count` can hold while the cache still
+        // holds a dead entry — a count guard would leak it. The cache is tiny.
+        if !transcriptCache.isEmpty {
             transcriptCache = transcriptCache.filter { live.contains($0.key) }
         }
         return (titles, instructions)

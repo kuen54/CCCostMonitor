@@ -31,25 +31,30 @@ enum AITitleReader {
     }
 
     /// Title + latest instruction for a session, resolved via the glob then one
-    /// bounded tail read. Empty when there is no transcript.
+    /// bounded tail read. Empty when there is no transcript. `needInstruction`
+    /// false = title-only fast path (the tail loop stops as soon as the title is
+    /// found instead of widening to the 4 MB cap hunting an instruction the caller
+    /// will not read) — used by the Otty exact-jump path.
     static func summary(sessionId: String,
                         projectsDir: URL = FileManager.default
                           .homeDirectoryForCurrentUser
-                          .appendingPathComponent(".claude/projects")) -> TranscriptSummary {
+                          .appendingPathComponent(".claude/projects"),
+                        needInstruction: Bool = true) -> TranscriptSummary {
         guard let path = transcriptPath(sessionId: sessionId, projectsDir: projectsDir) else {
             return .empty
         }
-        return summary(inFileAt: path)
+        return summary(inFileAt: path, needInstruction: needInstruction)
     }
 
     /// Latest `aiTitle` for a session, or nil if no transcript / no title found.
     /// Thin wrapper over `summary` — keeps the Otty exact-jump call site (9/11)
-    /// working unchanged.
+    /// working unchanged. Title-only (`needInstruction: false`) so a click never
+    /// widens the tail read past the title hunting an unused instruction.
     static func latestAITitle(sessionId: String,
                               projectsDir: URL = FileManager.default
                                 .homeDirectoryForCurrentUser
                                 .appendingPathComponent(".claude/projects")) -> String? {
-        return summary(sessionId: sessionId, projectsDir: projectsDir).title
+        return summary(sessionId: sessionId, projectsDir: projectsDir, needInstruction: false).title
     }
 
     /// Glob `~/.claude/projects/**/<sessionId>.jsonl` and return the first
@@ -84,9 +89,10 @@ enum AITitleReader {
         return nil
     }
 
-    /// Latest `aiTitle` for a file (no glob). Thin wrapper over `summary`.
+    /// Latest `aiTitle` for a file (no glob). Thin wrapper over `summary`,
+    /// title-only so it stops at the first chunk that yields a title.
     static func latestAITitle(inFileAt path: String) -> String? {
-        return summary(inFileAt: path).title
+        return summary(inFileAt: path, needInstruction: false).title
     }
 
     /// Read the file's TAIL in 256 KB chunks from EOF backward, extracting in ONE
@@ -99,7 +105,7 @@ enum AITitleReader {
     /// lines are complete, so a line truncated at the window FRONT (an older
     /// candidate) simply fails to parse and loses to last-wins — no special
     /// front handling is needed. Returns `.empty` on any I/O failure.
-    static func summary(inFileAt path: String) -> TranscriptSummary {
+    static func summary(inFileAt path: String, needInstruction: Bool = true) -> TranscriptSummary {
         guard let handle = FileHandle(forReadingAtPath: path) else { return .empty }
         defer { try? handle.close() }
 
@@ -117,9 +123,10 @@ enum AITitleReader {
             let data = handle.readData(ofLength: step)
             buffer = data + buffer
             result = scan(buffer)
-            // Both found: reading further back only yields OLDER candidates,
-            // which lose to last-wins — stop. (Common case: one 256 KB chunk.)
-            if result.title != nil && result.instruction != nil { break }
+            // Everything needed found: reading further back only yields OLDER
+            // candidates, which lose to last-wins — stop. (Common case: one
+            // 256 KB chunk.) Title-only callers stop the moment a title appears.
+            if result.title != nil && (!needInstruction || result.instruction != nil) { break }
         }
         return result
     }
