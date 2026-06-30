@@ -68,7 +68,7 @@ final class SessionJumper {
             return activateApp(target, reason: .unsupported)
         }
         guard let (_, listOut) = run(cli, ["pane", "list", "--json"]),
-              let panes = parseOttyPanes(listOut) else {
+              let panes = SessionLogic.parseOttyPanes(listOut) else {
             return activateApp(target, reason: .ambiguous)
         }
         // Otty exposes no pid/tty per pane — fuzzy join on cwd, disambiguated by
@@ -98,18 +98,6 @@ final class SessionJumper {
         }
         candidates.append("/Applications/Otty.app/Contents/MacOS/otty-cli")
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-    }
-
-    /// Parse `otty-cli pane list --json` → [OttyPane]. Tolerates schema drift:
-    /// any entry missing id/cwd is skipped; the `process` field is the title.
-    private func parseOttyPanes(_ json: String) -> [OttyPane]? {
-        guard let data = json.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let arr = root["data"] as? [[String: Any]] else { return nil }
-        return arr.compactMap { p in
-            guard let id = p["id"] as? String, let cwd = p["cwd"] as? String else { return nil }
-            return OttyPane(id: id, cwd: cwd, title: (p["process"] as? String) ?? "")
-        }
     }
 
     // MARK: Apple Terminal / iTerm2 (AppleScript, exact by tty)

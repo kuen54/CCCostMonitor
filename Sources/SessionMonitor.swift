@@ -96,6 +96,15 @@ final class SessionMonitor {
     }
     private var transcriptCache: [String: TranscriptCacheEntry] = [:]
 
+    // queue-confined negative cache for the transcript GLOB (Phase B): sessionId
+    // → when its glob last came up empty. A just-launched session (transcript not
+    // written yet) or a synthetic `proc-` session re-globs at most once per
+    // `transcriptGlobRetry` instead of walking all of ~/.claude/projects every
+    // 2 s tick. Short TTL on purpose — we watch sessions/, not projects/, so a
+    // re-glob is the only way a freshly written transcript title is discovered.
+    private var transcriptGlobMiss: [String: Double] = [:]
+    private static let transcriptGlobRetry: TimeInterval = 20
+
     // queue-confined done-unseen tracker state (Phase 2): the previous scan's
     // per-session statuses + the sessionIds that finished a turn unseen (→ when).
     private var prevStatuses: [String: SessionStatus] = [:]
@@ -206,7 +215,7 @@ final class SessionMonitor {
     // MARK: - Scan (queue only)
 
     private func rescan(now: Double = Date().timeIntervalSince1970) {
-        var scan = computeScan()
+        var scan = computeScan(now: now)
         // Fold this scan into the done-unseen tracker (pure reducer, our clock).
         let stepped = SessionLogic.stepDoneUnseen(
             prev: prevStatuses, current: scan.sessions,
@@ -258,7 +267,7 @@ final class SessionMonitor {
         }
     }
 
-    private func computeScan() -> SessionScan {
+    private func computeScan(now: Double) -> SessionScan {
         let (parsed, hadRegistryFiles) = parseRegistry()
 
         let sessions: [SessionInfo]
@@ -286,7 +295,7 @@ final class SessionMonitor {
         }
         let labels = resolveLabels(for: ordered)
         let targets = gatherTargets(for: ordered)
-        let (titles, instructions) = gatherSummaries(for: ordered)
+        let (titles, instructions) = gatherSummaries(for: ordered, now: now)
         return SessionScan(sessions: ordered, labels: labels,
                            oldClaudeHint: oldHint, targets: targets,
                            titles: titles, instructions: instructions)
@@ -299,7 +308,7 @@ final class SessionMonitor {
     /// `stat` and only a changed transcript is re-read. The expensive glob runs
     /// at most once per session (cached path is re-`stat`ed thereafter; re-glob
     /// only if it vanished). All on the monitor's serial queue (off-main).
-    private func gatherSummaries(for sessions: [SessionInfo])
+    private func gatherSummaries(for sessions: [SessionInfo], now: Double)
         -> (titles: [String: String], instructions: [String: String]) {
         let fm = FileManager.default
         var titles: [String: String] = [:]
@@ -307,11 +316,20 @@ final class SessionMonitor {
         var live = Set<String>()
         for s in sessions {
             live.insert(s.sessionId)
-            // Reuse the cached path while it still exists; else re-glob.
+            // Synthesized fallback sessions (old Claude Code with no registry)
+            // never have a transcript on disk — never glob for them.
+            if s.sessionId.hasPrefix("proc-") { continue }
+            // Reuse the cached path while it still exists; else (re-)glob, but
+            // skip the walk if a recent glob already came up empty (negative
+            // cache, short TTL — see transcriptGlobMiss).
             var path = transcriptCache[s.sessionId]?.path
             if path == nil || !fm.fileExists(atPath: path!) {
+                if let lastMiss = transcriptGlobMiss[s.sessionId],
+                   now - lastMiss < SessionMonitor.transcriptGlobRetry { continue }
                 path = AITitleReader.transcriptPath(sessionId: s.sessionId,
                                                     projectsDir: projectsDir)
+                if path == nil { transcriptGlobMiss[s.sessionId] = now; continue }
+                transcriptGlobMiss.removeValue(forKey: s.sessionId)  // resolved → clear miss
             }
             guard let p = path else { continue }
             let attrs = try? fm.attributesOfItem(atPath: p)
@@ -338,59 +356,57 @@ final class SessionMonitor {
         if !transcriptCache.isEmpty {
             transcriptCache = transcriptCache.filter { live.contains($0.key) }
         }
+        if !transcriptGlobMiss.isEmpty {
+            transcriptGlobMiss = transcriptGlobMiss.filter { live.contains($0.key) }
+        }
         return (titles, instructions)
     }
 
     // MARK: - Jump targeting (Phase 3)
 
-    private struct ProcRow { let ppid: Int; let tty: String; let comm: String }
+    // queue-confined targeting cache (Phase G): sessionId → (pid, resolved
+    // target). Keyed by sessionId for eviction, but pid-checked on hit: `claude
+    // --resume` reuses a sessionId under a NEW pid, so a stale entry from the old
+    // pid must miss and re-resolve — otherwise a jump would target the dead
+    // process's tty/window. (HEAD recomputed every scan, so this can't regress.)
+    private var targetCache: [String: (pid: Int, target: SessionTarget)] = [:]
 
-    /// Build the per-session targeting map from ONE `ps -Ao pid,ppid,tty,comm`
-    /// snapshot (no N spawns): the session's tty comes straight from its row,
-    /// the owning GUI terminal from walking the ppid chain up to the first
-    /// process whose comm is a `.app` bundle, and `multiplexed` from spotting a
-    /// tmux/screen ancestor on the way up. App display name + bundle id are read
-    /// once per app bundle path (cached). Empty on any ps failure — the UI then
-    /// just app-activates with no exact target.
+    /// Per-session targeting map for click-to-jump. Targeting facts (tty / owning
+    /// GUI terminal / app pid / multiplexed) are INVARIANT for a session's process
+    /// lifetime, so they're cached by sessionId and the expensive full-process-
+    /// table `ps -Ao` runs ONLY when there's at least one uncached live session —
+    /// steady state spawns no targeting ps at all. A degraded resolve (the session
+    /// pid wasn't in the snapshot — a racy/partial table) is returned for this
+    /// scan but NOT cached, so it's retried next scan. Dead sessions are evicted.
+    /// The pure table-parse + ppid-walk live in SessionLogic (testable); only the
+    /// `ps` spawn and the Bundle Info.plist read (app name/id) stay here.
     private func gatherTargets(for sessions: [SessionInfo]) -> [String: SessionTarget] {
-        guard !sessions.isEmpty,
-              let out = runProcess("/bin/ps", ["-Ao", "pid=,ppid=,tty=,comm="]) else { return [:] }
-        var table: [Int: ProcRow] = [:]
-        for line in out.split(separator: "\n") {
-            let toks = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-            guard toks.count >= 4, let pid = Int(toks[0]), let ppid = Int(toks[1]) else { continue }
-            let comm = toks[3...].joined(separator: " ")
-            table[pid] = ProcRow(ppid: ppid, tty: toks[2], comm: comm)
-        }
-
+        guard !sessions.isEmpty else { targetCache.removeAll(); return [:] }
+        let live = Set(sessions.map { $0.sessionId })
         var result: [String: SessionTarget] = [:]
+        var uncached: [SessionInfo] = []
         for s in sessions {
-            let tty = table[s.pid].map { $0.tty }
-            // Walk the ppid chain: claude → -zsh → login → GUI app (ppid 1).
-            var multiplexed = false
-            var terminal: TerminalKind = .unknown
-            var appPid: Int? = nil
-            var appBundle: String? = nil
-            var cursor = table[s.pid]?.ppid ?? 0
-            var hops = 0
-            while let row = table[cursor], hops < 12 {
-                hops += 1
-                if SessionLogic.isMultiplexer(comm: row.comm) { multiplexed = true }
-                if let bundle = SessionLogic.appBundlePath(fromExecPath: row.comm) {
-                    appBundle = bundle
-                    appPid = cursor
-                    terminal = SessionLogic.classifyTerminal(commPath: row.comm)
-                    break
-                }
-                if row.ppid <= 1 { break }
-                cursor = row.ppid
+            if let hit = targetCache[s.sessionId], hit.pid == s.pid {
+                result[s.sessionId] = hit.target               // same session AND same pid
+            } else {
+                uncached.append(s)                             // new / resumed (pid changed) → re-resolve
             }
-            let info = appBundle.map { terminalAppInfo(bundlePath: $0) }
-            result[s.sessionId] = SessionTarget(
-                tty: tty, terminal: terminal,
-                appName: info?.name, bundleId: info?.bundleId,
-                appPid: appPid, multiplexed: multiplexed, cwd: s.cwd)
         }
+        if !uncached.isEmpty,
+           let out = runProcess("/bin/ps", ["-Ao", "pid=,ppid=,tty=,comm="]) {
+            let table = SessionLogic.parseProcTable(out)
+            for s in uncached {
+                let pt = SessionLogic.resolveTarget(table: table, pid: s.pid)
+                let info = pt.appBundlePath.map { terminalAppInfo(bundlePath: $0) }
+                let target = SessionTarget(
+                    tty: pt.tty, terminal: pt.terminal,
+                    appName: info?.name, bundleId: info?.bundleId,
+                    appPid: pt.appPid, multiplexed: pt.multiplexed, cwd: s.cwd)
+                result[s.sessionId] = target
+                if pt.pidPresent { targetCache[s.sessionId] = (s.pid, target) }  // never cache a racy miss
+            }
+        }
+        if !targetCache.isEmpty { targetCache = targetCache.filter { live.contains($0.key) } }
         return result
     }
 
@@ -452,7 +468,13 @@ final class SessionMonitor {
         let facts = psFacts(for: pids)  // ONE batched ps call
         return sessions.filter { s in
             guard processExists(s.pid) else { return false }
-            guard let fact = facts[s.pid], fact.comm.contains("claude") else { return false }
+            // kill(2) is the load-bearing liveness check. The ps facts only REFINE
+            // it (PID-reuse guards). When ps gave us a row for this pid, apply the
+            // comm-name + start-time guards; when it didn't (ps failed / timed out
+            // / returned nothing), trust kill alone rather than dropping the
+            // session — otherwise one flaky ps spawn blanks the whole list.
+            guard let fact = facts[s.pid] else { return true }
+            if !fact.comm.contains("claude") { return false }   // pid reused by a non-claude proc
             if let start = fact.startEpoch, let recorded = s.startedAt {
                 // Only reject when the live process started well AFTER the recorded
                 // session — the pid-reuse signature. A lagging startedAt (negative
@@ -482,16 +504,13 @@ final class SessionMonitor {
         return result
     }
 
-    /// Parse "  5185 Wed Jun 24 21:38:58 2026 /path/to/claude" →
-    /// (pid, comm, lstart-as-local-epoch). lstart is always 5 whitespace tokens
-    /// (Dow Mon DD HH:MM:SS YYYY); comm is the rest (may contain spaces).
+    /// Parse "  5185 Wed Jun 24 21:38:58 2026 /path/to/claude" → (pid, comm,
+    /// lstart-as-local-epoch). The column split is the pure, testable
+    /// SessionLogic.parsePsLine; the lstart→epoch conversion (local TZ) stays here.
     private func parsePsLine(_ line: String) -> (Int, ProcFact)? {
-        let tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-        guard tokens.count >= 7, let pid = Int(tokens[0]) else { return nil }
-        let lstart = tokens[1...5].joined(separator: " ")
-        let comm = tokens[6...].joined(separator: " ")
-        let epoch = SessionMonitor.lstartFormatter.date(from: lstart)?.timeIntervalSince1970
-        return (pid, ProcFact(comm: comm, startEpoch: epoch))
+        guard let p = SessionLogic.parsePsLine(line) else { return nil }
+        let epoch = SessionMonitor.lstartFormatter.date(from: p.lstart)?.timeIntervalSince1970
+        return (p.pid, ProcFact(comm: p.comm, startEpoch: epoch))
     }
 
     /// `ps -o lstart=` local-time format, e.g. "Wed Jun 24 21:38:58 2026".

@@ -50,19 +50,26 @@ enum AppDate {
         return gregorian.startOfDay(for: monday)
     }
 
-    /// Build a "YYYY-MM-01:YYYY-MM-DD" range string for a given year/month
-    static func monthDateRange(year: Int, month: Int) -> String {
+    /// Number of days in a Gregorian month (28–31), or nil on calendar
+    /// arithmetic failure (unreachable for a valid year/month + the pinned
+    /// Gregorian calendar above). Single source for the month length; callers
+    /// pick their own fallback — a date RANGE wants 28 (valid in every month), a
+    /// chart axis wants 30 (purely cosmetic on the unreachable failure path).
+    static func daysInMonth(year: Int, month: Int) -> Int? {
         let cal = gregorian
-        var startComps = DateComponents()
-        startComps.year = year
-        startComps.month = month
-        startComps.day = 1
-        guard let startDate = cal.date(from: startComps),
-              let nextMonth = cal.date(byAdding: .month, value: 1, to: startDate),
-              let lastDay = cal.date(byAdding: .day, value: -1, to: nextMonth) else {
-            return String(format: "%04d-%02d-01:%04d-%02d-28", year, month, year, month)
-        }
-        let day = cal.component(.day, from: lastDay)
+        var comps = DateComponents()
+        comps.year = year
+        comps.month = month
+        comps.day = 1
+        guard let start = cal.date(from: comps),
+              let next = cal.date(byAdding: .month, value: 1, to: start),
+              let last = cal.date(byAdding: .day, value: -1, to: next) else { return nil }
+        return cal.component(.day, from: last)
+    }
+
+    /// Build a "YYYY-MM-01:YYYY-MM-DD" range string for a given year/month.
+    static func monthDateRange(year: Int, month: Int) -> String {
+        let day = daysInMonth(year: year, month: month) ?? 28  // 28 is a valid day in every month
         return String(format: "%04d-%02d-01:%04d-%02d-%02d", year, month, year, month, day)
     }
 

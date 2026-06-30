@@ -221,4 +221,43 @@ import Testing
         #expect(TimeLogic.date(fromDayKey: "2026-06") == nil)
         #expect(TimeLogic.date(fromDayKey: "") == nil)
     }
+
+    // MARK: renderedDayKeys / avgDivisor
+
+    private func day(_ secs: Int) -> DayTimeUsage { DayTimeUsage(intervals: [], totalSeconds: secs) }
+
+    @Test func renderedDayKeysKeepsInMonthAndPayloadOnly() {
+        // Week spanning a month boundary: May 30/31 then Jun 1..5.
+        let keys = ["2026-05-30", "2026-05-31", "2026-06-01", "2026-06-02",
+                    "2026-06-03", "2026-06-04", "2026-06-05"]
+        // Viewing June; payload carries only one of the out-of-month days.
+        let days = ["2026-05-31": day(60), "2026-06-02": day(120)]
+        let rendered = TimeLogic.renderedDayKeys(keys, monthPrefix: "2026-06-", days: days)
+        // All June days kept (even those with no payload), plus May 31 (has payload);
+        // May 30 (out of month, no payload) dropped — no fabricated zero.
+        #expect(rendered == ["2026-05-31", "2026-06-01", "2026-06-02",
+                             "2026-06-03", "2026-06-04", "2026-06-05"])
+    }
+
+    @Test func avgDivisorCurrentWeekCountsElapsedDays() {
+        let keys = ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04",
+                    "2026-06-05", "2026-06-06", "2026-06-07"]
+        // Today is Wednesday (index 2) → divide by 3, not 7.
+        #expect(TimeLogic.avgDivisor(dayKeys: keys, todayKey: "2026-06-03", renderedCount: 7) == 3)
+    }
+
+    @Test func avgDivisorPastWeekUsesRenderedCount() {
+        let keys = ["2026-05-04", "2026-05-05", "2026-05-06", "2026-05-07",
+                    "2026-05-08", "2026-05-09", "2026-05-10"]
+        // Fully past week (last day < today) → max(1, renderedCount).
+        #expect(TimeLogic.avgDivisor(dayKeys: keys, todayKey: "2026-06-03", renderedCount: 4) == 4)
+        #expect(TimeLogic.avgDivisor(dayKeys: keys, todayKey: "2026-06-03", renderedCount: 0) == 1)
+    }
+
+    @Test func avgDivisorFutureWeekIsOne() {
+        let keys = ["2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09",
+                    "2026-07-10", "2026-07-11", "2026-07-12"]
+        // First day already after today → 1 (the week renders all-zero anyway).
+        #expect(TimeLogic.avgDivisor(dayKeys: keys, todayKey: "2026-06-03", renderedCount: 0) == 1)
+    }
 }

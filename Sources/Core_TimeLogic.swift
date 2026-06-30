@@ -121,6 +121,31 @@ enum TimeLogic {
         return longest
     }
 
+    // MARK: Week stats scope / daily-average divisor
+
+    /// The day keys actually rendered/counted for a week row: in-month days
+    /// always, out-of-month days only when the payload carries them (no
+    /// fabricated zeros from the cross-week prev-month tail). `monthPrefix` is
+    /// "yyyy-MM-" of the viewed month; `days` is the time payload's day map.
+    static func renderedDayKeys(_ dayKeys: [String], monthPrefix: String,
+                                days: [String: DayTimeUsage]) -> [String] {
+        dayKeys.filter { $0.hasPrefix(monthPrefix) || days[$0] != nil }
+    }
+
+    /// Daily-average divisor for a week: the week containing `todayKey` averages
+    /// over elapsed days Mon..today (a Tuesday isn't divided by 7); a fully past
+    /// week divides by the days that rendered data (min 1); a future week (its
+    /// first day already after today) yields 1 (it renders all-zero anyway).
+    /// `dayKeys` are the week's 7 chronological keys; `renderedCount` =
+    /// renderedDayKeys.count. "yyyy-MM-dd" keys compare chronologically as strings.
+    static func avgDivisor(dayKeys: [String], todayKey: String, renderedCount: Int) -> Int {
+        if let todayIndex = dayKeys.firstIndex(of: todayKey) {
+            return todayIndex + 1
+        }
+        guard let first = dayKeys.first, first <= todayKey else { return 1 }
+        return max(1, renderedCount)
+    }
+
     // MARK: Year grid (53 cols × 7 rows, Monday-first)
 
     /// Local midnight of the Monday on or before Jan 1 of `year` — column 0 of
