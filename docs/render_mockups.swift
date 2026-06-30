@@ -117,6 +117,57 @@ func timeMock() -> (TimeData, [String:Int]) {
     return (TimeData(gapMinutes: 10, days: days), year)
 }
 
+// ── synthetic live-session data ──
+// Six demo sessions across three folder groups, exercising all four status-dot
+// colors the real SessionRow draws: busy=orange, waiting=amber, done-unseen=green,
+// idle=grey. updatedAt drives the trailing "Xm ago" + the group/row ordering.
+func sess(_ pid: Int, _ id: String, _ cwd: String, _ status: SessionStatus,
+          waitingFor: String? = nil, agoSec: Double) -> SessionInfo {
+    let now = Date().timeIntervalSince1970 * 1000
+    return SessionInfo(pid: pid, sessionId: id, cwd: cwd, status: status,
+                       waitingFor: waitingFor, startedAt: now - agoSec*1000 - 7_200_000,
+                       updatedAt: now - agoSec*1000, statusUpdatedAt: now - agoSec*1000,
+                       version: "2.3.0", kind: nil, entrypoint: "cli")
+}
+
+@MainActor
+func populateSessions(_ s: UsageStore) {
+    let ccm = "/Users/lijiakun/Developer/CCCostMonitor"
+    let mia = "/Users/lijiakun/Developer/mia"
+    let fin = "/Users/lijiakun/Developer/finance"
+    s.sessions = [
+        sess(4101, "a1aa0001-0000-0000-0000-000000000001", ccm, .busy, agoSec: 45),
+        sess(4102, "a1aa0002-0000-0000-0000-000000000002", ccm, .idle, agoSec: 6*60),
+        sess(4201, "b2bb0001-0000-0000-0000-000000000001", fin, .waiting,
+             waitingFor: "input needed", agoSec: 3*60),
+        sess(4202, "b2bb0002-0000-0000-0000-000000000002", fin, .idle, agoSec: 52*60),
+        sess(4301, "c3cc0001-0000-0000-0000-000000000001", mia, .idle, agoSec: 11*60),
+        sess(4302, "c3cc0002-0000-0000-0000-000000000002", mia, .idle, agoSec: 2*3600),
+    ]
+    s.sessionLabels = [ccm: "CCCostMonitor", mia: "mia", fin: "finance"]
+    s.sessionTitles = [
+        "a1aa0001-0000-0000-0000-000000000001": "Add notch display mode",
+        "a1aa0002-0000-0000-0000-000000000002": "Polish the segmented control",
+        "b2bb0001-0000-0000-0000-000000000001": "Personal finance allocation",
+        "b2bb0002-0000-0000-0000-000000000002": "Attachment styles",
+        "c3cc0001-0000-0000-0000-000000000001": "Calorie recognition pipeline",
+        "c3cc0002-0000-0000-0000-000000000002": "Layered DB research",
+    ]
+    s.sessionInstructions = [
+        "a1aa0001-0000-0000-0000-000000000001": "Add a Session tab between Time and Plan",
+        "a1aa0002-0000-0000-0000-000000000002": "Replace the native Picker with a self-drawn segmented control",
+        "b2bb0001-0000-0000-0000-000000000001": "Merge into screen 9; compute current vs target by amount and flag every over-allocated bucket",
+        "b2bb0002-0000-0000-0000-000000000002": "Add a blog post to the wiki",
+        "c3cc0001-0000-0000-0000-000000000001": "Rewrite the overview to the legacy MySQL schema",
+        "c3cc0002-0000-0000-0000-000000000002": "Open a workflow to review the final report",
+    ]
+    // Two finished-unseen rows → green dots (one per group): the CCCostMonitor
+    // idle session and the mia calorie-pipeline session.
+    s.sessionDoneUnseen = ["a1aa0002-0000-0000-0000-000000000002",
+                           "c3cc0001-0000-0000-0000-000000000001"]
+    s.anySessionDoneUnseen = true
+}
+
 @MainActor
 func makeStore(tab: DisplayTab, range: TimeRange = .week) -> UsageStore {
     let s = UsageStore()
@@ -144,6 +195,7 @@ func makeStore(tab: DisplayTab, range: TimeRange = .week) -> UsageStore {
         five_hour: OAuthUsageWindow(utilization: 62, resets_at: nil),
         seven_day: OAuthUsageWindow(utilization: 38, resets_at: nil),
         extra_usage: nil, seven_day_sonnet: OAuthUsageWindow(utilization: 81, resets_at: nil))
+    populateSessions(s)
     return s
 }
 
@@ -268,7 +320,7 @@ struct DemoPopover: View {
     /// In the notch we use the app's REAL custom segmented control (pure SwiftUI, so it
     /// rasterizes); the menu-bar shots keep the native-look SegmentedBar replica.
     var notch: Bool = false
-    private var visibleTabs: [DisplayTab] { [.cost, .tokens, .time, .subscription] }
+    private var visibleTabs: [DisplayTab] { [.cost, .tokens, .time, .session, .subscription] }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -316,7 +368,7 @@ struct DemoPopover: View {
             }
             .padding(.horizontal, 14).padding(.vertical, 10)
         }
-        .frame(width: store.selectedTab == .time ? 480 : 360)
+        .frame(width: (store.selectedTab == .time || store.selectedTab == .session) ? 480 : 360)
         .background(bg)
         .environment(\.localizer, loc)
     }
@@ -324,6 +376,13 @@ struct DemoPopover: View {
     @ViewBuilder private var content: some View {
         if store.selectedTab == .time {
             DemoTimeTab(store: store, loc: loc)
+        } else if store.selectedTab == .session {
+            // The REAL SessionTabView/SessionGroupSection/SessionRow — pure SwiftUI
+            // (VStack/HStack/Circle/Text/Image). The interaction modifiers (onHover/
+            // onTapGesture/onDisappear) attach recognizers but don't run at render
+            // time, so ImageRenderer rasterizes it cleanly with no native-view trap.
+            SessionTabView(store: store)
+                .environment(\.localizer, loc)
         } else if store.selectedTab == .subscription {
             SubscriptionView(store: store)
         } else {
@@ -424,6 +483,7 @@ struct RenderApp {
         render("time-week", DemoPopover(store: makeStore(tab: .time, range: .week), loc: loc))
         render("time-month", DemoPopover(store: makeStore(tab: .time, range: .month), loc: loc))
         render("time-year", DemoPopover(store: makeStore(tab: .time, range: .year), loc: loc))
+        render("session", DemoPopover(store: makeStore(tab: .session), loc: loc))
         render("notch", DemoNotch(store: makeStore(tab: .cost), loc: loc))
     }
 }

@@ -858,6 +858,245 @@ struct TimeTabView: View {
     }
 }
 
+// MARK: - Session tab (live Claude Code sessions)
+
+/// Read-only list of live interactive Claude Code sessions, grouped by working
+/// directory. Structurally modeled on TimeTabView. Phase 1: rows are
+/// NON-interactive (no click-to-jump) — but each row carries a `contentShape`
+/// so a Phase 3 tap handler attaches without restructuring.
+struct SessionTabView: View {
+    @ObservedObject var store: UsageStore
+    @Environment(\.localizer) private var loc
+
+    var body: some View {
+        VStack(spacing: 8) {
+            let groups = store.sessionGroups
+            if groups.isEmpty {
+                emptyState
+            } else {
+                if store.showOldClaudeHint { hintBanner }
+                if let jumpHint = store.sessionJumpHint { jumpHintBanner(jumpHint) }
+                ForEach(groups) { group in
+                    SessionGroupSection(group: group, store: store)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+        // Drive the jump-hint banner's `.transition(.opacity)` — the hint is set
+        // from a background completion (no withAnimation at the source), so animate
+        // its insertion/removal here instead.
+        .animation(.easeInOut(duration: 0.2), value: store.sessionJumpHint)
+        // Phase 6: viewing the Session tab no longer wipes the green cue — that
+        // cleared it before the user could tell which session finished. Each
+        // finished-unseen row keeps its own green dot until the user clicks it
+        // (engagement) or the reducer auto-evicts it.
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 20)).foregroundColor(.secondary)
+            Text(loc("sessionEmpty"))
+                .font(.system(size: 11)).foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 120)
+    }
+
+    /// Shown when running `claude` processes exist but no session registry does
+    /// (old Claude Code) — synthesized rows below show only a "Running" status.
+    private var hintBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.up.circle")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+            Text(loc("sessionOldCCHint"))
+                .font(.system(size: 10.5)).foregroundColor(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
+    }
+
+    /// Transient, non-modal hint after a click-to-jump that could only raise the
+    /// app (ambiguous pane) / needs Automation permission / failed. Auto-clears.
+    private func jumpHintBanner(_ key: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "info.circle")
+                .font(.system(size: 11)).foregroundColor(.secondary)
+            Text(loc(key))
+                .font(.system(size: 10.5)).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.08)))
+        .transition(.opacity)
+    }
+}
+
+/// One cwd's card: folder header (basename / git top-level, full path on hover)
+/// + its session rows.
+struct SessionGroupSection: View {
+    let group: SessionGroup
+    @ObservedObject var store: UsageStore
+    @Environment(\.localizer) private var loc
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: "folder")
+                    .font(.system(size: 10)).foregroundColor(.secondary)
+                Text(group.label)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                Text("\(group.sessions.count)")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(Color.primary.opacity(0.07)))
+                Spacer(minLength: 0)
+            }
+            .help(group.cwd)
+
+            VStack(spacing: 2) {
+                ForEach(group.sessions) { session in
+                    SessionRow(session: session, store: store)
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+    }
+}
+
+/// One session: leading colored STATUS dot + the session TITLE (the transcript
+/// ai-title) as the primary line + the latest user INSTRUCTION as the subtitle
+/// (one line, …-truncated), relative time, hover jump affordance.
+/// Phase 3: the whole row is clickable — a tap focuses/raises that session's
+/// terminal window (and pane/tab where possible) via store.jumpToSession.
+struct SessionRow: View {
+    let session: SessionInfo
+    @ObservedObject var store: UsageStore
+    @Environment(\.localizer) private var loc
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Status survives as the leading dot (busy=orange, waiting=amber,
+            // idle/shell=grey); the label moves to accessibility, not the title.
+            Circle()
+                .fill(statusColor)
+                .frame(width: 7, height: 7)
+                .accessibilityLabel(statusLabel)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(titleText)
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(subtitleText)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 4)
+            if let updated = session.updatedAt {
+                Text(timeAgo(Date(timeIntervalSince1970: updated / 1000), loc))
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+            // Jump affordance: a subtle "open this terminal" glyph that fades in
+            // on hover. Always present in the layout (fixed width) so the row
+            // doesn't reflow when it appears.
+            Image(systemName: "arrow.up.forward.app")
+                .font(.system(size: 10.5))
+                .foregroundColor(.secondary)
+                .opacity(hovering ? 0.9 : 0.0)
+                .frame(width: 13)
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 4)
+        // Single hit-testable shape (set up in Phase 1) so the tap is additive.
+        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(Color.primary.opacity(hovering ? 0.06 : 0.0))
+        )
+        .onHover { inside in
+            // Only act on a REAL transition. SwiftUI can re-deliver the same
+            // value on a re-render; without this guard a repeated `true` would
+            // double-push the cursor stack (and a repeated `false` underflow-pop).
+            guard inside != hovering else { return }
+            hovering = inside
+            // Pointer cursor over a clickable row. push/pop must stay balanced.
+            if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        // Tapping a row activates the terminal app, which makes the menu-bar
+        // popover resign key and tear down WHILE the pointer is still over the
+        // row — so onHover's `false` never arrives. Pop the cursor we pushed on
+        // teardown so it can't leak a stuck pointing-hand into the next popover.
+        .onDisappear {
+            if hovering { NSCursor.pop(); hovering = false }
+        }
+        .onTapGesture { store.jumpToSession(session) }
+    }
+
+    /// Primary line: the session title (newest transcript ai-title). Falls back
+    /// to the cwd basename (repo), then a localized "Untitled session".
+    private var titleText: String {
+        if let t = store.sessionTitles[session.sessionId], !t.isEmpty { return t }
+        let base = SessionLogic.basename(session.cwd)
+        return base.isEmpty ? loc("sessionUntitled") : base
+    }
+
+    /// Subtitle: the latest clean user instruction. SwiftUI tail-truncates it to
+    /// one line ("…"); falls back to a localized "(no recent prompt)".
+    private var subtitleText: String {
+        if let i = store.sessionInstructions[session.sessionId], !i.isEmpty { return i }
+        return loc("sessionNoPrompt")
+    }
+
+    /// True when THIS session just finished a turn the user hasn't engaged with —
+    /// the per-session twin of the notch's aggregate green cue.
+    private var isDoneUnseen: Bool { store.sessionDoneUnseen.contains(session.sessionId) }
+
+    /// Leading dot color by PRIORITY: busy → orange (working); waiting → amber;
+    /// else a finished-unseen session → GREEN (identical to the notch aggregate
+    /// done dot); else idle/shell/unknown → grey. A done-unseen session is by
+    /// definition idle/shell, so green replaces grey for exactly those rows.
+    private var statusColor: Color {
+        switch session.status {
+        case .busy:                  return .orange
+        case .waiting:               return Color(red: 0.93, green: 0.69, blue: 0.22) // amber
+        case .idle, .shell, .unknown:
+            return isDoneUnseen ? .green : .gray
+        }
+    }
+
+    private var statusLabel: String {
+        switch session.status {
+        case .busy:
+            return loc("sessionWorking")
+        case .waiting:
+            switch session.waitReason {
+            case .needsConfirmation:    return loc("sessionNeedsConfirm")
+            case .needsInput, .none:    return loc("sessionWaitingInput")
+            }
+        case .idle, .shell:
+            return isDoneUnseen ? loc("sessionFinishedUnread") : loc("sessionIdle")
+        case .unknown:
+            // statusColor renders .unknown as green when done-unseen (the reducer
+            // does NOT evict on idle→unknown), so keep the label in lockstep with
+            // the dot instead of reading "Running" under a green dot.
+            return isDoneUnseen ? loc("sessionFinishedUnread") : loc("sessionRunning")
+        }
+    }
+}
+
 /// Monday-first localized short weekday symbols (DateFormatter's
 /// shortWeekdaySymbols is Sunday-first → rotate). Human-facing → locale-aware.
 private func mondayFirstWeekdaySymbols(_ loc: Localizer) -> [String] {
@@ -1603,12 +1842,14 @@ struct PopoverView: View {
         return max(240, screenH - 190)
     }
 
-    /// Cost + Tokens + Time always; the Plan tab only when the user has
-    /// subscription auth. Explicit arrays, NOT DisplayTab.allCases: display
-    /// order (cost, tokens, time, subscription) differs from rawValue order —
-    /// `time = 3` was APPENDED so persisted rawValues never remap.
+    /// Cost + Tokens + Time + Session always; the Plan tab only when the user has
+    /// subscription auth. Explicit arrays, NOT DisplayTab.allCases: display order
+    /// (cost, tokens, time, session, subscription) differs from rawValue order —
+    /// `time = 3` and `session = 4` were APPENDED so persisted rawValues never remap.
     private var visibleTabs: [DisplayTab] {
-        store.hasOAuthToken ? [.cost, .tokens, .time, .subscription] : [.cost, .tokens, .time]
+        store.hasOAuthToken
+            ? [.cost, .tokens, .time, .session, .subscription]
+            : [.cost, .tokens, .time, .session]
     }
 
     /// Notch-only spring for the per-tab WIDTH flip (360↔480). In the notch the black
@@ -1704,9 +1945,10 @@ struct PopoverView: View {
 
             footer
         }
-        // The Time tab needs room for a 53-column heatmap and a 0–24h timeline;
-        // the other tabs keep the original compact width.
-        .frame(width: store.selectedTab == .time ? 480 : 360)
+        // The Time tab needs room for a 53-column heatmap and a 0–24h timeline,
+        // and the Session tab reads better wide for grouped path lists; the other
+        // tabs keep the original compact width.
+        .frame(width: (store.selectedTab == .time || store.selectedTab == .session) ? 480 : 360)
         // Notch: spring the width flip so it grows symmetrically from the notch center.
         // Menu bar: nil → tabs switch instantly (no NSPopover resize animation). See
         // notchWidthAnimation.
@@ -1720,6 +1962,8 @@ struct PopoverView: View {
     private var contentSection: some View {
             if store.selectedTab == .time {
                 TimeTabView(store: store)
+            } else if store.selectedTab == .session {
+                SessionTabView(store: store)
             } else if store.selectedTab == .subscription {
                 SubscriptionView(store: store)
             } else if store.isCurrentMonth {

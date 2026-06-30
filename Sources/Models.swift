@@ -60,12 +60,14 @@ enum DisplayTab: Int, CaseIterable {
     case tokens = 1
     case subscription = 2
     case time = 3
+    case session = 4
     var icon: String {
         switch self {
         case .cost:         return "dollarsign.circle"
         case .tokens:       return "number.circle"
         case .subscription: return "gauge.with.dots.needle.67percent"
         case .time:         return "clock"
+        case .session:      return "bubble.left.and.bubble.right"
         }
     }
     func label(_ loc: Localizer) -> String {
@@ -74,6 +76,7 @@ enum DisplayTab: Int, CaseIterable {
         case .tokens:       return loc("tokens")
         case .subscription: return loc("subTab")
         case .time:         return loc("timeTab")
+        case .session:      return loc("sessionTab")
         }
     }
 }

@@ -516,6 +516,11 @@ final class NotchController: NSObject {
         // Fresh-when-you-look, mirroring the NSPopover open kick. Non-forced: the
         // fingerprint short-circuit makes it ~free when nothing changed.
         store.refresh()
+        // Phase 6: opening the popover (even straight onto the Session tab) NO LONGER
+        // clears the green "finished, unseen" cue. Merely looking can't tell which
+        // session finished — so the per-session green dots persist until the user
+        // genuinely engages (clicks a session row → store.jumpToSession clears that
+        // one), or the reducer auto-evicts it (busy/waiting again, gone).
     }
 
     private func close(_ inst: NotchInstance) {
