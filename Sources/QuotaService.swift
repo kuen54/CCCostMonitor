@@ -184,20 +184,44 @@ enum CredentialStore {
                 creds.fullData = fresh.fullData
             }
             creds.syncIntoFullData()
-            guard let json = try? JSONSerialization.data(withJSONObject: creds.fullData) else { return }
-            try? json.write(to: URL(fileURLWithPath: path), options: .atomic)
+            // NOTE: these failure logs deliberately carry ONLY the filesystem
+            // error (and at most the well-known credential path) — NEVER the JSON
+            // blob / access or refresh token. A silent failure here was the audit
+            // finding O: a dropped write/chmod/keychain result can leave the
+            // refreshed token unpersisted (worst case logging Claude Code out)
+            // with no signal, inconsistent with the 2.1.1 archive-dir NSLog.
+            guard let json = try? JSONSerialization.data(withJSONObject: creds.fullData) else {
+                NSLog("CCCostMonitor: token persist skipped — could not encode credentials JSON")
+                return
+            }
+            do {
+                try json.write(to: URL(fileURLWithPath: path), options: .atomic)
+            } catch {
+                NSLog("CCCostMonitor: refreshed-token write failed: \(error.localizedDescription)")
+                return
+            }
             // Atomic replace swaps in a new inode — restore the credential file's
             // tight permissions afterwards.
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: path)
+            do {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600], ofItemAtPath: path)
+            } catch {
+                NSLog("CCCostMonitor: credential file chmod 0600 failed: \(error.localizedDescription)")
+            }
         case .keychain(let service):
             if let data = KeychainCLI.readBlob(service: service),
                let fresh = parseCredentials(data, source: creds.source) {
                 creds.fullData = fresh.fullData
             }
             creds.syncIntoFullData()
-            guard let json = try? JSONSerialization.data(withJSONObject: creds.fullData) else { return }
-            KeychainCLI.writeBlob(service: service, account: KeychainCLI.account(service: service), json: json)
+            guard let json = try? JSONSerialization.data(withJSONObject: creds.fullData) else {
+                NSLog("CCCostMonitor: token persist skipped — could not encode credentials JSON")
+                return
+            }
+            if !KeychainCLI.writeBlob(service: service,
+                                      account: KeychainCLI.account(service: service), json: json) {
+                NSLog("CCCostMonitor: refreshed-token keychain write-back failed (token rotation not persisted)")
+            }
         }
     }
 }
