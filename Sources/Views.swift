@@ -855,19 +855,19 @@ struct TimeTabView: View {
 /// NON-interactive (no click-to-jump) — but each row carries a `contentShape`
 /// so a Phase 3 tap handler attaches without restructuring.
 struct SessionTabView: View {
-    @ObservedObject var store: UsageStore
+    @ObservedObject var sessionStore: SessionStore
     @Environment(\.localizer) private var loc
 
     var body: some View {
         VStack(spacing: 8) {
-            let groups = store.sessionGroups
+            let groups = sessionStore.groups
             if groups.isEmpty {
                 emptyState
             } else {
-                if store.showOldClaudeHint { hintBanner }
-                if let jumpHint = store.sessionJumpHint { jumpHintBanner(jumpHint) }
+                if sessionStore.showOldClaudeHint { hintBanner }
+                if let jumpHint = sessionStore.jumpHint { jumpHintBanner(jumpHint) }
                 ForEach(groups) { group in
-                    SessionGroupSection(group: group, store: store)
+                    SessionGroupSection(group: group, sessionStore: sessionStore)
                 }
             }
         }
@@ -876,7 +876,7 @@ struct SessionTabView: View {
         // Drive the jump-hint banner's `.transition(.opacity)` — the hint is set
         // from a background completion (no withAnimation at the source), so animate
         // its insertion/removal here instead.
-        .animation(.easeInOut(duration: 0.2), value: store.sessionJumpHint)
+        .animation(.easeInOut(duration: 0.2), value: sessionStore.jumpHint)
         // Phase 6: viewing the Session tab no longer wipes the green cue — that
         // cleared it before the user could tell which session finished. Each
         // finished-unseen row keeps its own green dot until the user clicks it
@@ -930,7 +930,7 @@ struct SessionTabView: View {
 /// + its session rows.
 struct SessionGroupSection: View {
     let group: SessionGroup
-    @ObservedObject var store: UsageStore
+    @ObservedObject var sessionStore: SessionStore
     @Environment(\.localizer) private var loc
 
     var body: some View {
@@ -953,7 +953,7 @@ struct SessionGroupSection: View {
 
             VStack(spacing: 2) {
                 ForEach(group.sessions) { session in
-                    SessionRow(session: session, store: store)
+                    SessionRow(session: session, sessionStore: sessionStore)
                 }
             }
         }
@@ -966,10 +966,10 @@ struct SessionGroupSection: View {
 /// ai-title) as the primary line + the latest user INSTRUCTION as the subtitle
 /// (one line, …-truncated), relative time, hover jump affordance.
 /// Phase 3: the whole row is clickable — a tap focuses/raises that session's
-/// terminal window (and pane/tab where possible) via store.jumpToSession.
+/// terminal window (and pane/tab where possible) via sessionStore.jump.
 struct SessionRow: View {
     let session: SessionInfo
-    @ObservedObject var store: UsageStore
+    @ObservedObject var sessionStore: SessionStore
     @Environment(\.localizer) private var loc
     @State private var hovering = false
 
@@ -1032,13 +1032,13 @@ struct SessionRow: View {
         .onDisappear {
             if hovering { NSCursor.pop(); hovering = false }
         }
-        .onTapGesture { store.jumpToSession(session) }
+        .onTapGesture { sessionStore.jump(session) }
     }
 
     /// Primary line: the session title (newest transcript ai-title). Falls back
     /// to the cwd basename (repo), then a localized "Untitled session".
     private var titleText: String {
-        if let t = store.sessionTitles[session.sessionId], !t.isEmpty { return t }
+        if let t = sessionStore.titles[session.sessionId], !t.isEmpty { return t }
         let base = SessionLogic.basename(session.cwd)
         return base.isEmpty ? loc("sessionUntitled") : base
     }
@@ -1046,13 +1046,13 @@ struct SessionRow: View {
     /// Subtitle: the latest clean user instruction. SwiftUI tail-truncates it to
     /// one line ("…"); falls back to a localized "(no recent prompt)".
     private var subtitleText: String {
-        if let i = store.sessionInstructions[session.sessionId], !i.isEmpty { return i }
+        if let i = sessionStore.instructions[session.sessionId], !i.isEmpty { return i }
         return loc("sessionNoPrompt")
     }
 
     /// True when THIS session just finished a turn the user hasn't engaged with —
     /// the per-session twin of the notch's aggregate green cue.
-    private var isDoneUnseen: Bool { store.sessionDoneUnseen.contains(session.sessionId) }
+    private var isDoneUnseen: Bool { sessionStore.doneUnseen.contains(session.sessionId) }
 
     /// Leading dot kind by PRIORITY (busy > waiting > done-unseen > grey). One
     /// pure decision in SessionLogic.dotKind so the color and the accessibility
@@ -1067,7 +1067,7 @@ struct SessionRow: View {
     private var statusColor: Color {
         switch dotKind {
         case .busy:       return .orange
-        case .waiting:    return Color(red: 0.93, green: 0.69, blue: 0.22) // amber
+        case .waiting:    return Color.ccStatusWaiting
         case .doneUnseen: return .green
         case .grey:       return .gray
         }
@@ -1860,7 +1860,7 @@ struct PopoverView: View {
             HStack {
                 HStack(spacing: 6) {
                     ClaudeLogoShape()
-                        .fill(Color(red: 0.851, green: 0.467, blue: 0.341)) // Claude brand orange (#D97757)
+                        .fill(Color.ccBrand)
                         .frame(width: 14, height: 14)
                     Text(loc("title"))
                         .font(.system(size: 13, weight: .bold))
@@ -1954,7 +1954,7 @@ struct PopoverView: View {
             if store.selectedTab == .time {
                 TimeTabView(store: store)
             } else if store.selectedTab == .session {
-                SessionTabView(store: store)
+                SessionTabView(sessionStore: store.sessionStore)
             } else if store.selectedTab == .subscription {
                 SubscriptionView(store: store)
             } else if store.isCurrentMonth {

@@ -16,7 +16,6 @@ import AppKit
 /// The result of a jump attempt, surfaced to the UI as an honest hint.
 enum JumpOutcome: Equatable {
     case focusedPane               // landed on the exact pane/tab
-    case focusedWindow             // raised the right window (less granular)
     case appOnly(JumpReason)       // could only bring the app forward
     case failed(JumpReason)        // couldn't even do that
 }
@@ -206,27 +205,14 @@ final class SessionJumper {
         return path.isEmpty ? nil : path
     }
 
-    /// Run a short-lived command; return (exitStatus, trimmed stdout), or nil on
-    /// launch failure / timeout. Same shape as SessionMonitor.runProcess: a
-    /// watchdog DispatchWorkItem kills a hung child so the queue can't wedge, and
-    /// stderr goes to /dev/null (an undrained stderr pipe could block on >64KB).
+    /// Run a short-lived command; return (exitStatus, TRIMMED stdout), or nil on
+    /// launch failure / non-UTF8. Delegates to the shared ProcessRunner (watchdog-
+    /// killed, stderr → /dev/null); this layer just trims the output, which is what
+    /// every caller here expects.
     @discardableResult
     private func run(_ launchPath: String, _ args: [String],
                      timeout: TimeInterval = 5.0) -> (Int32, String)? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: launchPath)
-        task.arguments = args
-        let outPipe = Pipe()
-        task.standardOutput = outPipe
-        task.standardError = FileHandle.nullDevice
-        do { try task.run() } catch { return nil }
-        let watchdog = DispatchWorkItem { if task.isRunning { task.terminate() } }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        watchdog.cancel()
-        let out = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return (task.terminationStatus, out)
+        guard let r = ProcessRunner.run(launchPath, args, timeout: timeout) else { return nil }
+        return (r.status, r.output.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }

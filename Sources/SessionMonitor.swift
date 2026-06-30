@@ -230,23 +230,6 @@ final class SessionMonitor {
         }
     }
 
-    /// The user is now looking at session state (notch opened / Session tab
-    /// shown): forget every pending "finished, unseen" cue. Queue-confined like
-    /// the rest of the monitor's state; republishes the cleared flag on the main
-    /// thread (only when it was actually set, so no needless publish). prevStatuses
-    /// is intentionally NOT reset — transition tracking continues uninterrupted.
-    func markSeen() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            self.doneUnseen.removeAll()
-            guard var scan = self.lastScan, scan.anyDoneUnseen else { return }
-            scan.anyDoneUnseen = false
-            scan.doneUnseenIds = []
-            self.lastScan = scan
-            DispatchQueue.main.async { [weak self] in self?.onChange(scan) }
-        }
-    }
-
     /// Phase 6: the user ENGAGED with ONE session (clicked its list row to jump):
     /// forget just that session's "finished, unseen" cue, leaving every other
     /// session's green dot intact. Queue-confined; republishes guarded on the main
@@ -583,31 +566,11 @@ final class SessionMonitor {
 
     // MARK: - Process helper
 
-    /// Run a short-lived command, return trimmed stdout, or nil on launch failure
-    /// / timeout / non-UTF8. Synchronous on the serial queue; a watchdog kills a
-    /// hung child so the queue can't wedge.
+    /// Run a short-lived command on the serial queue, return raw stdout (callers
+    /// `split`/`trim` as needed) or nil on launch failure / non-UTF8. Delegates to
+    /// the shared ProcessRunner (watchdog-killed, stderr → /dev/null).
     private func runProcess(_ launchPath: String, _ args: [String],
                             timeout: TimeInterval = 5.0) -> String? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: launchPath)
-        task.arguments = args
-        let outPipe = Pipe()
-        task.standardOutput = outPipe
-        // Discard stderr to /dev/null (NOT a Pipe): an undrained Pipe whose child
-        // writes >64KB would block, stalling the serial queue until the watchdog.
-        task.standardError = FileHandle.nullDevice
-        do {
-            try task.run()
-        } catch {
-            return nil
-        }
-        let watchdog = DispatchWorkItem {
-            if task.isRunning { task.terminate() }
-        }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        watchdog.cancel()
-        return String(data: data, encoding: .utf8)
+        ProcessRunner.run(launchPath, args, timeout: timeout)?.output
     }
 }

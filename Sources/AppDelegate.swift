@@ -97,12 +97,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Always shows current month regardless of which month is being viewed.
         // CombineLatest4 is Combine's max arity — the time-tab input is chained
         // on with an extra combineLatest.
+        // The .session tab's menu-bar value (count + ▸busy marker) derives from
+        // sessionStore, which now lives outside UsageStore — fold a DEDUPED
+        // "count|anyBusy" signal into the pipeline so the title refreshes when
+        // sessions change, without re-titling on every 2s scan that changed neither.
+        let sessionMenuSignal = store.sessionStore.$sessions
+            .map { sessions -> String in
+                "\(sessions.count)|\(sessions.contains { $0.status == .busy })"
+            }
+            .removeDuplicates()
         cancellable = Publishers.CombineLatest4(
             store.$currentMonthData, store.$selectedTab, store.$language, store.$subscriptionQuota)
             .combineLatest(store.$timeTodaySeconds)
+            .combineLatest(sessionMenuSignal)
             .receive(on: RunLoop.main)
             .sink { [weak self] combined, _ in
-                let (monthData, _, _, _) = combined
+                let ((monthData, _, _, _), _) = combined
                 guard let self = self, monthData != nil else { return }
                 // Single source of truth: store.menuBarValue (shared with the notch
                 // idle label) computes the per-tab string. Guard on monthData so a

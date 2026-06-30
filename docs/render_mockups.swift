@@ -135,7 +135,7 @@ func populateSessions(_ s: UsageStore) {
     let ccm = "/Users/lijiakun/Developer/CCCostMonitor"
     let mia = "/Users/lijiakun/Developer/mia"
     let fin = "/Users/lijiakun/Developer/finance"
-    s.sessions = [
+    s.sessionStore.sessions = [
         sess(4101, "a1aa0001-0000-0000-0000-000000000001", ccm, .busy, agoSec: 45),
         sess(4102, "a1aa0002-0000-0000-0000-000000000002", ccm, .idle, agoSec: 6*60),
         sess(4201, "b2bb0001-0000-0000-0000-000000000001", fin, .waiting,
@@ -144,8 +144,8 @@ func populateSessions(_ s: UsageStore) {
         sess(4301, "c3cc0001-0000-0000-0000-000000000001", mia, .idle, agoSec: 11*60),
         sess(4302, "c3cc0002-0000-0000-0000-000000000002", mia, .idle, agoSec: 2*3600),
     ]
-    s.sessionLabels = [ccm: "CCCostMonitor", mia: "mia", fin: "finance"]
-    s.sessionTitles = [
+    s.sessionStore.labels = [ccm: "CCCostMonitor", mia: "mia", fin: "finance"]
+    s.sessionStore.titles = [
         "a1aa0001-0000-0000-0000-000000000001": "Add notch display mode",
         "a1aa0002-0000-0000-0000-000000000002": "Polish the segmented control",
         "b2bb0001-0000-0000-0000-000000000001": "Personal finance allocation",
@@ -153,7 +153,7 @@ func populateSessions(_ s: UsageStore) {
         "c3cc0001-0000-0000-0000-000000000001": "Calorie recognition pipeline",
         "c3cc0002-0000-0000-0000-000000000002": "Layered DB research",
     ]
-    s.sessionInstructions = [
+    s.sessionStore.instructions = [
         "a1aa0001-0000-0000-0000-000000000001": "Add a Session tab between Time and Plan",
         "a1aa0002-0000-0000-0000-000000000002": "Replace the native Picker with a self-drawn segmented control",
         "b2bb0001-0000-0000-0000-000000000001": "Merge into screen 9; compute current vs target by amount and flag every over-allocated bucket",
@@ -163,9 +163,9 @@ func populateSessions(_ s: UsageStore) {
     ]
     // Two finished-unseen rows → green dots (one per group): the CCCostMonitor
     // idle session and the mia calorie-pipeline session.
-    s.sessionDoneUnseen = ["a1aa0002-0000-0000-0000-000000000002",
-                           "c3cc0001-0000-0000-0000-000000000001"]
-    s.anySessionDoneUnseen = true
+    s.sessionStore.doneUnseen = ["a1aa0002-0000-0000-0000-000000000002",
+                                 "c3cc0001-0000-0000-0000-000000000001"]
+    s.sessionStore.anyDoneUnseen = true
 }
 
 @MainActor
@@ -381,7 +381,7 @@ struct DemoPopover: View {
             // (VStack/HStack/Circle/Text/Image). The interaction modifiers (onHover/
             // onTapGesture/onDisappear) attach recognizers but don't run at render
             // time, so ImageRenderer rasterizes it cleanly with no native-view trap.
-            SessionTabView(store: store)
+            SessionTabView(sessionStore: store.sessionStore)
                 .environment(\.localizer, loc)
         } else if store.selectedTab == .subscription {
             SubscriptionView(store: store)

@@ -86,12 +86,6 @@ enum AITitleReader {
         return nil
     }
 
-    /// Latest `aiTitle` for a file (no glob). Thin wrapper over `summary`,
-    /// title-only so it stops at the first chunk that yields a title.
-    static func latestAITitle(inFileAt path: String) -> String? {
-        return summary(inFileAt: path, needInstruction: false).title
-    }
-
     /// Read the file's TAIL in 256 KB chunks from EOF backward, extracting in ONE
     /// pass BOTH the newest `ai-title` and the newest USER INSTRUCTION (newest
     /// clean `last-prompt`/`user` line). Bounds total work so a huge transcript

@@ -137,7 +137,6 @@ struct SessionGroup: Identifiable, Equatable {
 
     var id: String { cwd }
     var anyBusy: Bool { sessions.contains { $0.status == .busy } }
-    var anyWaiting: Bool { sessions.contains { $0.status == .waiting } }
     /// Most-recent updatedAt across the group (0 when none reported one).
     var mostRecentUpdate: Double { sessions.compactMap { $0.updatedAt }.max() ?? 0 }
 }
