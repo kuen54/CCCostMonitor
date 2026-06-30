@@ -1089,7 +1089,10 @@ struct SessionRow: View {
         case .idle, .shell:
             return isDoneUnseen ? loc("sessionFinishedUnread") : loc("sessionIdle")
         case .unknown:
-            return loc("sessionRunning")
+            // statusColor renders .unknown as green when done-unseen (the reducer
+            // does NOT evict on idle→unknown), so keep the label in lockstep with
+            // the dot instead of reading "Running" under a green dot.
+            return isDoneUnseen ? loc("sessionFinishedUnread") : loc("sessionRunning")
         }
     }
 }
