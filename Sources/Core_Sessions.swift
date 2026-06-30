@@ -397,17 +397,20 @@ enum SessionLogic {
     /// is no longer "an unseen finish":
     ///   (a) the session is .busy/.waiting again,
     ///   (b) the session vanished from `current`,
-    ///   (c) its finishedAt is older than `ttl` (default 3600s),
-    ///   (d) `seenAll` (the user looked) clears everything.
+    ///   (c) `seenAll` (the user looked) clears everything.
+    /// There is NO time-based expiry: a present session that finished and is
+    /// still idle/shell stays an unseen cue indefinitely, until the user clicks
+    /// into it (the app-layer per-session `markSeen(sessionId:)`) or it is evicted
+    /// by (a)/(b)/(c). `finishedAt = now` is still stamped on each finish so the
+    /// value is available for a future "finished Xm ago" presentation.
     /// Returns the next (prevStatuses, doneUnseen). Deterministic for a given
     /// `now`, so the caller must pass its own clock (no Date() in core).
     static func stepDoneUnseen(prev: [String: SessionStatus],
                                current: [SessionInfo],
                                doneUnseen: [String: Double],
                                seenAll: Bool,
-                               now: Double,
-                               ttl: Double = 3600) -> (prev: [String: SessionStatus],
-                                                       doneUnseen: [String: Double]) {
+                               now: Double) -> (prev: [String: SessionStatus],
+                                                doneUnseen: [String: Double]) {
         let curStatus = Dictionary(current.map { ($0.sessionId, $0.status) },
                                    uniquingKeysWith: { _, b in b })
         // The user looked: forget every pending cue, but still advance prev so a
@@ -419,13 +422,11 @@ enum SessionLogic {
             next[id] = now
         }
         let currentIds = Set(curStatus.keys)
-        for (id, finishedAt) in next {
+        for (id, _) in next {
             if let st = curStatus[id], st == .busy || st == .waiting {
                 next.removeValue(forKey: id)            // (a) active again
             } else if !currentIds.contains(id) {
                 next.removeValue(forKey: id)            // (b) session gone
-            } else if now - finishedAt > ttl {
-                next.removeValue(forKey: id)            // (c) stale
             }
         }
         return (curStatus, next)

@@ -520,7 +520,7 @@ final class NotchController: NSObject {
         // clears the green "finished, unseen" cue. Merely looking can't tell which
         // session finished — so the per-session green dots persist until the user
         // genuinely engages (clicks a session row → store.jumpToSession clears that
-        // one), or the reducer auto-evicts it (busy/waiting again, gone, ttl).
+        // one), or the reducer auto-evicts it (busy/waiting again, gone).
     }
 
     private func close(_ inst: NotchInstance) {

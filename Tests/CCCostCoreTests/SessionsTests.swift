@@ -306,20 +306,30 @@ import Testing
         #expect(done1.isEmpty)                      // session gone → cue cleared
     }
 
-    @Test func stepTtlExpiryClears() {
-        let (_, done0) = SessionLogic.stepDoneUnseen(
+    @Test func stepPersistsAcrossIdleScansAndLargeElapsed() {
+        // A finished session that stays idle/shell never auto-expires: it survives
+        // many idle→idle scans and an arbitrarily large elapsed `now`.
+        var (prev, done) = SessionLogic.stepDoneUnseen(
             prev: ["a": .busy], current: [sess("a", .idle)],
             doneUnseen: [:], seenAll: false, now: 0)
-        // Just under ttl: kept.
-        let (_, kept) = SessionLogic.stepDoneUnseen(
-            prev: ["a": .idle], current: [sess("a", .idle)],
-            doneUnseen: done0, seenAll: false, now: 3599, ttl: 3600)
-        #expect(kept["a"] == 0)
-        // Past ttl: evicted.
-        let (_, expired) = SessionLogic.stepDoneUnseen(
-            prev: ["a": .idle], current: [sess("a", .idle)],
-            doneUnseen: done0, seenAll: false, now: 3601, ttl: 3600)
-        #expect(expired.isEmpty)
+        #expect(done["a"] == 0)
+        // Many subsequent idle→idle scans, each advancing `now`.
+        for t in 1...20 {
+            (prev, done) = SessionLogic.stepDoneUnseen(
+                prev: prev, current: [sess("a", .idle)],
+                doneUnseen: done, seenAll: false, now: Double(t))
+            #expect(done["a"] == 0)                  // still pending, finishedAt unchanged
+        }
+        // A single scan with a huge elapsed time (10 hours) — still no expiry.
+        (prev, done) = SessionLogic.stepDoneUnseen(
+            prev: prev, current: [sess("a", .idle)],
+            doneUnseen: done, seenAll: false, now: 10 * 3600)
+        #expect(done["a"] == 0)
+        // Even shell (also a "done" status) keeps it.
+        (_, done) = SessionLogic.stepDoneUnseen(
+            prev: prev, current: [sess("a", .shell)],
+            doneUnseen: done, seenAll: false, now: 100 * 3600)
+        #expect(done["a"] == 0)
     }
 
     @Test func stepSeenAllClearsButAdvancesPrev() {
