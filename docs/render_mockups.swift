@@ -127,7 +127,7 @@ func sess(_ pid: Int, _ id: String, _ cwd: String, _ status: SessionStatus,
     return SessionInfo(pid: pid, sessionId: id, cwd: cwd, status: status,
                        waitingFor: waitingFor, startedAt: now - agoSec*1000 - 7_200_000,
                        updatedAt: now - agoSec*1000, statusUpdatedAt: now - agoSec*1000,
-                       version: "2.3.0", kind: nil, entrypoint: "cli")
+                       version: "3.0.0", kind: nil, entrypoint: "cli")
 }
 
 @MainActor
