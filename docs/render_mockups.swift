@@ -168,6 +168,23 @@ func populateSessions(_ s: UsageStore) {
     s.sessionStore.anyDoneUnseen = true
 }
 
+// ISO-8601 string for a reset `hours` from now, so the Plan bars show live-looking
+// "resets in Xh/Xd" countdowns (SubWindowRow renders reset text only when non-nil).
+func resetIn(_ hours: Double) -> String {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    return f.string(from: Date().addingTimeInterval(hours * 3600))
+}
+
+// One model-scoped weekly cap for the Plan tab's `limits[]` (the shape Anthropic
+// now delivers per-model caps in — e.g. the separate Fable weekly cap).
+func scopedCap(_ model: String, used: Double, resetHours: Double) -> OAuthUsageLimit {
+    OAuthUsageLimit(kind: "weekly_scoped", group: "weekly", percent: used,
+                    resets_at: resetIn(resetHours),
+                    scope: OAuthLimitScope(model: OAuthLimitModel(id: nil, display_name: model)),
+                    is_active: true)
+}
+
 @MainActor
 func makeStore(tab: DisplayTab, range: TimeRange = .week) -> UsageStore {
     let s = UsageStore()
@@ -191,10 +208,21 @@ func makeStore(tab: DisplayTab, range: TimeRange = .week) -> UsageStore {
     s.viewingTimeData = td
     s.yearTimeDays = year
     s.timeRange = range
+    // Modern subscription shape: model-scoped weekly caps arrive in `limits[]`
+    // (the flat seven_day_sonnet is null now). Shows a Fable + Sonnet weekly cap
+    // alongside the 5h / 7d windows — green / amber / coral across the four bars.
     s.subscriptionQuota = OAuthUsage(
-        five_hour: OAuthUsageWindow(utilization: 62, resets_at: nil),
-        seven_day: OAuthUsageWindow(utilization: 38, resets_at: nil),
-        extra_usage: nil, seven_day_sonnet: OAuthUsageWindow(utilization: 81, resets_at: nil))
+        five_hour: OAuthUsageWindow(utilization: 45, resets_at: resetIn(2.5)),
+        seven_day: OAuthUsageWindow(utilization: 78, resets_at: resetIn(96)),
+        extra_usage: nil, seven_day_sonnet: nil,
+        limits: OAuthLimitList(items: [
+            OAuthUsageLimit(kind: "session", group: "session", percent: 45,
+                            resets_at: resetIn(2.5), scope: nil, is_active: false),
+            OAuthUsageLimit(kind: "weekly_all", group: "weekly", percent: 78,
+                            resets_at: resetIn(96), scope: nil, is_active: false),
+            scopedCap("Fable", used: 71, resetHours: 50),
+            scopedCap("Sonnet", used: 93, resetHours: 46),
+        ]))
     populateSessions(s)
     return s
 }
