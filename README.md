@@ -58,7 +58,7 @@ This app reads all your local session data and puts it in one place. One menu ba
   - **Month** — the same timeline, one row per week of the month
   - **Year** — a GitHub-style activity heatmap
 - **Sessions** — a live list of your running Claude Code sessions, grouped by folder. Each row shows a status dot (working / waiting for input / just-finished / idle), the session's title, and its latest prompt. **Click a row to jump straight to that session's terminal window** — pinpointing the exact pane/tab for Otty, Terminal and iTerm, with an honest *bring-the-app-forward* fallback elsewhere. The notch logo **spins while any session is working** and shows an attention dot (amber = waiting, green = just finished) until you look
-- **Subscription quota** (Pro / Max) — dedicated tab showing how much is *left* in the 5-hour, 7-day and 7-day Sonnet windows, with reset countdowns. Live from Anthropic's official usage endpoint — the same source Claude Code's `/usage` uses
+- **Subscription quota** (Pro / Max) — dedicated tab showing how much is *left* in the 5-hour and 7-day windows, plus per-model weekly caps (e.g. **Fable**), each with reset countdowns. Live from Anthropic's official usage endpoint — the same source Claude Code's `/usage` uses
 - **Today / This Week / This Month** — token distribution by type (input, output, cache read, cache write)
 - **Daily bar chart** — hover for details
 - **Month navigation** — browse past months, cached locally
@@ -204,7 +204,7 @@ Claude Code 的 `/cost` 只显示当前会话。如果你有多个 Anthropic 账
   - **月视图** — 同样的时间轴，每行是该月的一周
   - **年视图** — GitHub 风格的活跃度热力图
 - **会话（Sessions）** — 实时列出正在运行的 Claude Code 会话，按文件夹分组。每行显示状态点（处理中 / 等待输入 / 刚完成 / 空闲）、会话标题和最近一条指令。**点击任意一行即可跳转到该会话所在的终端窗口** —— Otty、Terminal、iTerm 能精确定位到具体的 pane/标签页，其它终端则诚实地回退为「把 app 切到前台」。只要有会话在处理，刘海里的 logo 会**持续旋转**，并显示一个提醒圆点（琥珀=等待，绿色=刚完成），直到你查看为止
-- **订阅剩余用量**（Pro / Max）— 独立 tab，查看 5 小时 / 7 天 / 7 天 Sonnet 窗口**还剩多少**及重置倒计时。数据来自 Anthropic 官方用量接口 —— 与 Claude Code `/usage` 同源
+- **订阅剩余用量**（Pro / Max）— 独立 tab，查看 5 小时 / 7 天窗口，以及各模型每周限额（如 **Fable**）**还剩多少**及重置倒计时。数据来自 Anthropic 官方用量接口 —— 与 Claude Code `/usage` 同源
 - **今日 / 本周 / 本月** — 按类型拆分 token（输入、输出、缓存读、缓存写）
 - **每日柱状图** — 悬浮查看详情
 - **月份导航** — 浏览历史月份，本地缓存

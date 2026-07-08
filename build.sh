@@ -1,6 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
+# Ensure bare `swiftc` can locate the macOS SDK even in a non-interactive shell
+# (interactive logins resolve it via the default toolchain, but cron / CI / agent
+# shells may not — without this, compiling `import Cocoa` fails with "no such
+# module 'Cocoa'"). Only fills SDKROOT when unset, so an explicit override wins.
+: "${SDKROOT:=$(xcrun --show-sdk-path --sdk macosx)}"
+export SDKROOT
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="CCCostMonitor"
 BUILD_DIR="$SCRIPT_DIR/build"
