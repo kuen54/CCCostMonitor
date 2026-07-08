@@ -92,10 +92,22 @@ struct SubscriptionView: View {
                 SubWindowRow(label: loc("sub7dLabel"),
                              usedPercent: q.seven_day.displayPercent,
                              resetAt: q.sevenDayResetDate)
-                // Max plans expose a separate Sonnet 7-day cap. Show it only when the
-                // API actually returns a bucket with activity or a reset time.
+                // Per-model weekly caps. Anthropic now delivers these in the `limits`
+                // array (a `weekly_scoped` entry per model — e.g. the separate Fable
+                // cap subscription users recently got). Render one remaining bar each.
+                ForEach(Array(q.scopedModelLimits.enumerated()), id: \.offset) { _, lim in
+                    SubWindowRow(
+                        label: String(format: loc("sub7dScopedFmt"), lim.modelDisplayName ?? ""),
+                        usedPercent: lim.displayPercent,
+                        resetAt: lim.resetDate)
+                }
+                // Legacy flat Sonnet-only 7-day cap (pre-`limits` accounts, Max plans).
+                // Shown only when the newer array didn't already surface a Sonnet-scoped
+                // bar, so the model never renders twice.
                 if let sonnet = q.seven_day_sonnet,
-                   sonnet.displayPercent > 0 || sonnet.resets_at != nil {
+                   sonnet.displayPercent > 0 || sonnet.resets_at != nil,
+                   !q.scopedModelLimits.contains(where: {
+                       $0.modelDisplayName?.caseInsensitiveCompare("Sonnet") == .orderedSame }) {
                     SubWindowRow(label: loc("sub7dSonnetLabel"),
                                  usedPercent: sonnet.displayPercent,
                                  resetAt: q.sevenDaySonnetResetDate)
