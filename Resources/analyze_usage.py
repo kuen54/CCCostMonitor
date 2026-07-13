@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Optional, Dict, List
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 # ---------------------------------------------------------------------------
 # Active-time tracking

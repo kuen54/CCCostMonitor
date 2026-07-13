@@ -26,9 +26,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // sustained writes, so the work item would fire every cycle and spawn Python ~2s
     // of CPU each time). Timer / wake / ⌘R / popover-open refreshes are unaffected.
     private var lastFSTriggeredRefresh: Date?
-    // Latest desired menu-bar title. While the popover is open we defer applying it to
-    // the button (a resizing anchor makes NSPopover drift left); popoverDidClose flushes it.
-    private var latestMenuTitle = " … "
+    // Menu-bar content is a SwiftUI hosting view inside the status button (so the
+    // Claude mark can spin while a session is busy and carry the attention dot — the
+    // same behavior as the notch and popover header). `menuBarModel.text` holds the
+    // current value string; the status item length tracks the measured content width.
+    private let menuBarModel = MenuBarModel(text: "…")
+    private var menuBarHostingView: NSView?
+    // Latest desired menu-bar value. While the popover is open we defer applying it (a
+    // resizing status item makes NSPopover drift left); popoverDidClose flushes it.
+    private var latestMenuText = "…"
+    // Last measured content width — the status item length. Frozen while the popover
+    // is open; restored on close and when switching back to menu-bar mode.
+    private var lastMenuBarWidth: CGFloat = 40
 
     // Notch display mode. When displayMode == .notch the controller owns the notch
     // panel + its whole lifecycle; the displayMode sink below is the SINGLE writer of
@@ -36,49 +45,38 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var notchController: NotchController?
     private var displayModeCancellable: AnyCancellable?
 
-    // Claude official logo as a menu bar template image
-    // SVG path from SimpleIcons (https://simpleicons.org/?q=claude), viewBox 0 0 24 24
-    private func makeClaudeIcon(size: CGFloat = 18) -> NSImage {
-        let img = NSImage(size: NSSize(width: size, height: size))
-        img.lockFocus()
-
-        let scale = size / 24.0
-        let transform = NSAffineTransform()
-        // SVG Y-axis is top-down, macOS is bottom-up → flip vertically
-        transform.translateX(by: 0, yBy: size)
-        transform.scaleX(by: scale, yBy: -scale)
-
-        // Official Claude logo SVG path data (from SimpleIcons, CC0 licensed) —
-        // command list lives in ClaudeLogo.swift (shared with the popover header
-        // and the app-icon generator). Built in SVG space, flipped by `transform`.
-        let path = ClaudeLogo.nsBezierPath { x, y in NSPoint(x: x, y: y) }
-
-        path.transform(using: transform as AffineTransform)
-        NSColor.black.setFill()
-        path.fill()
-
-        img.unlockFocus()
-        img.isTemplate = true
-        return img
-    }
-
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Status bar item
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Status bar item. Length is managed manually (updateMenuBarWidth) to track the
+        // SwiftUI content's measured width — variableLength can't size to a hosted view.
+        statusItem = NSStatusBar.system.statusItem(withLength: lastMenuBarWidth)
         statusItem.autosaveName = "CCCostMonitor"
         // Initial visibility set synchronously to avoid a launch-time flash of the
         // icon in notch mode; the displayMode sink below remains the single owner.
         statusItem.isVisible = (store.displayMode == .menubar)
         if let button = statusItem.button {
-            button.image = makeClaudeIcon()
-            button.imagePosition = .imageLeft
-            button.title = " … "
             button.action = #selector(togglePopover)
             button.target = self
+            // Host [Claude mark + value] in SwiftUI so the mark can spin while a session
+            // is busy and carry the attention dot (same view as the notch/popover). The
+            // hosting view passes mouse events through to the button so a click still
+            // toggles the popover; its measured width drives the status item length.
+            let content = MenuBarContentView(
+                sessionStore: store.sessionStore,
+                model: menuBarModel,
+                onWidth: { [weak self] w in self?.updateMenuBarWidth(w) })
+            let hosting = PassthroughStatusHostingView(rootView: content)
+            hosting.translatesAutoresizingMaskIntoConstraints = false
+            button.addSubview(hosting)
+            NSLayoutConstraint.activate([
+                hosting.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+                hosting.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+                hosting.topAnchor.constraint(equalTo: button.topAnchor),
+                hosting.bottomAnchor.constraint(equalTo: button.bottomAnchor),
+            ])
+            menuBarHostingView = hosting
         }
-        // Status item stays variableLength (sizes to content — the idiomatic menu-bar
-        // behavior). Popover drift is prevented by freezing the title while the popover
-        // is open (see the title sink + popoverDidClose), not by pinning the width.
+        // Popover drift is prevented by freezing the value (and thus the width) while the
+        // popover is open (see the value sink + popoverDidClose), not by pinning a width.
 
         // Popover with SwiftUI content
         popover = NSPopover()
@@ -116,13 +114,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 guard let self = self, monthData != nil else { return }
                 // Single source of truth: store.menuBarValue (shared with the notch
                 // idle label) computes the per-tab string. Guard on monthData so a
-                // transient nil can never overwrite a good title with "…".
-                let display = " \(self.store.menuBarValue) "
-                self.latestMenuTitle = display
-                // Don't resize the status button while the popover is open — a resizing
+                // transient nil can never overwrite a good value with "…".
+                let value = self.store.menuBarValue
+                self.latestMenuText = value
+                // Don't resize the status item while the popover is open — a resizing
                 // anchor makes NSPopover creep left. popoverDidClose applies the latest.
                 if !self.popover.isShown {
-                    self.statusItem.button?.title = display
+                    self.menuBarModel.text = value
                 }
             }
 
@@ -174,6 +172,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .menubar:
             notchController?.stop()
             notchController = nil
+            // Flush any value deferred while in notch mode and restore the width.
+            menuBarModel.text = latestMenuText
+            statusItem.length = lastMenuBarWidth
             statusItem.isVisible = true
         case .notch:
             statusItem.isVisible = false
@@ -187,6 +188,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 controller.start()
             }
         }
+    }
+
+    /// The SwiftUI menu-bar content measured a new intrinsic width — size the status
+    /// item to it. Frozen while the popover is open (a resizing anchor drifts the
+    /// popover left); popoverDidClose restores lastMenuBarWidth. Only the value text
+    /// changes width — the spinning mark and the dot never do — so this fires only on
+    /// value changes, which are already deferred while the popover is open.
+    private func updateMenuBarWidth(_ w: CGFloat) {
+        let width = max(20, w)
+        lastMenuBarWidth = width
+        guard store.displayMode == .menubar, !popover.isShown else { return }
+        statusItem.length = width
     }
 
     // Called when user opens the app again (double-click, Spotlight, Launchpad, etc.)
@@ -205,7 +218,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // NSPopoverDelegate: the title may have changed (data refresh or tab switch) while
     // the popover was open and we deferred it to keep the anchor stable. Apply it now.
     func popoverDidClose(_ notification: Notification) {
-        statusItem.button?.title = latestMenuTitle
+        // Apply the value we deferred while open, then restore the width (the value
+        // change re-measures asynchronously; set the known width now to avoid a blip).
+        menuBarModel.text = latestMenuText
+        if store.displayMode == .menubar {
+            statusItem.length = lastMenuBarWidth
+        }
         store.setSessionMonitorActive(false)
     }
 
@@ -337,4 +355,60 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             store.refresh()
         }
     }
+}
+
+// MARK: - Menu-bar status-item content (SwiftUI)
+
+/// Holds the current menu-bar value string. AppDelegate is the sole writer (it defers
+/// updates while the popover is open); the hosting view re-renders on change.
+final class MenuBarModel: ObservableObject {
+    @Published var text: String
+    init(text: String) { self.text = text }
+}
+
+/// Reports the intrinsic width of the menu-bar content up to AppDelegate so it can
+/// size the (manually-lengthed) status item.
+private struct MenuBarWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        let n = nextValue()
+        if n > 0 { value = n }
+    }
+}
+
+/// The status-item content: the session-aware Claude mark (spins while busy, carries
+/// the amber/green attention dot) + the current value. The mark is brand orange
+/// (`.ccBrand`) — the SAME single color scheme as the notch and popover header, no
+/// per-surface variants. The value text stays `.primary` (adaptive) for menu-bar
+/// legibility, mirroring the notch's orange-mark + neutral-value pairing.
+struct MenuBarContentView: View {
+    @ObservedObject var sessionStore: SessionStore
+    @ObservedObject var model: MenuBarModel
+    var onWidth: (CGFloat) -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            SessionAwareClaudeLogo(sessionStore: sessionStore,
+                                   size: 16, color: .ccBrand, dotSize: 5)
+            Text(model.text)
+                .font(.system(size: 13))
+                .monospacedDigit()
+                .foregroundColor(.primary)
+                .fixedSize()
+        }
+        .padding(.horizontal, 6)
+        .fixedSize()
+        // Measure the intrinsic (fixedSize) content — NOT the button fill — so
+        // resizing the status item to this width can't feed back into the measurement.
+        .background(GeometryReader { geo in
+            Color.clear.preference(key: MenuBarWidthKey.self, value: geo.size.width)
+        })
+        .onPreferenceChange(MenuBarWidthKey.self) { onWidth($0) }
+    }
+}
+
+/// NSHostingView that lets every mouse event fall through to the status-bar button
+/// beneath it, so clicks still toggle the popover (the content is presentational).
+final class PassthroughStatusHostingView<Content: View>: NSHostingView<Content> {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
