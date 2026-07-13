@@ -137,9 +137,6 @@ struct CompactNotchView: View {
     @ObservedObject var sessionStore: SessionStore
     var notchWidth: CGFloat
     var notchHeight: CGFloat
-    /// Passed down from NotchRootView (the same source the rest of the notch reads).
-    /// When true the logo NEVER spins — it breathes (slow opacity) while busy instead.
-    var reduceMotion: Bool = false
 
     /// Icon block width = outerPad + icon(16) + innerPad. Kept in sync with the layout
     /// below so NotchRootView can compute the gap-centering offset.
@@ -147,72 +144,12 @@ struct CompactNotchView: View {
     static let innerPad: CGFloat = 10
     static let outerPad: CGFloat = 14
 
-    /// Logo spin speed: ~one revolution per 1.4s (degrees per second).
-    private static let spinDegreesPerSecond: Double = 360.0 / 1.4
-    /// Reduce-motion "breathe" full cycle length (seconds).
-    private static let breathePeriod: Double = 2.6
-
-    /// The brand-orange Claude mark at a fixed 16×16. Rotation / opacity is layered
-    /// on per state below; the badge dot overlays the FIXED box (not the rotating
-    /// shape), so the dot stays put while the logo spins.
-    private var logoMark: some View {
-        ClaudeLogoShape()
-            .fill(Color.ccBrand)
-            .frame(width: 16, height: 16)
-    }
-
-    /// Drives the logo: spins continuously ONLY while busy && !reduceMotion (the
-    /// TimelineView is torn down otherwise → no animation / CPU when idle, and no
-    /// repeatForever "unwind" jump on stop — it just renders static). Under
-    /// reduceMotion+busy it breathes opacity instead of spinning; idle is static.
-    @ViewBuilder private var animatedLogo: some View {
-        if sessionStore.anyBusy && !reduceMotion {
-            TimelineView(.animation) { ctx in
-                let angle = (ctx.date.timeIntervalSinceReferenceDate * Self.spinDegreesPerSecond)
-                    .truncatingRemainder(dividingBy: 360)
-                logoMark.rotationEffect(.degrees(angle))
-            }
-        } else if sessionStore.anyBusy && reduceMotion {
-            TimelineView(.animation) { ctx in
-                let t = ctx.date.timeIntervalSinceReferenceDate
-                let phase = (sin(2 * Double.pi * t / Self.breathePeriod) + 1) / 2  // 0…1
-                logoMark.opacity(0.55 + 0.45 * phase)
-            }
-        } else {
-            logoMark
-        }
-    }
-
-    /// Attention-dot color by PRIORITY: amber (a session needs your confirmation/
-    /// input) outranks green (a turn just finished, unseen). nil → no dot. Static
-    /// (no pulse), and independent of the spin (both may co-occur).
-    private var dotColor: Color? {
-        if sessionStore.anyWaiting {
-            return Color.ccStatusWaiting
-        }
-        if sessionStore.anyDoneUnseen {
-            return .green
-        }
-        return nil
-    }
-
     var body: some View {
         HStack(spacing: 0) {
-            animatedLogo
-                .frame(width: 16, height: 16)   // fixed box → stable overlay anchor
-                .overlay(alignment: .topTrailing) {
-                    if let c = dotColor {
-                        Circle()
-                            .fill(c)
-                            .frame(width: 5, height: 5)
-                            // Thin light ring so the dot reads against BOTH the dark
-                            // notch and the orange logo it partly overlaps.
-                            .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 0.8))
-                            // Hug the top-right corner; small offset keeps the ring
-                            // inside the pill even at the synthetic notch's min height.
-                            .offset(x: 1.5, y: -1.5)
-                    }
-                }
+            // Brand-orange mark: spins while any session is busy, carries the amber/
+            // green attention dot. Shared with the popover header and menu-bar icon.
+            SessionAwareClaudeLogo(sessionStore: sessionStore,
+                                   size: 16, color: .ccBrand, dotSize: 5)
                 .padding(.leading, Self.outerPad)
                 .padding(.trailing, Self.innerPad)
 
@@ -295,8 +232,7 @@ struct NotchRootView: View {
                 CompactNotchView(store: store,
                                  sessionStore: sessionStore,
                                  notchWidth: vm.closedNotchSize.width,
-                                 notchHeight: vm.closedNotchSize.height,
-                                 reduceMotion: reduceMotion)
+                                 notchHeight: vm.closedNotchSize.height)
             }
         }
         // SHARED black (and measurement) — one continuous shape under both states, so

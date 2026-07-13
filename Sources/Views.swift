@@ -119,9 +119,10 @@ struct PopoverView: View {
             // ── Header ──
             HStack {
                 HStack(spacing: 6) {
-                    ClaudeLogoShape()
-                        .fill(Color.ccBrand)
-                        .frame(width: 14, height: 14)
+                    // Inherits the notch/menu-bar mark's behavior: spins while a
+                    // session is busy, shows the amber/green attention dot.
+                    SessionAwareClaudeLogo(sessionStore: store.sessionStore,
+                                           size: 14, color: .ccBrand, dotSize: 5)
                     Text(loc("title"))
                         .font(.system(size: 13, weight: .bold))
                         .foregroundColor(.primary)

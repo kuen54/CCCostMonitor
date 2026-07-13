@@ -55,6 +55,87 @@ struct ClaudeLogoShape: Shape {
     }
 }
 
+// ── Session-aware Claude logo (shared: notch pill · popover header · menu bar) ──
+//
+// The Claude mark that SPINS while any live session is busy (breathes under
+// reduce-motion instead) and carries the attention dot at its top-trailing corner:
+// amber = a session is waiting for input, green = a turn finished unseen (amber
+// outranks green; nil → no dot). This "is Claude working / does it want me" cue
+// used to live only in the notch's CompactNotchView — extracting it here lets the
+// popover header and the menu-bar icon render the exact same behavior.
+struct SessionAwareClaudeLogo: View {
+    @ObservedObject var sessionStore: SessionStore
+    /// Logo edge length in points. The dot diameter/offset are passed separately.
+    var size: CGFloat = 16
+    /// Fill for the mark. Brand orange in the notch/popover; `.primary` in the menu
+    /// bar so it stays monochrome and follows the light/dark menu-bar appearance.
+    var color: Color = .ccBrand
+    var dotSize: CGFloat = 5
+
+    // Own reduce-motion source (the notch tracks it separately for its open/close
+    // spring; both observe the same workspace notification, so they never disagree).
+    @State private var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+
+    /// ~one revolution per 1.4s (the notch's original speed).
+    private static let spinDegreesPerSecond: Double = 360.0 / 1.4
+    /// Reduce-motion "breathe" full cycle length (seconds).
+    private static let breathePeriod: Double = 2.6
+
+    private var logoMark: some View {
+        ClaudeLogoShape().fill(color).frame(width: size, height: size)
+    }
+
+    /// Spins continuously ONLY while busy && !reduceMotion (the TimelineView is torn
+    /// down otherwise → no animation / CPU when idle, and no repeatForever "unwind"
+    /// jump on stop — it just renders static). Under reduceMotion+busy it breathes
+    /// opacity instead of spinning; idle is static.
+    @ViewBuilder private var animatedLogo: some View {
+        if sessionStore.anyBusy && !reduceMotion {
+            TimelineView(.animation) { ctx in
+                let angle = (ctx.date.timeIntervalSinceReferenceDate * Self.spinDegreesPerSecond)
+                    .truncatingRemainder(dividingBy: 360)
+                logoMark.rotationEffect(.degrees(angle))
+            }
+        } else if sessionStore.anyBusy && reduceMotion {
+            TimelineView(.animation) { ctx in
+                let t = ctx.date.timeIntervalSinceReferenceDate
+                let phase = (sin(2 * Double.pi * t / Self.breathePeriod) + 1) / 2  // 0…1
+                logoMark.opacity(0.55 + 0.45 * phase)
+            }
+        } else {
+            logoMark
+        }
+    }
+
+    /// Attention-dot color by PRIORITY: amber (needs your input) outranks green (a
+    /// turn just finished, unseen). Static (no pulse), independent of the spin.
+    private var dotColor: Color? {
+        if sessionStore.anyWaiting { return .ccStatusWaiting }
+        if sessionStore.anyDoneUnseen { return .green }
+        return nil
+    }
+
+    var body: some View {
+        animatedLogo
+            .frame(width: size, height: size)   // fixed box → stable overlay anchor
+            .overlay(alignment: .topTrailing) {
+                if let c = dotColor {
+                    Circle()
+                        .fill(c)
+                        .frame(width: dotSize, height: dotSize)
+                        // Thin light ring so the dot reads against a dark notch/menu
+                        // bar and the mark it partly overlaps.
+                        .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 0.8))
+                        .offset(x: dotSize * 0.3, y: -dotSize * 0.3)
+                }
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+                for: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification)) { _ in
+                reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            }
+    }
+}
+
 // ── Proportion bar (generic — works for cost or tokens) ──
 struct ProportionBar: View {
     let segments: [(color: Color, fraction: CGFloat)]

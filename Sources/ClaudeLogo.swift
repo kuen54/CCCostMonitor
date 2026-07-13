@@ -6,11 +6,12 @@ import SwiftUI
 // Official Claude logo SVG path from SimpleIcons (https://simpleicons.org/?q=claude),
 // CC0 licensed, viewBox 0 0 24 24 (y axis top-down, SVG convention).
 //
-// Rendered in three places, all from this one command list:
-//   - menu-bar template image (AppDelegate.makeClaudeIcon, NSBezierPath)
-//   - popover header (Views.ClaudeLogoShape, SwiftUI Path)
-//   - app icon generator (generate_icon.swift — compiled STANDALONE by build.sh
-//     together with this file, so keep imports to what both contexts tolerate)
+// Rendered in two shapes from this one command list:
+//   - SwiftUI Path (ClaudeLogoShape) — used by the popover header, the notch, AND
+//     the menu-bar icon, all via the shared SessionAwareClaudeLogo view
+//   - NSBezierPath — the app icon generator (generate_icon.swift, compiled
+//     STANDALONE by build.sh together with this file, so keep imports to what both
+//     contexts tolerate)
 enum ClaudeLogo {
     enum Command {
         case move(CGFloat, CGFloat)
