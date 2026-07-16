@@ -58,12 +58,12 @@ This app reads all your local session data and puts it in one place. One menu ba
   - **Month** — the same timeline, one row per week of the month
   - **Year** — a GitHub-style activity heatmap
 - **Sessions** — a live list of your running Claude Code sessions, grouped by folder. Each row shows a status dot (working / waiting for input / just-finished / idle), the session's title, and its latest prompt. **Click a row to jump straight to that session's terminal window** — pinpointing the exact pane/tab for Otty, Terminal and iTerm, with an honest *bring-the-app-forward* fallback elsewhere. The **Claude icon spins while any session is working** — in the menu bar, the notch, *and* the expanded popover's header — and carries an attention dot (amber = waiting for input, green = just finished, unseen) until you look
-- **Subscription quota** (Pro / Max) — dedicated tab showing how much is *left* in the 5-hour and 7-day windows, plus per-model weekly caps (e.g. **Fable**), each with reset countdowns. Live from Anthropic's official usage endpoint — the same source Claude Code's `/usage` uses
+- **Subscription quota** (Pro / Max) — dedicated tab showing how much is *left* in the 5-hour and 7-day windows, plus per-model weekly caps (e.g. **Fable**), each with reset countdowns. From Anthropic's official usage endpoint — the same source Claude Code's `/usage` uses — refreshed on demand with **⌘R** (auto-refreshes are cached briefly)
 - **Today / This Week / This Month** — token distribution by type (input, output, cache read, cache write)
 - **Daily bar chart** — hover for details
 - **Month navigation** — browse past months, cached locally
 - **4 languages** — English, 简体中文, 繁體中文, 日本語
-- **Auto-refresh** — watches your session logs and updates within seconds of real usage (rate-limited to once per 2 min), with a 30-min fallback timer + refresh on screen wake
+- **Auto-refresh** — watches your session logs and updates within seconds of real usage (rate-limited to once per 2 min), with a 30-min fallback timer + refresh on screen wake. **⌘R** (the footer refresh button) forces a full rescan on demand, bypassing that rate limit — and pulls **live** subscription quota straight from Anthropic, skipping the ~5-min quota cache
 - **Menu bar only** — no Dock icon, click app again to show popover
 - **Notch mode** — optionally move the display into the notch: an idle pill that hover-expands into the full popover, on every display (synthetic notch on externals), hiding for fullscreen and returning with the menu bar. *Enable from the **⋯** menu in the popover footer → Display location → Notch*
 
@@ -121,7 +121,7 @@ The app shells out to a bundled Python script that scans `~/.claude/projects/**/
     → SwiftUI popover
 ```
 
-The **Subscription** tab is separate: it calls Anthropic's OAuth usage endpoint directly (no local logs involved). The access token is read from `~/.claude/.credentials.json` or — the default on macOS — the login **Keychain** (`Claude Code-credentials`). macOS may prompt for Keychain access on first use; choose *Always Allow* (the grant is bound to the system `security` tool, so it persists across app updates and rebuilds). API-key users (Bedrock / Vertex / Console) have no subscription quota, so the tab is hidden for them.
+The **Subscription** tab is separate: it calls Anthropic's OAuth usage endpoint directly (no local logs involved). The quota is cached for ~5 minutes — auto-refreshes are served from that cache, while **⌘R** bypasses it to pull live numbers on demand. On this tab the footer's *Updated* time reflects when the quota itself was last fetched (not the local log scan), and if a refresh fails or the token is rejected the last-known numbers stay on screen with an inline warning rather than being silently shown as current. The access token is read from `~/.claude/.credentials.json` or — the default on macOS — the login **Keychain** (`Claude Code-credentials`). macOS may prompt for Keychain access on first use; choose *Always Allow* (the grant is bound to the system `security` tool, so it persists across app updates and rebuilds). API-key users (Bedrock / Vertex / Console) have no subscription quota, so the tab is hidden for them.
 
 ### Project structure
 
@@ -131,11 +131,12 @@ No Xcode project — the app is compiled with plain `swiftc`. `Package.swift` ex
 Sources/                    ← 35 Swift files
   main.swift                  ← entry point (single-instance check + bootstrap)
   AppDelegate.swift           ← menu bar item + title, popover, refresh timers, FSEvents watcher
-  UsageStore.swift            ← published state + refresh orchestration
+  UsageStore.swift            ← published usage state + refresh orchestration
+  SessionStore.swift          ← live-session state (@Published) + monitor/jumper wiring
   UsageArchive.swift          ← durable local history (survives Claude Code cleanup)
   UsageScriptClient.swift     ← runs the bundled Python script
   QuotaService.swift          ← subscription quota (OAuth) + Keychain access
-  Views.swift                 ← UI (popover, charts)
+  Views*.swift                ← UI: popover, cards, charts, menus (Views.swift + Views_Common/Cards/Menus/Plan/Session/Time)
   NotchController.swift       ← notch panels: geometry, lifecycle, hover/fullscreen
   NotchView.swift             ← notch SwiftUI layer (compact pill ↔ popover)
   SessionMonitor.swift        ← watches ~/.claude/sessions: liveness, titles, done-unseen
@@ -204,12 +205,12 @@ Claude Code 的 `/cost` 只显示当前会话。如果你有多个 Anthropic 账
   - **月视图** — 同样的时间轴，每行是该月的一周
   - **年视图** — GitHub 风格的活跃度热力图
 - **会话（Sessions）** — 实时列出正在运行的 Claude Code 会话，按文件夹分组。每行显示状态点（处理中 / 等待输入 / 刚完成 / 空闲）、会话标题和最近一条指令。**点击任意一行即可跳转到该会话所在的终端窗口** —— Otty、Terminal、iTerm 能精确定位到具体的 pane/标签页，其它终端则诚实地回退为「把 app 切到前台」。只要有会话在处理，**Claude 图标就会持续旋转**——菜单栏、刘海、以及展开弹窗左上角的 header 图标都会——并显示一个提醒圆点（琥珀=等待输入，绿色=刚完成且未查看），直到你查看为止
-- **订阅剩余用量**（Pro / Max）— 独立 tab，查看 5 小时 / 7 天窗口，以及各模型每周限额（如 **Fable**）**还剩多少**及重置倒计时。数据来自 Anthropic 官方用量接口 —— 与 Claude Code `/usage` 同源
+- **订阅剩余用量**（Pro / Max）— 独立 tab，查看 5 小时 / 7 天窗口，以及各模型每周限额（如 **Fable**）**还剩多少**及重置倒计时。数据来自 Anthropic 官方用量接口 —— 与 Claude Code `/usage` 同源 —— 用 **⌘R** 按需刷新（自动刷新走短时缓存）
 - **今日 / 本周 / 本月** — 按类型拆分 token（输入、输出、缓存读、缓存写）
 - **每日柱状图** — 悬浮查看详情
 - **月份导航** — 浏览历史月份，本地缓存
 - **4 种语言** — English、简体中文、繁體中文、日本語
-- **自动刷新** — 监听本地会话日志，实际使用后数秒内更新（限速为每 2 分钟最多一次），另有 30 分钟兜底定时器 + 屏幕唤醒后刷新
+- **自动刷新** — 监听本地会话日志，实际使用后数秒内更新（限速为每 2 分钟最多一次），另有 30 分钟兜底定时器 + 屏幕唤醒后刷新。**⌘R**（footer 刷新按钮）可按需强制全量重扫、绕过该限速 —— 并直接向 Anthropic 拉取**实时**订阅配额，跳过约 5 分钟的配额缓存
 - **仅菜单栏** — 无 Dock 图标，再次点击 app 可唤出弹窗
 - **刘海模式（Notch）** — 可选把显示移到屏幕刘海：平时是贴着刘海的悬浮小条，hover 展开成完整弹窗；外接屏也有（合成刘海），全屏时自动隐藏、hover 顶部唤出菜单栏时随之出现。*在弹窗底部 **⋯** 菜单 → 显示位置 → 刘海 开启*
 
@@ -265,7 +266,7 @@ open build/CCCostMonitor.app
     → SwiftUI 弹窗
 ```
 
-**订阅** tab 走的是另一条路：直接调用 Anthropic 的 OAuth 用量接口（不读本地日志）。访问 token 从 `~/.claude/.credentials.json` 读取，或——在 macOS 上的默认情况——从登录**钥匙串**（`Claude Code-credentials`）读取。首次使用时 macOS 可能弹出钥匙串授权框，请选择*始终允许*（授权绑定在系统 `security` 工具上，升级或重新构建 app 都不会失效）。API-key 用户（Bedrock / Vertex / Console）没有订阅限额，该 tab 对他们隐藏。
+**订阅** tab 走的是另一条路：直接调用 Anthropic 的 OAuth 用量接口（不读本地日志）。配额结果带约 5 分钟缓存 —— 自动刷新命中缓存，而 **⌘R** 会绕过缓存按需拉取实时数字。在该 tab，footer 的*更新*时间反映的是**配额自身最后一次抓取的时刻**（而非本地日志扫描时刻）；若刷新失败或 token 被拒，上次已知的数字会连同内联警告继续显示，而不会被当作当前值静默呈现。访问 token 从 `~/.claude/.credentials.json` 读取，或——在 macOS 上的默认情况——从登录**钥匙串**（`Claude Code-credentials`）读取。首次使用时 macOS 可能弹出钥匙串授权框，请选择*始终允许*（授权绑定在系统 `security` 工具上，升级或重新构建 app 都不会失效）。API-key 用户（Bedrock / Vertex / Console）没有订阅限额，该 tab 对他们隐藏。
 
 ### 项目结构
 
@@ -275,11 +276,12 @@ open build/CCCostMonitor.app
 Sources/                    ← 35 个 Swift 文件
   main.swift                  ← 入口（单实例检测 + 启动引导）
   AppDelegate.swift           ← 菜单栏图标与标题、弹窗、刷新定时器、FSEvents 监听
-  UsageStore.swift            ← 状态发布 + 刷新编排
+  UsageStore.swift            ← 用量状态发布 + 刷新编排
+  SessionStore.swift          ← 实时会话状态（@Published）+ monitor/jumper 接线
   UsageArchive.swift          ← 本地用量归档（对抗 Claude Code 清理）
   UsageScriptClient.swift     ← 调用内置 Python 脚本
   QuotaService.swift          ← 订阅配额（OAuth）+ 钥匙串读取
-  Views.swift                 ← UI（弹窗、图表）
+  Views*.swift                ← UI：弹窗、卡片、图表、菜单（Views.swift + Views_Common/Cards/Menus/Plan/Session/Time）
   NotchController.swift       ← 刘海面板：几何、生命周期、hover/全屏
   NotchView.swift             ← 刘海 SwiftUI 层（小条 ↔ 弹窗）
   SessionMonitor.swift        ← 监听 ~/.claude/sessions：存活检测、标题、done-unseen
