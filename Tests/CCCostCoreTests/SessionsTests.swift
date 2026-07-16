@@ -102,6 +102,23 @@ import Testing
         #expect(SessionLogic.listable(weird) == false)
     }
 
+    @Test func listableExcludesBackgroundForks() {
+        // A `--fork-session` background job (kind "bg", run under the bg-pty-host
+        // daemon) forks another session's transcript → same title → it renders as
+        // a visual duplicate of its interactive parent, and has no terminal to jump
+        // to. It must NOT list even though it's a busy cli session.
+        let bg = SessionInfo(pid: 1, sessionId: "a", cwd: "/x", status: .busy,
+                             kind: "bg", entrypoint: "cli")
+        let interactive = SessionInfo(pid: 2, sessionId: "b", cwd: "/x", status: .busy,
+                                      kind: "interactive", entrypoint: "cli")
+        #expect(SessionLogic.listable(bg) == false)
+        #expect(SessionLogic.listable(interactive) == true)
+        // A nil/absent kind (older Claude Code, predates the field) STILL lists —
+        // the filter excludes only the known background kind, never a real session.
+        let noKind = SessionInfo(pid: 3, sessionId: "c", cwd: "/x", status: .idle, entrypoint: "cli")
+        #expect(SessionLogic.listable(noKind) == true)
+    }
+
     // MARK: - grouping
 
     @Test func basenameCollisionKeepsDistinctGroups() {
@@ -139,6 +156,82 @@ import Testing
         let b = SessionInfo(pid: 2, sessionId: "b", cwd: "/x", status: .idle, updatedAt: 100, entrypoint: "cli")
         // Equal updatedAt → tiebreak on sessionId, so order is stable across inputs.
         #expect(SessionLogic.grouped([a, b]) == SessionLogic.grouped([b, a]))
+    }
+
+    // MARK: - Duplicate-session collapse
+
+    @Test func dedupKeepsFresherByUpdatedAt() {
+        // Same sessionId under two pid files (a lingering old file + the resumed
+        // one). The fresher registry write (higher updatedAt) is the current state.
+        let stale = SessionInfo(pid: 100, sessionId: "S", cwd: "/x", status: .busy,
+                                updatedAt: 100, entrypoint: "cli")
+        let fresh = SessionInfo(pid: 200, sessionId: "S", cwd: "/x", status: .idle,
+                                updatedAt: 500, entrypoint: "cli")
+        let out = SessionLogic.dedupBySessionId([stale, fresh])
+        #expect(out.count == 1)
+        #expect(out.first?.pid == 200)
+        #expect(out.first?.status == .idle)          // fresh state wins, not the stale busy
+        // Order-independent: same survivor regardless of input order.
+        #expect(SessionLogic.dedupBySessionId([fresh, stale]) == out)
+    }
+
+    @Test func dedupUsesMaxOfTimestampsAndHigherPidTiebreak() {
+        // A file that only bumped statusUpdatedAt still counts as fresh (max, not
+        // first-non-nil): `later` has no updatedAt but a newer statusUpdatedAt.
+        let earlier = SessionInfo(pid: 1, sessionId: "S", cwd: "/x", status: .idle,
+                                  updatedAt: 100, statusUpdatedAt: 100, entrypoint: "cli")
+        let later = SessionInfo(pid: 2, sessionId: "S", cwd: "/x", status: .waiting,
+                                updatedAt: nil, statusUpdatedAt: 300, entrypoint: "cli")
+        #expect(SessionLogic.dedupBySessionId([earlier, later]).first?.pid == 2)
+        // Equal freshness → higher pid (newer/resumed process) wins, deterministically.
+        let lo = SessionInfo(pid: 5, sessionId: "S", cwd: "/x", status: .idle,
+                             updatedAt: 100, entrypoint: "cli")
+        let hi = SessionInfo(pid: 9, sessionId: "S", cwd: "/x", status: .busy,
+                             updatedAt: 100, entrypoint: "cli")
+        #expect(SessionLogic.dedupBySessionId([lo, hi]).first?.pid == 9)
+        #expect(SessionLogic.dedupBySessionId([hi, lo]).first?.pid == 9)
+    }
+
+    @Test func dedupFreshnessBeatsPidWhenPidIsLower() {
+        // Isolate freshness from the pid tiebreak: the fresher entry has the LOWER
+        // pid, so a regression that picked purely by pid (ignoring recency) would
+        // fail here. Freshness must be the PRIMARY key.
+        let fresherLowPid = SessionInfo(pid: 2, sessionId: "S", cwd: "/x", status: .idle,
+                                        updatedAt: 900, entrypoint: "cli")
+        let stalerHighPid = SessionInfo(pid: 900, sessionId: "S", cwd: "/x", status: .busy,
+                                        updatedAt: 100, entrypoint: "cli")
+        let out = SessionLogic.dedupBySessionId([stalerHighPid, fresherLowPid])
+        #expect(out.count == 1)
+        #expect(out.first?.pid == 2)                 // recency wins despite the lower pid
+        #expect(out.first?.status == .idle)
+    }
+
+    @Test func dedupLeavesDistinctSessionsUntouched() {
+        let a = SessionInfo(pid: 1, sessionId: "a", cwd: "/x", status: .idle, updatedAt: 100, entrypoint: "cli")
+        let b = SessionInfo(pid: 2, sessionId: "b", cwd: "/y", status: .busy, updatedAt: 200, entrypoint: "cli")
+        let out = SessionLogic.dedupBySessionId([a, b])
+        #expect(out.count == 2)
+        #expect(out == [a, b])                       // first-appearance order preserved
+    }
+
+    @Test func dedupCollapsesEvenAcrossDifferentCwds() {
+        // Rare: same session resumed in a different directory. Still ONE session —
+        // collapse to the fresher, don't show it under two folder groups.
+        let inA = SessionInfo(pid: 1, sessionId: "S", cwd: "/x/a", status: .idle,
+                              updatedAt: 100, entrypoint: "cli")
+        let inB = SessionInfo(pid: 2, sessionId: "S", cwd: "/x/b", status: .busy,
+                              updatedAt: 200, entrypoint: "cli")
+        let out = SessionLogic.dedupBySessionId([inA, inB])
+        #expect(out.count == 1)
+        #expect(out.first?.cwd == "/x/b")
+        // Fed to grouped(), a deduped list yields exactly one row for the session.
+        #expect(SessionLogic.grouped(out).reduce(0) { $0 + $1.sessions.count } == 1)
+    }
+
+    @Test func dedupEmptyAndSingletonAreNoOps() {
+        #expect(SessionLogic.dedupBySessionId([]).isEmpty)
+        let only = SessionInfo(pid: 1, sessionId: "a", cwd: "/x", status: .idle, entrypoint: "cli")
+        #expect(SessionLogic.dedupBySessionId([only]) == [only])
     }
 
     // MARK: - Otty pane matching (Phase 4)
