@@ -181,12 +181,23 @@ enum SessionLogic {
     }
 
     /// Whether a registry-parsed session belongs in the live session list.
-    /// Excludes `claude -p` / SDK mode (entrypoint == "sdk-cli", which also omits
-    /// `status`): a listable entry is an interactive CLI session with a real
-    /// status. NOTE: app-synthesized fallback sessions (old Claude Code, status
-    /// .unknown) bypass this filter — it gates the registry only.
+    /// Excludes:
+    ///   - `claude -p` / SDK mode (`entrypoint == "sdk-cli"`, which also omits
+    ///     `status`): a listable entry is an interactive CLI session with a real
+    ///     status.
+    ///   - background forks (`kind == "bg"`): a session launched with
+    ///     `--fork-session --resume <other>.jsonl` and run under Claude Code's
+    ///     bg-pty-host daemon (a background-agent job). It forks another session's
+    ///     transcript, so it inherits that session's title and appears as a visual
+    ///     DUPLICATE of the interactive session it branched from — and it has no
+    ///     real terminal window (its parent is the daemon, not a terminal app), so
+    ///     it isn't a jumpable session either. Only the KNOWN "bg" kind is
+    ///     excluded; a nil/absent kind (older Claude Code that predates the field)
+    ///     still lists, so this can never hide a real interactive session.
+    /// NOTE: app-synthesized fallback sessions (old Claude Code, status .unknown)
+    /// bypass this filter — it gates the registry only.
     static func listable(_ s: SessionInfo) -> Bool {
-        s.entrypoint == "cli" && s.status != .unknown
+        s.entrypoint == "cli" && s.status != .unknown && s.kind != "bg"
     }
 
     /// Basename of a path ("/Users/x/proj" → "proj"). Empty/"/" fall back to the
@@ -228,6 +239,56 @@ enum SessionLogic {
         if a.anyBusy != b.anyBusy { return a.anyBusy }
         if a.mostRecentUpdate != b.mostRecentUpdate { return a.mostRecentUpdate > b.mostRecentUpdate }
         return a.cwd < b.cwd
+    }
+
+    // MARK: - Duplicate-session collapse
+
+    /// Collapse entries that share a `sessionId` down to ONE. The registry is keyed
+    /// by pid (`~/.claude/sessions/<pid>.json`), so a single logical session can be
+    /// present under two files at once — most often `claude --resume <id>` adopts
+    /// the session under a NEW pid while the previous pid's file still lingers (a
+    /// SIGKILL leaves it un-reaped and liveness hasn't reaped it yet), or the same
+    /// session is open in two windows. Left un-collapsed, both flow through as
+    /// SessionInfo with the SAME `id` (sessionId): the Session list's `ForEach` is
+    /// keyed on that id, so SwiftUI renders TWO rows for one session, each with its
+    /// own status dot derived from its own file → the dots visibly disagree. (It
+    /// also lets a stale `busy` file keep the notch/menu-bar `anyBusy` cue on.)
+    ///
+    /// Keep the entry that best reflects the session's CURRENT state: the most
+    /// recently touched registry file (`freshness`), tie-broken by the higher pid
+    /// (the newer/resumed process) so the pick is a TOTAL order and can't thrash
+    /// the @Published publish-guard between two equally-fresh files. Survivors keep
+    /// first-appearance order (the caller re-sorts anyway). Collapsing is always
+    /// safe: a sessionId is a UUID identifying ONE logical session, so two files
+    /// sharing it are never two different sessions.
+    static func dedupBySessionId(_ sessions: [SessionInfo]) -> [SessionInfo] {
+        var winner: [String: SessionInfo] = [:]
+        var order: [String] = []
+        for s in sessions {
+            if let cur = winner[s.sessionId] {
+                if isFresher(s, than: cur) { winner[s.sessionId] = s }
+            } else {
+                winner[s.sessionId] = s
+                order.append(s.sessionId)
+            }
+        }
+        return order.compactMap { winner[$0] }
+    }
+
+    /// True when `a` is a more current registry write than `b` for the same
+    /// session — the pick key in `dedupBySessionId`. Recency first (freshest file
+    /// wins), then higher pid as a deterministic total-order tiebreak.
+    static func isFresher(_ a: SessionInfo, than b: SessionInfo) -> Bool {
+        let af = freshness(a), bf = freshness(b)
+        if af != bf { return af > bf }
+        return a.pid > b.pid
+    }
+
+    /// Latest "touched" epoch (ms) for a session across its optional timestamps
+    /// (`max`, not first-non-nil, so a file that only bumped `statusUpdatedAt`
+    /// still counts as fresh); 0 when none are present.
+    static func freshness(_ s: SessionInfo) -> Double {
+        max(s.updatedAt ?? 0, s.statusUpdatedAt ?? 0, s.startedAt ?? 0)
     }
 
     // MARK: - Jump targeting (Phase 3) — pure helpers

@@ -353,8 +353,14 @@ final class SessionMonitor {
             oldHint = !synth.isEmpty
         }
 
+        // Collapse any duplicate-sessionId entries (the same logical session
+        // present under two pid files — `claude --resume` adopts it under a new
+        // pid while the old file lingers, or it's open in two windows) to ONE
+        // freshest entry BEFORE ordering, so the list can't render a session
+        // twice with disagreeing dots and targets/summaries below aren't doubled.
+        let unique = SessionLogic.dedupBySessionId(sessions)
         // Stable order so the Equatable publish-guard never thrashes.
-        let ordered = sessions.sorted { a, b in
+        let ordered = unique.sorted { a, b in
             a.cwd != b.cwd ? a.cwd < b.cwd : a.sessionId < b.sessionId
         }
         let labels = resolveLabels(for: ordered)
