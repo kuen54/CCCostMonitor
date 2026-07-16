@@ -299,6 +299,30 @@ final class SubscriptionQuotaService {
         return value
     }
 
+    /// Force a synchronous, LIVE token-presence probe, bypassing the 60s sticky
+    /// cache, and refresh that cache with the result. For a manual ⌘R so a
+    /// just-completed `claude login` / `logout` is reflected on this refresh
+    /// instead of up to 60s later. Attributes-only (no `-w`) → never prompts.
+    /// Called from the main thread on ⌘R, matching the existing first-ever probe.
+    @discardableResult
+    func probeTokenPresenceNow() -> Bool {
+        let value = CredentialStore.probeTokenPresence()
+        tokenPresenceLock.lock()
+        tokenPresenceCache = (value, Date())
+        tokenPresenceLock.unlock()
+        return value
+    }
+
+    /// When the currently-cached quota was fetched from the network (nil if never).
+    /// Both success paths — a live 200 and a cache-hit — serve `cached.quota`, and
+    /// the 200 path stamps `cached = (quota, Date())` before completing, so
+    /// `cached.at` is always the true retrieval time of what the UI is showing.
+    /// The footer reads this to show the Plan tab's real freshness.
+    var lastSuccessAt: Date? {
+        lock.lock(); defer { lock.unlock() }
+        return cached?.at
+    }
+
     // MARK: Token refresh (mirrors openusage / Claude Code's own OAuth refresh)
 
     private func needsRefresh(_ creds: OAuthCredentials) -> Bool {
