@@ -268,7 +268,19 @@ struct PopoverView: View {
     // ── Footer ──
     private var footer: some View {
         HStack(spacing: 12) {
-                if let time = store.lastUpdate, store.isCurrentMonth {
+                if store.selectedTab == .subscription {
+                    // The Plan tab shows OAuth quota, not the local JSONL scan, so
+                    // bind its OWN fetch time (`quotaUpdatedAt`) — never `lastUpdate`
+                    // (which is always "just now" after any scan) or the month-scoped
+                    // "cached data" label (quota isn't month-scoped). Nil until the
+                    // first successful fetch, in which case show nothing (the tab
+                    // itself renders a loading spinner).
+                    if let qt = store.quotaUpdatedAt {
+                        Text(String(format: loc("updated"), timeAgo(qt, loc)))
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                    }
+                } else if let time = store.lastUpdate, store.isCurrentMonth {
                     Text(String(format: loc("updated"),
                                 timeAgo(time, loc)))
                         .font(.system(size: 10.5))

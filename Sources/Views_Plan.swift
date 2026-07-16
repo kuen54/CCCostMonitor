@@ -124,6 +124,22 @@ struct SubscriptionView: View {
                     }
                     .padding(.horizontal, 2)
                 }
+                if store.quotaError != nil {
+                    // Last-known bars are showing, but the latest refresh failed or
+                    // the token was rejected. Surface it inline so the numbers
+                    // aren't silently trusted as current — paired with the footer's
+                    // real quota fetch time, the user sees "updated Nm ago" + why.
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                        Text(errorText)
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 2)
+                }
             } else if store.quotaError != nil {
                 stateMessage(icon: "exclamationmark.triangle", text: errorText)
             } else {

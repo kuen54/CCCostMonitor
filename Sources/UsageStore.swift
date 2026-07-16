@@ -102,6 +102,13 @@ class UsageStore: ObservableObject {
     /// Last non-success result for the quota fetch, if any. Used to show error hints
     /// (token expired, rate limited, network, schema change).
     @Published var quotaError: QuotaError?
+    /// When the currently-displayed quota was actually fetched from Anthropic's
+    /// endpoint (nil until the first success). The footer shows THIS on the Plan
+    /// tab instead of `lastUpdate` (which is the local JSONL scan time), so the
+    /// timestamp reflects the quota's real freshness — not the log scan's. Only
+    /// advanced on `.success`, so it correctly stays put (shows the old time)
+    /// while refreshes are failing.
+    @Published var quotaUpdatedAt: Date?
 
     var isCurrentMonth: Bool {
         let cal = AppDate.gregorian
@@ -233,7 +240,14 @@ class UsageStore: ObservableObject {
     /// Fast-paths for API-key users (no token): avoids unnecessary @Published churn and
     /// network calls. Safe to call repeatedly — the service caches for 5 minutes internally.
     func refreshQuota(force: Bool = false) {
-        let probedHasToken = SubscriptionQuotaService.shared.hasOAuthToken
+        // A manual ⌘R must re-check token presence LIVE: the `hasOAuthToken`
+        // getter serves a 60s-sticky probe cache, so right after `claude login`
+        // a forced refresh would otherwise short-circuit here and no-op for up to
+        // a minute. `probeTokenPresenceNow` bypasses that cache (attributes-only,
+        // never prompts). Auto refreshes stay on the cheap sticky probe.
+        let probedHasToken = force
+            ? SubscriptionQuotaService.shared.probeTokenPresenceNow()
+            : SubscriptionQuotaService.shared.hasOAuthToken
         if !probedHasToken {
             // API-key user. Only publish if state drifted (e.g. user ran `claude logout`).
             if hasOAuthToken || subscriptionQuota != nil || quotaError != nil {
@@ -251,14 +265,26 @@ class UsageStore: ObservableObject {
                 case .success(let quota):
                     if self.subscriptionQuota != quota { self.subscriptionQuota = quota }
                     if self.quotaError != nil { self.quotaError = nil }
+                    // Stamp the quota's true fetch time (the service returns the
+                    // same cached tuple on a cache-hit, so `lastSuccessAt` is the
+                    // real retrieval time of what we're now showing). Guarded so a
+                    // cache-hit — where the timestamp is unchanged — doesn't fire a
+                    // redundant publish.
+                    let fetchedAt = SubscriptionQuotaService.shared.lastSuccessAt
+                    if self.quotaUpdatedAt != fetchedAt { self.quotaUpdatedAt = fetchedAt }
                 case .noToken:
                     // Token disappeared between probe and fetch (user ran `claude logout`).
                     self.hasOAuthToken = false
                     self.subscriptionQuota = nil
                     self.quotaError = nil
                 case .unauthorized:
-                    self.subscriptionQuota = nil
-                    self.quotaError = .unauthorized
+                    // Keep any last-known quota visible (the Plan tab surfaces the
+                    // "run `claude login`" hint inline instead of blanking the
+                    // bars) — a transient/racy 401 shouldn't flash good→error→good.
+                    // `requestUsage` already retried once with a token refresh
+                    // before this reached us, so a recoverable token self-heals;
+                    // a real logout comes through `.noToken`, which does clear it.
+                    if self.quotaError != .unauthorized { self.quotaError = .unauthorized }
                 case .rateLimited:
                     // Keep any previously cached quota visible; just surface the error.
                     if self.quotaError != .rateLimited { self.quotaError = .rateLimited }
@@ -496,9 +522,12 @@ class UsageStore: ObservableObject {
     ///   real scan (manual ⌘R). Does NOT bypass isRefreshInFlight coalescing.
     func refresh(force: Bool = false) {
         // Refresh subscription quota in parallel (no-op for API-key users).
-        // It keeps its own independent 5-minute cache — unaffected by the
-        // JSONL fingerprint below.
-        refreshQuota()
+        // It keeps its own independent 5-minute cache (unaffected by the JSONL
+        // fingerprint below), so background/auto refreshes are served from that
+        // cache. A manual ⌘R (force) must bypass it to fetch live plan usage on
+        // demand — otherwise the Plan tab lags up to 5 min behind the website
+        // even when the user explicitly asks to refresh.
+        refreshQuota(force: force)
 
         // Backfill the durable archive before transcripts get pruned. Throttled
         // to ~every 6h (force/⌘R always runs); first call after launch sweeps
