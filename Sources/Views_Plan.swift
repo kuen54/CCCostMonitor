@@ -169,11 +169,28 @@ struct SubscriptionView: View {
     private var errorText: String {
         switch store.quotaError {
         case .unauthorized:    return loc("quotaTokenExpired")
-        case .rateLimited:     return loc("quotaRateLimited")
+        case .rateLimited:
+            // Show the concrete backoff so ⌘R being a no-op during the cooldown reads
+            // as "wait ~Nm" rather than a broken refresh. Fall back to the vague copy
+            // only if we somehow lack a deadline.
+            if let retryAt = store.quotaRetryAt, retryAt > Date() {
+                return String(format: loc("quotaRateLimitedRetry"), retryCountdown(retryAt))
+            }
+            return loc("quotaRateLimited")
         case .decodeFailure:   return loc("quotaDecodeFail")
         case .networkFailure, nil:
             return loc("quotaFetchFail")
         }
+    }
+
+    /// "<1m" / "56m" / "1h 2m" — coarse countdown for the rate-limit retry hint
+    /// (mirrors SubWindowRow.shortDuration; minute-granularity is plenty here).
+    private func retryCountdown(_ date: Date) -> String {
+        let s = max(0, date.timeIntervalSinceNow)
+        if s < 60 { return "<1m" }
+        if s < 3600 { return "\(Int(s / 60))m" }
+        let h = Int(s / 3600), m = Int((s.truncatingRemainder(dividingBy: 3600)) / 60)
+        return m > 0 ? "\(h)h \(m)m" : "\(h)h"
     }
 }
 

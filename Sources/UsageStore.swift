@@ -109,6 +109,10 @@ class UsageStore: ObservableObject {
     /// advanced on `.success`, so it correctly stays put (shows the old time)
     /// while refreshes are failing.
     @Published var quotaUpdatedAt: Date?
+    /// When the active 429 cooldown ends (nil unless rate-limited). Drives the Plan
+    /// tab's "Rate limited — retry in Nm" hint so the user knows why ⌘R is a no-op
+    /// during the cooldown, instead of the vague "retrying soon".
+    @Published var quotaRetryAt: Date?
 
     var isCurrentMonth: Bool {
         let cal = AppDate.gregorian
@@ -293,6 +297,14 @@ class UsageStore: ObservableObject {
                 case .decodeFailure:
                     if self.quotaError != .decodeFailure { self.quotaError = .decodeFailure }
                 }
+                // Mirror the service's 429 cooldown into a published deadline for the
+                // "retry in Nm" hint. Only rate-limited carries one; every other
+                // outcome (incl. a recovered success) clears it. Derived from the
+                // quotaError the switch just set, so it stays in lockstep.
+                let retryAt: Date? = self.quotaError == .rateLimited
+                    ? SubscriptionQuotaService.shared.rateLimitCooldownUntil
+                    : nil
+                if self.quotaRetryAt != retryAt { self.quotaRetryAt = retryAt }
             }
         }
     }
