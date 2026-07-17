@@ -234,6 +234,20 @@ final class SubscriptionQuotaService {
     private let url = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     private let ttl: TimeInterval = 300
     private var cached: (quota: OAuthUsage, at: Date)?
+    // After a 429, the absolute instant before which we must NOT re-hit the endpoint
+    // (honors the server's `Retry-After`). Guarded by `lock`, same as `cached`.
+    //
+    // This is the fix for the rate-limit death-spiral: `cached` is written only on a
+    // 200, so once the last success ages past `ttl`, the success-cache guard no longer
+    // short-circuits anything and EVERY refresh trigger (popover-open, FSEvents ~2min,
+    // notch hover, the 30-min timer, every ⌘R) re-pokes the throttled endpoint. Each
+    // poke returns a fresh, near-full `Retry-After`, so the window keeps resetting and
+    // never clears while the app is in use. Sitting out the cooldown lets it elapse.
+    //
+    // Distinct from the 5-min success cache: that is client-side freshness (⌘R may
+    // bypass it); this is a server-imposed hard limit (⌘R must respect it — forcing
+    // past it just resets the penalty clock).
+    private var rateLimitedUntil: Date?
     private let lock = NSLock()
 
     // Serial work queue: ALL credential load / token refresh / usage-fetch logic runs
@@ -323,6 +337,40 @@ final class SubscriptionQuotaService {
         return cached?.at
     }
 
+    /// When the active 429 cooldown ends, or nil if not rate-limited (or the cooldown
+    /// has already elapsed but no fetch has cleared it yet). The Plan tab reads this to
+    /// show a concrete "retry in Nm" instead of the vague "retrying soon".
+    var rateLimitCooldownUntil: Date? {
+        lock.lock(); defer { lock.unlock() }
+        guard let until = rateLimitedUntil, until > Date() else { return nil }
+        return until
+    }
+
+    /// Turn a 429 `Retry-After` into an absolute deadline. The header is delta-seconds
+    /// (what Anthropic sends, e.g. "3367") or, per RFC 7231, an HTTP-date. Absent or
+    /// unparseable → `defaultCooldown` so we ALWAYS back off something. Capped at 1h so
+    /// a pathological header can't freeze the quota indefinitely (an early retry just
+    /// re-429s and re-arms the cooldown, self-correcting).
+    private static func retryDeadline(from http: HTTPURLResponse?,
+                                      default defaultCooldown: TimeInterval) -> Date {
+        let now = Date()
+        let cap: TimeInterval = 3600
+        if let raw = http?.value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespaces), !raw.isEmpty {
+            if let secs = TimeInterval(raw) {
+                return now.addingTimeInterval(min(cap, max(0, secs)))
+            }
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.timeZone = TimeZone(identifier: "GMT")
+            fmt.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+            if let d = fmt.date(from: raw), d > now {
+                return min(d, now.addingTimeInterval(cap))
+            }
+        }
+        return now.addingTimeInterval(defaultCooldown)
+    }
+
     // MARK: Token refresh (mirrors openusage / Claude Code's own OAuth refresh)
 
     private func needsRefresh(_ creds: OAuthCredentials) -> Bool {
@@ -393,6 +441,17 @@ final class SubscriptionQuotaService {
                 DispatchQueue.main.async { completion(.success(q)) }
                 return
             }
+            // Server-imposed 429 cooldown: sit it out WITHOUT a request — even for a
+            // forced ⌘R. forceRefresh only bypasses the success cache above (client
+            // freshness); re-poking a throttled endpoint returns a fresh full
+            // Retry-After and resets the window, which is exactly the death-spiral we
+            // are fixing. Re-serve `.rateLimited` so the UI keeps last-known bars + the
+            // "retry in Nm" hint.
+            if let until = self.rateLimitedUntil, Date() < until {
+                self.lock.unlock()
+                DispatchQueue.main.async { completion(.rateLimited) }
+                return
+            }
             self.lock.unlock()
 
             self.pendingCompletions.append(completion)
@@ -459,6 +518,7 @@ final class SubscriptionQuotaService {
                     }
                     self.lock.lock()
                     self.cached = (quota, Date())
+                    self.rateLimitedUntil = nil   // recovered — drop any 429 cooldown
                     self.lock.unlock()
                     completion(.success(quota))
                 case 401, 403:
@@ -474,6 +534,13 @@ final class SubscriptionQuotaService {
                         completion(.unauthorized)
                     }
                 case 429:
+                    // Arm the cooldown from Retry-After BEFORE completing, so any
+                    // fetch that starts right after (or a joined single-flight caller
+                    // re-triggering) sees it and short-circuits instead of re-poking.
+                    let deadline = Self.retryDeadline(from: http, default: 60)
+                    self.lock.lock()
+                    self.rateLimitedUntil = deadline
+                    self.lock.unlock()
                     completion(.rateLimited)
                 default:
                     completion(.networkFailure)
