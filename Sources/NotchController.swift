@@ -18,9 +18,12 @@ import Combine
 //
 // Fullscreen: each panel joins a private SkyLight space so it CAN ride over fullscreen
 // apps, but on a screen running a native-fullscreen app the pill behaves like the menu
-// bar — HIDDEN by default (alpha 0), REVEALED (alpha 1) only while the cursor is in the
-// top reveal band (the same gesture that slides the menu bar down), then it can be
-// hover-expanded as usual. On a normal desktop the idle pill is always visible.
+// bar — HIDDEN by default (alpha 0), REVEALED (alpha 1) only AFTER the cursor pushes the
+// very top edge (the gesture that slides the menu bar down) and while it then stays in
+// the menu-bar band, at which point it can be hover-expanded as usual. Merely entering
+// the band is NOT enough: a fullscreen window owns that band (a browser's tab strip lives
+// exactly there), so reacting to it would reveal + expand over content the user is
+// aiming at. On a normal desktop the idle pill is always visible and always hoverable.
 //
 // Main-thread only (a plain NSObject, like AppDelegate). macOS 13 safe — no macOS-14
 // APIs. Adapted from TheBoredTeam/boring.notch + MacroVisionKit + MrKai77/DynamicNotchKit.
@@ -195,6 +198,12 @@ final class NotchInstance {
     /// Whether this display currently runs a native-fullscreen app (drives the
     /// hide-unless-revealed behavior). Updated on activeSpaceDidChange + rebuild.
     var isFullscreen = false
+    /// FULLSCREEN ONLY: has the cursor performed the menu-bar summon gesture (touched the
+    /// very top edge) and not yet left the menu-bar band? Gates both the pill's reveal and
+    /// its hover-expand there, so a fullscreen window's own top chrome (browser tabs) stays
+    /// reachable. Always false / ignored on a normal desktop, where the pill is visible and
+    /// hovering it must open it. Reset whenever the display's fullscreen state flips.
+    var revealArmed = false
     var openWork: DispatchWorkItem?
     var closeWork: DispatchWorkItem?
     /// Re-applies mouse gating whenever the measured popover size changes, so the clickable
@@ -229,6 +238,16 @@ final class NotchController: NSObject {
     /// Idle hover zone = notch width plus a shoulder each side (so hovering the icon /
     /// value, which sit just outside the physical notch, also opens it).
     private let hoverShoulder: CGFloat = 84
+    /// Thickness of the hot edge at the very top of a fullscreen screen. Touching it is
+    /// the same push that slides the system menu bar down, and it is what ARMS the pill
+    /// there. Deliberately a thin strip — NOT the whole menu-bar band — because in
+    /// fullscreen the band belongs to the app: on a non-notched display the window covers
+    /// the screen outright, so a browser's tab strip sits in it (measured: 30pt band, tabs
+    /// ~40pt tall → aiming at a tab lands ~20pt down, nowhere near this strip). Thin enough
+    /// to never catch a tab, thick enough to be an easy landing strip for a deliberate shove
+    /// (the cursor DOES reach frame.maxY exactly, but overshooting onto a display stacked
+    /// above must not be the only way to arm).
+    private let revealEdge: CGFloat = 8
 
     /// One instance per display, keyed by its stable CGDirectDisplayID.
     private var instances: [CGDirectDisplayID: NotchInstance] = [:]
@@ -364,17 +383,72 @@ final class NotchController: NSObject {
 
     private func refreshFullscreenStates() {
         for inst in instances.values {
+            let wasFullscreen = inst.isFullscreen
             inst.isFullscreen = inst.screen.screen.displayUUID
                 .map { FullscreenDetector.shared.isFullscreen(displayUUID: $0) } ?? false
+            // Entering/leaving fullscreen with the cursor parked anywhere must not inherit
+            // a stale arm — a screen that just went fullscreen starts hidden until the user
+            // performs the summon gesture again.
+            if inst.isFullscreen != wasFullscreen { inst.revealArmed = false }
         }
     }
 
     /// The menu-bar reveal band at the very top of a screen (full width). In fullscreen
-    /// the pill rides this band, so a hover-to-top brings it back together with the menu bar.
+    /// the pill rides this band, so once armed it stays revealed with the menu bar for as
+    /// long as the cursor is in it.
     private func revealRect(_ ns: NotchScreen) -> NSRect {
         let f = ns.screen.frame
         let band = max(ns.closedNotchSize.height, 24)
         return NSRect(x: f.minX, y: f.maxY - band, width: f.width, height: band)
+    }
+
+    /// The hot edge at the very top of a screen (full width, `revealEdge` thick).
+    private func edgeRect(_ ns: NotchScreen) -> NSRect {
+        let f = ns.screen.frame
+        return NSRect(x: f.minX, y: f.maxY - revealEdge, width: f.width, height: revealEdge)
+    }
+
+    /// Mouse hit-test that counts a rect's TOP edge as inside — AppKit's unflipped
+    /// `NSMouseInRect` convention (`minY < y <= maxY`), NOT `NSRect.contains`, which is
+    /// half-open at maxY. This is load-bearing here: every rect in this file is flush to a
+    /// screen's `frame.maxY`, and a pointer shoved against the top of a display reports
+    /// EXACTLY `frame.maxY` (measured: warping to the top row of either display yields
+    /// `NSEvent.mouseLocation.y == frame.maxY`). `.contains` would therefore exclude the one
+    /// position the menu-bar summon gesture actually produces — and would also drop the
+    /// screen itself, since the same off-by-one makes `frame.contains` false up there.
+    /// Bottom edges stay exclusive, so stacked displays never both claim a shared row.
+    private func hit(_ p: NSPoint, _ r: NSRect) -> Bool { NSMouseInRect(p, r, false) }
+
+    /// Mirror the system menu bar's fullscreen behavior for this display: ARM on the top-edge
+    /// push, stay armed while the cursor lingers in the menu-bar band (so the user can slide
+    /// sideways onto the pill), disarm once it drops out of the band on this screen. Only
+    /// meaningful in fullscreen — on a normal desktop the pill is always visible and always
+    /// hoverable, so the arm is cleared and never consulted.
+    private func updateRevealArm(_ inst: NotchInstance, mouse: NSPoint, onThisScreen: Bool) {
+        guard inst.isFullscreen else { inst.revealArmed = false; return }
+        if hit(mouse, edgeRect(inst.screen)) {
+            inst.revealArmed = true
+        } else if onThisScreen, !inst.vm.isOpen, !hit(mouse, revealRect(inst.screen)) {
+            // Dropped out of the menu-bar band → the menu bar slides back up, so do we.
+            // Never disarm while the popover is up: the cursor is legitimately below the
+            // band then, and re-collapsing to a HIDDEN pill mid-use would flicker.
+            inst.revealArmed = false
+        }
+        // Two cases deliberately KEEP the current arm:
+        //  • inside the band but off the edge — sticky, exactly like the menu bar, so the
+        //    user can slide sideways from the edge onto the pill;
+        //  • cursor on another display — a display stacked directly above this one means
+        //    the top edge is a crossing, not a clamp, so a shove that overshoots onto the
+        //    neighbour must not throw away the arm it just earned. Holding it is harmless:
+        //    both the reveal and the hover-open ALSO require the cursor to be back in this
+        //    screen's band, which no off-screen position satisfies.
+    }
+
+    /// May a hover in the idle hover zone expand this panel right now? Always on a normal
+    /// desktop; in fullscreen only once the menu bar has been summoned — otherwise every
+    /// trip to a fullscreen window's top chrome would pop the popover open on top of it.
+    private func hoverCanOpen(_ inst: NotchInstance) -> Bool {
+        !inst.isFullscreen || inst.revealArmed
     }
 
     // MARK: Open / close (controller is the single authority)
@@ -434,7 +508,7 @@ final class NotchController: NSObject {
     /// the relaunch/reveal path where there is no hover to disambiguate.
     private func primaryInstance() -> NotchInstance? {
         let mouse = NSEvent.mouseLocation
-        if let hit = instances.values.first(where: { $0.screen.screen.frame.contains(mouse) }) { return hit }
+        if let under = instances.values.first(where: { hit(mouse, $0.screen.screen.frame) }) { return under }
         if let builtin = instances.values.first(where: { $0.screen.screen.isBuiltin }) { return builtin }
         if let mainID = NSScreen.main?.displayID, let onMain = instances[mainID] { return onMain }
         return instances.values.first
@@ -457,22 +531,24 @@ final class NotchController: NSObject {
     }
 
     /// One handler drives every panel. The instance the cursor left schedules its close;
-    /// the one it entered schedules its open. In fullscreen the open path is naturally
-    /// gated to the top (hoverRect lives in the reveal band, so the pill is revealed there).
+    /// the one it entered schedules its open. In fullscreen both the reveal and the open
+    /// additionally require the menu-bar summon gesture (see updateRevealArm), so crossing
+    /// a fullscreen window's top chrome does nothing.
     private func handleMouseMoved() {
         let mouse = NSEvent.mouseLocation
         for inst in instances.values {
-            let onThisScreen = inst.screen.screen.frame.contains(mouse)
+            let onThisScreen = hit(mouse, inst.screen.screen.frame)
+            updateRevealArm(inst, mouse: mouse, onThisScreen: onThisScreen)
             if inst.vm.isOpen {
                 // Close once the cursor leaves the VISIBLE popover (not the bigger window).
-                if !onThisScreen || !contentRect(inst).contains(mouse) {
+                if !onThisScreen || !hit(mouse, contentRect(inst)) {
                     scheduleClose(inst)
                 } else {
                     cancelClose(inst)
                 }
             } else {
                 // Open once the cursor dwells inside this notch's hover zone.
-                if onThisScreen && hoverRect(inst.screen).contains(mouse) {
+                if onThisScreen && hit(mouse, hoverRect(inst.screen)) && hoverCanOpen(inst) {
                     scheduleOpen(inst)
                 } else {
                     cancelOpen(inst)
@@ -487,9 +563,12 @@ final class NotchController: NSObject {
         let work = DispatchWorkItem { [weak self, weak inst] in
             guard let self = self, let inst = inst else { return }
             inst.openWork = nil
-            // Re-check the cursor is still in the hover zone before committing.
-            if inst.screen.screen.frame.contains(NSEvent.mouseLocation),
-               self.hoverRect(inst.screen).contains(NSEvent.mouseLocation) {
+            // Re-check the cursor is still in the hover zone — and, in fullscreen, that the
+            // menu bar is still summoned — before committing.
+            let mouse = NSEvent.mouseLocation
+            if self.hit(mouse, inst.screen.screen.frame),
+               self.hit(mouse, self.hoverRect(inst.screen)),
+               self.hoverCanOpen(inst) {
                 self.open(inst)
             }
         }
@@ -506,7 +585,7 @@ final class NotchController: NSObject {
             inst.closeWork = nil
             // Re-check the cursor is still outside the visible popover (it may have
             // returned during the grace window). close() itself honors keepVisible.
-            if !self.contentRect(inst).contains(NSEvent.mouseLocation) {
+            if !self.hit(NSEvent.mouseLocation, self.contentRect(inst)) {
                 self.close(inst)
             }
         }
@@ -543,21 +622,21 @@ final class NotchController: NSObject {
     /// For every panel: decide whether it should be visible right now, fade alpha to match,
     /// and gate mouse passthrough to its visible black.
     ///  • Not fullscreen → always visible (the idle pill on the desktop).
-    ///  • Fullscreen → visible only while OPEN or while the cursor is in the top reveal
-    ///    band (rides the menu bar); otherwise hidden (alpha 0).
+    ///  • Fullscreen → visible only while OPEN, or while the menu bar has been summoned
+    ///    (armed) AND the cursor is still in the top reveal band; otherwise hidden (alpha 0).
     private func applyPanelState() {
         let mouse = NSEvent.mouseLocation
         for inst in instances.values {
             let visible = !inst.isFullscreen
                 || inst.vm.isOpen
-                || revealRect(inst.screen).contains(mouse)
+                || (inst.revealArmed && hit(mouse, revealRect(inst.screen)))
             setVisible(inst, visible)
             if !visible {
                 inst.panel.ignoresMouseEvents = true
             } else if inst.vm.isOpen {
-                inst.panel.ignoresMouseEvents = !contentRect(inst).contains(mouse)
+                inst.panel.ignoresMouseEvents = !hit(mouse, contentRect(inst))
             } else {
-                inst.panel.ignoresMouseEvents = !hoverRect(inst.screen).contains(mouse)
+                inst.panel.ignoresMouseEvents = !hit(mouse, hoverRect(inst.screen))
             }
         }
     }
