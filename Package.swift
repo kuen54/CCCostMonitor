@@ -27,6 +27,7 @@ let package = Package(
                 "Core_DateLogic.swift",
                 "Core_TimeLogic.swift",
                 "Core_KeychainCodec.swift",
+                "Core_CredentialLocator.swift",
             ]
         ),
         .testTarget(

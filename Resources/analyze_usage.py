@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Optional, Dict, List
 
-__version__ = "3.2.4"
+__version__ = "3.2.5"
 
 # ---------------------------------------------------------------------------
 # Active-time tracking
@@ -1888,7 +1888,62 @@ def print_json(sessions: dict, subscription_quota: Optional[dict] = None,
 
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
-CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _claude_config_dirs() -> list:
+    """Config dirs Claude Code may use: $CLAUDE_CONFIG_DIR (if set), then ~/.claude."""
+    dirs = []
+    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env_dir:
+        dirs.append(env_dir)
+    default = str(Path.home() / ".claude")
+    if default not in dirs:
+        dirs.append(default)
+    return dirs
+
+
+def _keychain_service_candidates() -> list:
+    """Keychain item names Claude Code may have used, in tie-break order.
+
+    Claude Code appends `-<sha256(NFC(configDir))[:8]>` to the service name
+    whenever CLAUDE_CONFIG_DIR is set — even to the default ~/.claude. Mirrors
+    the Swift side's CredentialLocator (Sources/Core_CredentialLocator.swift).
+    """
+    import hashlib
+    import unicodedata
+
+    def suffixed(d: str) -> str:
+        h = hashlib.sha256(unicodedata.normalize("NFC", d).encode("utf-8")).hexdigest()
+        return f"{KEYCHAIN_SERVICE}-{h[:8]}"
+
+    out = []
+    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env_dir:
+        out.append(suffixed(env_dir))
+    out.append(KEYCHAIN_SERVICE)
+    out += [suffixed(d) for d in _claude_config_dirs()]
+    return list(dict.fromkeys(out))
+
+
+def _resolve_keychain_service() -> Optional[str]:
+    """The existing candidate item modified most recently (attributes only, no prompt)."""
+    import re
+    import subprocess
+    best, best_date = None, None
+    for service in _keychain_service_candidates():
+        try:
+            out = subprocess.run(["security", "find-generic-password", "-s", service],
+                                 capture_output=True, text=True, timeout=5)
+        except Exception:
+            continue
+        if out.returncode != 0:
+            continue
+        m = re.search(r'"mdat"<timedate>=\S+\s+"([0-9]{14}Z)', out.stdout)
+        date = m.group(1) if m else ""
+        if best is None or date > best_date:
+            best, best_date = service, date
+    return best
 
 
 def _token_from_credentials_blob(text: str) -> Optional[str]:
@@ -1931,16 +1986,19 @@ def _decode_security_value(raw: str) -> Optional[str]:
 def _read_oauth_token() -> Optional[str]:
     """Return the Claude Code OAuth access token, or None if unavailable.
 
-    Checks, in order: env var, `~/.claude/.credentials.json`, then (on macOS) the
+    Checks, in order: env var, `<configDir>/.credentials.json`, then (on macOS) the
     login Keychain — which is the DEFAULT location Claude Code stores credentials
     on macOS, so Pro/Max users typically have no plaintext file at all.
     """
     env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     if env_token:
         return env_token
-    if CREDENTIALS_PATH.exists():
+    for config_dir in _claude_config_dirs():
+        path = Path(config_dir) / ".credentials.json"
+        if not path.exists():
+            continue
         try:
-            with open(CREDENTIALS_PATH, "r") as f:
+            with open(path, "r") as f:
                 token = _token_from_credentials_blob(f.read())
             if token:
                 return token
@@ -1950,9 +2008,11 @@ def _read_oauth_token() -> Optional[str]:
     if sys.platform == "darwin":
         try:
             import subprocess
+            service = _resolve_keychain_service()
+            if not service:
+                return None
             out = subprocess.run(
-                ["security", "find-generic-password",
-                 "-s", "Claude Code-credentials", "-w"],
+                ["security", "find-generic-password", "-s", service, "-w"],
                 capture_output=True, text=True, timeout=5,
             )
             if out.returncode == 0 and out.stdout.strip():

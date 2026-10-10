@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// App version, single-sourced from Info.plist (CFBundleShortVersionString).
 /// When run as a bare binary in dev (no bundle plist), falls back to "0.0".
@@ -90,9 +91,6 @@ enum KeychainCLI {
 // every call into this type happens on that queue (or, for the very first
 // hasOAuthToken probe, synchronously before any other credential work exists).
 enum CredentialStore {
-    /// Keychain item Claude Code stores its OAuth credentials under (mirrors Claude Code).
-    static let keychainService = "Claude Code-credentials"
-
     /// Parsed Claude Code OAuth credentials plus where they were read from, so a refreshed
     /// token can be written back to the same place.
     struct OAuthCredentials {
@@ -119,17 +117,42 @@ enum CredentialStore {
         }
     }
 
+    /// `CLAUDE_CONFIG_DIR` as this process sees it (usually unset for a GUI launch).
+    private static var envConfigDir: String? { ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] }
+
+    private static func sha256Hex(_ s: String) -> String {
+        SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The Keychain item Claude Code is actually using: among every name it may have
+    /// chosen (see CredentialLocator), the existing one modified most recently.
+    /// Attributes-only queries (no `-w`) — never prompts.
+    static func resolveKeychainService() -> String? {
+        let services = CredentialLocator.candidateServices(
+            envConfigDir: envConfigDir, home: NSHomeDirectory(), sha256Hex: sha256Hex)
+        let found = services.compactMap { service -> (service: String, modDate: String?)? in
+            guard let attrs = KeychainCLI.runSecurity(["find-generic-password", "-s", service]) else { return nil }
+            return (service, CredentialLocator.parseModDate(attrs))
+        }
+        return CredentialLocator.pickNewest(found)
+    }
+
+    private static var credentialFiles: [String] {
+        CredentialLocator.candidateCredentialFiles(envConfigDir: envConfigDir, home: NSHomeDirectory())
+    }
+
     /// The actual existence check: env → plaintext file → keychain attributes (no `-w`).
     static func probeTokenPresence() -> Bool {
         if let env = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !env.isEmpty {
             return true
         }
-        let path = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/.credentials.json")
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           parseCredentials(data, source: .file(path: path)) != nil {
-            return true
+        for path in credentialFiles {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+               parseCredentials(data, source: .file(path: path)) != nil {
+                return true
+            }
         }
-        return KeychainCLI.runSecurity(["find-generic-password", "-s", keychainService]) != nil
+        return resolveKeychainService() != nil
     }
 
     /// Load credentials from env → plaintext file → Keychain (via the `security` CLI).
@@ -138,15 +161,18 @@ enum CredentialStore {
             return OAuthCredentials(accessToken: env, refreshToken: nil, expiresAtMs: nil,
                                     source: .env, fullData: [:])
         }
-        // 1. `~/.claude/.credentials.json` — Linux, or macOS opted out of Keychain.
-        let path = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/.credentials.json")
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let creds = parseCredentials(data, source: .file(path: path)) {
-            return creds
+        // 1. `<configDir>/.credentials.json` — Linux, or macOS opted out of Keychain.
+        for path in credentialFiles {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+               let creds = parseCredentials(data, source: .file(path: path)) {
+                return creds
+            }
         }
-        // 2. macOS Keychain — the default location Claude Code uses on macOS.
-        if let data = KeychainCLI.readBlob(service: keychainService),
-           let creds = parseCredentials(data, source: .keychain(service: keychainService)) {
+        // 2. macOS Keychain — the default location Claude Code uses on macOS. The
+        //    resolved service rides along in `source`, so token write-back hits the same item.
+        if let service = resolveKeychainService(),
+           let data = KeychainCLI.readBlob(service: service),
+           let creds = parseCredentials(data, source: .keychain(service: service)) {
             return creds
         }
         return nil
