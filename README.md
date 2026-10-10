@@ -121,7 +121,7 @@ The app shells out to a bundled Python script that scans `~/.claude/projects/**/
     → SwiftUI popover
 ```
 
-The **Subscription** tab is separate: it calls Anthropic's OAuth usage endpoint directly (no local logs involved). The quota is cached for ~5 minutes — auto-refreshes are served from that cache, while **⌘R** bypasses it to pull live numbers on demand. On this tab the footer's *Updated* time reflects when the quota itself was last fetched (not the local log scan), and if a refresh fails or the token is rejected the last-known numbers stay on screen with an inline warning rather than being silently shown as current. The access token is read from `~/.claude/.credentials.json` or — the default on macOS — the login **Keychain** (`Claude Code-credentials`). macOS may prompt for Keychain access on first use; choose *Always Allow* (the grant is bound to the system `security` tool, so it persists across app updates and rebuilds). API-key users (Bedrock / Vertex / Console) have no subscription quota, so the tab is hidden for them.
+The **Subscription** tab is separate: it calls Anthropic's OAuth usage endpoint directly (no local logs involved). The quota is cached for ~5 minutes — auto-refreshes are served from that cache, while **⌘R** bypasses it to pull live numbers on demand. On this tab the footer's *Updated* time reflects when the quota itself was last fetched (not the local log scan), and if a refresh fails or the token is rejected the last-known numbers stay on screen with an inline warning rather than being silently shown as current. The access token is read from `~/.claude/.credentials.json` or — the default on macOS — the login **Keychain** (`Claude Code-credentials`, or `Claude Code-credentials-<hash>` when `CLAUDE_CONFIG_DIR` is set — the app checks every name Claude Code may use and picks the most recently updated). macOS may prompt for Keychain access on first use; choose *Always Allow* (the grant is bound to the system `security` tool, so it persists across app updates and rebuilds). API-key users (Bedrock / Vertex / Console) have no subscription quota, so the tab is hidden for them.
 
 ### Project structure
 
@@ -266,7 +266,7 @@ open build/CCCostMonitor.app
     → SwiftUI 弹窗
 ```
 
-**订阅** tab 走的是另一条路：直接调用 Anthropic 的 OAuth 用量接口（不读本地日志）。配额结果带约 5 分钟缓存 —— 自动刷新命中缓存，而 **⌘R** 会绕过缓存按需拉取实时数字。在该 tab，footer 的*更新*时间反映的是**配额自身最后一次抓取的时刻**（而非本地日志扫描时刻）；若刷新失败或 token 被拒，上次已知的数字会连同内联警告继续显示，而不会被当作当前值静默呈现。访问 token 从 `~/.claude/.credentials.json` 读取，或——在 macOS 上的默认情况——从登录**钥匙串**（`Claude Code-credentials`）读取。首次使用时 macOS 可能弹出钥匙串授权框，请选择*始终允许*（授权绑定在系统 `security` 工具上，升级或重新构建 app 都不会失效）。API-key 用户（Bedrock / Vertex / Console）没有订阅限额，该 tab 对他们隐藏。
+**订阅** tab 走的是另一条路：直接调用 Anthropic 的 OAuth 用量接口（不读本地日志）。配额结果带约 5 分钟缓存 —— 自动刷新命中缓存，而 **⌘R** 会绕过缓存按需拉取实时数字。在该 tab，footer 的*更新*时间反映的是**配额自身最后一次抓取的时刻**（而非本地日志扫描时刻）；若刷新失败或 token 被拒，上次已知的数字会连同内联警告继续显示，而不会被当作当前值静默呈现。访问 token 从 `~/.claude/.credentials.json` 读取，或——在 macOS 上的默认情况——从登录**钥匙串**（`Claude Code-credentials`；设置了 `CLAUDE_CONFIG_DIR` 时为 `Claude Code-credentials-<hash>`——app 会检查 Claude Code 可能使用的所有条目名，取最近更新的那个）读取。首次使用时 macOS 可能弹出钥匙串授权框，请选择*始终允许*（授权绑定在系统 `security` 工具上，升级或重新构建 app 都不会失效）。API-key 用户（Bedrock / Vertex / Console）没有订阅限额，该 tab 对他们隐藏。
 
 ### 项目结构
 
